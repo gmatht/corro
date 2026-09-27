@@ -114,35 +114,101 @@ pub fn run_menu_action_by_name(name: &str) {
     super::gui_backend::dispatch_android_menu_action(name);
 }
 
-/// Scroll the sheet viewport by a whole number of rows/columns.
-///
-/// Called from `SheetView` on a touch drag: Android has no native scrolling
-/// for the sheet (the `ScrolledWindow` there is an inert `FrameLayout`), so
-/// the grid is moved by driving the same cursor/viewport machinery the
-/// scrollbars use. Positive `d_rows` moves the viewport down (later rows),
-/// positive `d_cols` moves it right. Returns the remaining pixel delta the
-/// caller should carry into the next drag event: deltas smaller than one
-/// row/column are accumulated by the Java side, which is why this takes a
-/// whole-cell count and the caller keeps the sub-cell remainder.
-#[cfg(target_os = "android")]
-pub fn scroll_viewport(d_rows: i32, d_cols: i32) {
-    super::gui_backend::scroll_viewport_by_cells(d_rows, d_cols);
-}
 
 /// Report the row/column height in device pixels, so `SheetView` can convert
-/// a touch drag in pixels into the whole-cell counts [`scroll_viewport`]
-/// takes.
+/// a touch drag in pixels into whole-cell counts (it keeps the sub-cell
+/// remainder between events).
 ///
 /// The Java side needs the same numbers Rust renders with — a hardcoded
 /// constant there would drift from `row_h()`/`col_w()` as soon as the
 /// density or metrics change, and touch scrolling would feel wrong by
-/// exactly that factor.
+/// exactly that factor. Because the metrics include the pinch scale, the Java
+/// side re-reads them after a zoom (see `SheetView.refreshCellSize`), or a
+/// pinch would leave the drag conversion at the old scale.
 #[cfg(target_os = "android")]
 pub fn touch_cell_size() -> (f64, f64) {
     (
         super::gui_backend::touch_row_h(),
         super::gui_backend::touch_col_w(),
     )
+}
+
+/// Apply a pinch-zoom step: multiply the sheet's view scale by `factor`
+/// (`currentSpan / previousSpan` from Android's `ScaleGestureDetector`).
+///
+/// Called from `SheetView` once per scale-gesture event. Everything the sheet
+/// draws *and* everything a finger hits derives from the same scale, so a
+/// pinch moves the grid, the gutter, the headers and the hit targets together.
+/// Returns the scale actually applied (clamped to
+/// `gui_backend::MIN_VIEW_ZOOM`..=`MAX_VIEW_ZOOM`), so `SheetView` can refresh
+/// its cached cell size and log the value.
+#[cfg(target_os = "android")]
+pub fn zoom_viewport(factor: f64) -> f64 {
+    super::gui_backend::zoom_viewport_by(factor)
+}
+
+/// Reset the pinch scale to 1.0 (a double-tap, or the View menu's reset item).
+/// Returns the applied scale (always 1.0).
+#[cfg(target_os = "android")]
+pub fn reset_viewport_zoom() -> f64 {
+    super::gui_backend::reset_viewport_zoom()
+}
+
+/// Begin a touch gesture that may become a drag: `kind` is 0 for a mouse (drag
+/// selects) and 1 for a finger (drag scrolls until a long press arms
+/// selection). Wire this to `ACTION_DOWN`.
+///
+/// Returns the [`rswidgets::gridview::DragOutcome`] as a small integer so the
+/// Java side can react without a second JNI call:
+/// `0` ignored, `1` select, `2` scroll (deltas delivered separately by
+/// `drag_viewport`), `3` tap, `4` long press.
+#[cfg(target_os = "android")]
+pub fn gesture_down(canvas_id: u64, x: f64, y: f64, is_touch: bool) -> i32 {
+    super::gui_backend::mobile_gesture_down(canvas_id, x, y, is_touch)
+}
+
+/// A finger that has been still since `gesture_down` and has now held long
+/// enough: arm selection so the following drag extends it instead of
+/// scrolling. Wire this to `GestureDetector.onLongPress`.
+#[cfg(target_os = "android")]
+pub fn gesture_long_press(canvas_id: u64, x: f64, y: f64) -> i32 {
+    super::gui_backend::mobile_gesture_long_press(canvas_id, x, y)
+}
+
+/// A pointer move while a gesture is active. Returns the
+/// [`rswidgets::gridview::DragOutcome`] code (see [`gesture_down`]); for a
+/// scroll the Java side applies the pan through [`drag_viewport`].
+#[cfg(target_os = "android")]
+pub fn gesture_move(canvas_id: u64, x: f64, y: f64) -> i32 {
+    super::gui_backend::mobile_gesture_move(canvas_id, x, y)
+}
+
+/// A pointer release. Returns the outcome code (see [`gesture_down`]); a
+/// `3` (tap) means the host should treat it as a click, which the shared
+/// handler has already applied.
+#[cfg(target_os = "android")]
+pub fn gesture_up(canvas_id: u64, x: f64, y: f64) -> i32 {
+    super::gui_backend::mobile_gesture_up(canvas_id, x, y)
+}
+
+/// Cancel an in-flight gesture (the system stole the touch, the activity
+/// paused). Never produces a tap.
+#[cfg(target_os = "android")]
+pub fn gesture_cancel(canvas_id: u64) {
+    super::gui_backend::mobile_gesture_cancel(canvas_id);
+}
+
+/// Pan the sheet by a pixel delta from a touch drag, converting to whole
+/// cells with the *current* (zoom-aware) metrics.
+///
+/// `dx`/`dy` are the movement since the last event in device pixels; positive
+/// `dy` means the content should move down the screen (drag downward reveals
+/// earlier rows), so the row delta is negated, exactly like the existing
+/// `scrollByDrag` path. Returns the row/column counts actually applied so the
+/// caller can keep its sub-cell remainder.
+#[cfg(target_os = "android")]
+pub fn drag_viewport(canvas_id: u64, dx: f64, dy: f64) -> (i32, i32) {
+    super::gui_backend::drag_viewport_by_pixels(canvas_id, dx, dy)
 }
 
 /// Write a line to logcat (`log -t corro` shows these). Best-effort: the

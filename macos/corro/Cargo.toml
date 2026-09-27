@@ -1,0 +1,41 @@
+[package]
+name = "corro_macos"
+version = "0.7.0"
+edition = "2021"
+# Standalone crate (NOT in the corro workspace): it builds for Apple targets
+# with its own feature set, mirroring ios/corro and android/corro.
+[workspace]
+
+[lib]
+# `staticlib` for an app that links the Rust code into its own binary, and
+# `cdylib` for a standalone bundle. Both are produced because the Xcode target
+# picks: a host that vendors the Rust code uses one, a host that ships a
+# `.dylib` uses the other, and producing both costs one extra archive.
+crate-type = ["staticlib", "cdylib"]
+
+[features]
+# Generate app/CorroGeneratedShims.{h,m} from rswidgets' signature table when
+# this crate is built (see build.rs). Only needed when the shim contract
+# changes; the generated files are checked in like any other source.
+generate-apple-shims = []
+
+[dependencies]
+# `gui-macos` is the shared GUI pipeline against the AppKit adapter, with the
+# GTK half absent (it cannot link on an Apple target — see Cargo.toml at the
+# repo root). This is the feature the macOS path actually needs; a Mac must not
+# use `gui`, which resolves rswidgets/gtk + gtk_dynamic_loader.
+corro = { path = "../..", default-features = false, features = ["gui-macos"] }
+# rswidgets is depended on directly (not only through corro) so the cdylib can
+# name `backends::macos` for the exported entry points. default-features = false
+# keeps the GTK adapter out of the macOS link entirely.
+rswidgets = { path = "../../rustxWidgets/rswidgets", default-features = false, features = ["macos"] }
+
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+# `debug = 1` and `lto = false` for the same reason as ios/corro: a Rust panic
+# in the app must print a backtrace that names the real functions, and fat LTO
+# collapses exactly those frames. A panic inside an `extern "C"` frame cannot
+# unwind, so the trace is the only diagnosis there is.
+debug = 1
+lto = false

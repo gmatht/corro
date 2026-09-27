@@ -49,14 +49,7 @@ pub fn apply_sheet_op(app: &mut App, op: Op) {
 
 /// Simple A1-style label for a main cell (column letters + 1-indexed row).
 pub fn main_addr_label(row: u32, col: u32) -> String {
-    let mut name = String::new();
-    let mut c = col;
-    loop {
-        name.insert(0, (b'A' + (c % 26) as u8) as char);
-        if c < 26 { break; }
-        c = c / 26 - 1;
-    }
-    format!("{}{}", name, row + 1)
+    format!("{}{}", crate::addr::excel_column_name(col as usize), row + 1)
 }
 
 /// Format-scope menu actions as data: (action name, scope id, status text).
@@ -258,6 +251,105 @@ pub enum MenuDispatch {
     BalanceBooks,
 }
 
+/// The three presentation primitives every backend must supply for a menu
+/// action's result.
+///
+/// [`dispatch_menu_action`] decides *what* should happen; the backend only
+/// decides *how it looks*. Those are the only two things that differ between
+/// hosts, so naming them lets one [`present_menu_dispatch`] serve every
+/// backend instead of each re-matching the same nine variants.
+///
+/// Deliberately small: a text prompt, a list picker, and a dialog. A backend
+/// that has a richer native equivalent (GTK's in-grid dropdown, a real modal)
+/// is free to present it that way — the trait says what information must reach
+/// the user, not which widget carries it.
+/// Which informational dialog a [`MenuPresenter`] is being asked for.
+///
+/// Typed rather than passed as a title string so a backend can choose its own
+/// widget — the GUI has bespoke dialogs (`show_about_dialog`,
+/// `show_keybinds_help`) and would otherwise have to *sniff the dialog body
+/// text* to decide which one to open, which silently breaks if the shared body
+/// wording ever changes. `Other` carries a title+body for anything that is
+/// genuinely a plain text box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InfoDialog<'a> {
+    About,
+    HelpFull,
+    /// A title and body with no dedicated widget: the backend may show a
+    /// generic text box.
+    Other(&'a str, &'a str),
+}
+
+pub trait MenuPresenter {
+    /// Show an informational dialog. See [`InfoDialog`] for why this is typed
+    /// rather than a `(title, text)` pair.
+    fn show_dialog(&mut self, which: InfoDialog<'_>);
+
+    /// Show a single-choice list of `rows` with `selected` highlighted, and
+    /// route subsequent keys through the shared picker state
+    /// (`picker_dispatch`). `title` labels the popup.
+    fn show_list_picker(&mut self, title: &str, rows: &[String], selected: usize);
+
+    /// Ask for a line of text for `action` (labelled `label`). The backend
+    /// owns the input widget; submitting it must run the shared
+    /// [`run_prompt_action`].
+    fn open_prompt(&mut self, label: &str, action: &str);
+
+    /// Put `value` into the cursor cell's edit buffer (Insert ▸ Date/Time).
+    fn begin_edit_with(&mut self, value: &str);
+
+    /// Show the Keybindings help. Separate from `show_dialog` because the
+    /// bindings genuinely differ per host (a terminal lists terminal keys,
+    /// GTK lists GTK's), so there is no shared body to hand it.
+    fn show_keybinds(&mut self);
+
+    /// Publish a status string. An empty string means "keep the current one".
+    fn set_status(&mut self, status: &str);
+}
+
+/// Present a [`MenuDispatch`] through a [`MenuPresenter`].
+///
+/// This is the single implementation of the menu-result protocol: every
+/// variant, in one place, so a new `MenuDispatch` variant can only be forgotten
+/// once rather than per backend. Backends call this from their menu-action
+/// callback and implement only the five primitives above.
+///
+/// `About`/`HelpFull`/`HelpKeybinds` bodies come from [`crate::ui_core`] so
+/// every host shows identical text (render parity), and `BalanceBooks` and the
+/// two pickers read their items from the shared picker modules — the backend
+/// never re-lists them.
+pub fn present_menu_dispatch(dispatch: MenuDispatch, presenter: &mut dyn MenuPresenter) {
+    match dispatch {
+        MenuDispatch::Status(s) => presenter.set_status(&s),
+        MenuDispatch::Edit { value } => presenter.begin_edit_with(&value),
+        MenuDispatch::Prompt(label, action) => presenter.open_prompt(label, action),
+        MenuDispatch::SpecialPicker => {
+            let rows: Vec<String> = super::special_picker::items().into_iter().collect();
+            presenter.show_list_picker(" Special Char ", &rows, 0);
+        }
+        MenuDispatch::AggregatePicker => {
+            let rows = super::agg_picker::items();
+            presenter.show_list_picker(" Aggregate ", &rows, 0);
+        }
+        MenuDispatch::BalanceBooks => {
+            let rows: Vec<String> = super::balance_picker::items().into_iter().collect();
+            presenter.show_list_picker(" Balance books ", &rows, 0);
+        }
+        MenuDispatch::About { status } => {
+            presenter.show_dialog(InfoDialog::About);
+            presenter.set_status(&status);
+        }
+        MenuDispatch::HelpFull { status } => {
+            presenter.show_dialog(InfoDialog::HelpFull);
+            presenter.set_status(&status);
+        }
+        MenuDispatch::HelpKeybinds { status } => {
+            presenter.show_keybinds();
+            presenter.set_status(&status);
+        }
+    }
+}
+
 /// Perform an immediate (non-prompt) menu action on `app`, returning how the
 /// backend should present the result. Actions that need a text prompt are
 /// handled by the backend via [`menu_action_needs_prompt`] (except `save`, which
@@ -312,6 +404,71 @@ pub fn dispatch_menu_action(
             }
         }
         "balance_books" => MenuDispatch::BalanceBooks,
+        "toggle_night_mode" => {
+            // `Format ▸ Night mode`: flip the global palette. Deliberately a
+            // *view* setting — it writes no op and touches no cell, so it
+            // belongs to the shared toolkit global rather than to app state,
+            // and it is neither undoable nor persisted.
+            //
+            // The repaint is the backend's job, not ours: a realised widget
+            // only picks the new palette up on its next paint, and this
+            // function has no handle on one. Every backend that dispatches
+            // menu actions already queues a redraw for actions that change
+            // what is drawn (see `col_lock` in gui_backend), so returning a
+            // Status here is enough for the palette to take effect.
+            let next = match rswidgets::core::color_scheme() {
+                rswidgets::core::ColorScheme::Light => rswidgets::core::ColorScheme::Night,
+                rswidgets::core::ColorScheme::Night => rswidgets::core::ColorScheme::Light,
+            };
+            rswidgets::core::set_color_scheme(next);
+            MenuDispatch::Status(format!(
+                "Night mode {}",
+                if next == rswidgets::core::ColorScheme::Night {
+                    "on"
+                } else {
+                    "off"
+                }
+            ))
+        }
+        "col_lock" | "row_lock" => {
+            // `Sheet ▸ Freeze`: pin the cursor's column/row so it stays
+            // visible while the sheet scrolls. The state is the shared
+            // `core.locks` (the same one the GUI gutter padlock toggles), so
+            // a lock set from the menu shows up in the padlock and vice
+            // versa. No prompt: both act on the cursor, and the status line
+            // names the gutter so a toggle reads unambiguously.
+            let sid = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+            // Clear stale pins first, so toggling right after a sheet switch
+            // cannot re-pin the previous sheet's row (same guard the render
+            // path applies on read).
+            app.core.locks.ensure_sheet(sid);
+            let cursor = app.core.cursor;
+            if name == "col_lock" {
+                app.core.locks.toggle_col(cursor.col);
+                let label = crate::addr::ui_column_fragment(
+                    cursor.col,
+                    app.core.workbook.active_sheet().grid.main_cols(),
+                );
+                let locked = app.core.locks.col_locked(cursor.col);
+                MenuDispatch::Status(format!(
+                    "Column {}: {}",
+                    label,
+                    if locked { "locked" } else { "unlocked" }
+                ))
+            } else {
+                app.core.locks.toggle_row(cursor.row);
+                let label = crate::addr::ui_row_label(
+                    cursor.row,
+                    app.core.workbook.active_sheet().grid.main_rows(),
+                );
+                let locked = app.core.locks.row_locked(cursor.row);
+                MenuDispatch::Status(format!(
+                    "Row {}: {}",
+                    label,
+                    if locked { "locked" } else { "unlocked" }
+                ))
+            }
+        }
         "insert_special_chars" => {
             // Picker, not free-text (ratatui parity): the backend opens
             // its 10-choice dialog/popup over shared picker state.
@@ -505,6 +662,10 @@ pub fn dispatch_menu_action(
                     row: HEADER_ROWS + mr.saturating_sub(1),
                     col: MARGIN_COLS + mc.saturating_sub(1),
                 };
+                // Select-all is a both-axes cell rectangle: a stale Rows/Cols
+                // from an earlier header click would otherwise swallow one of
+                // the axes (and hide the other header strip's glow).
+                app.core.selection_kind = crate::grid::SelectionKind::Cells;
             }
             MenuDispatch::Status("Selected all".into())
         }
@@ -530,13 +691,14 @@ pub fn dispatch_menu_action(
             app.core.ops_applied = 0;
             app.core.persisted_view_sort_cols.clear();
             app.core.revision_limit = None;
-            app.core.revision_browse = false;
+            app.leave_revision_browse();
             app.core.revision_browse_limit = 0;
             app.core.watcher = None;
             app.core.op_history.clear();
             app.core.redo_history.clear();
             app.core.cursor = SheetCursor { row: hr, col: lm };
             app.core.anchor = None;
+            app.core.selection_kind = crate::grid::SelectionKind::Cells;
             app.core.unsaved_file = None;
             app.core.linked_source_mtimes.clear();
             app.core.edit_target_addr = None;
@@ -633,29 +795,32 @@ pub fn dispatch_menu_action(
                 &mut workbook,
                 &mut active_sheet,
             ) {
-                Ok((off, replay)) => {
-                    app.core.workbook = workbook;
-                    app.core.workbook.ensure_active_sheet();
-                    app.core.view_sheet_id = active_sheet;
-                    if let Some(idx) = app.core.workbook.sheet_index_by_id(active_sheet) {
-                        app.core.workbook.active_sheet = idx;
-                        app.core.state = app.core.workbook.sheets[idx].state.clone();
-                    }
-                    app.core.offset = off;
-                    app.core.ops_applied = replay.op_count;
-                    app.core.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
-                    app.core.anchor = None;
-                    // Same revision-browse bookkeeping as the reference, so the
-                    // reloaded log is treated as a browsable revision set
-                    // rather than a fresh edit stream.
-                    app.core.revision_browse = true;
-                    app.core.revision_browse_limit = replay.op_count;
+                Ok((_off, replay)) => {
+                    // Hand the re-replay to the shared implementation rather
+                    // than duplicating its bookkeeping: point CoreApp at the
+                    // log with the limit at the newest revision and let it
+                    // reload. This keeps the GUI, pancurses and the ratatui
+                    // reference on one code path (a divergence here shows up
+                    // as a stale active-sheet cache or unfitted columns).
                     app.core.source_path = Some(p.clone());
-                    MenuDispatch::Status(format!(
-                        "Replayed {} @ revision {}",
-                        p.display(),
-                        replay.op_count
-                    ))
+                    app.core.revision_browse_limit = replay.op_count;
+                    if let Err(e) = app.core.reload_revision_browse() {
+                        return MenuDispatch::Status(format!("Replay error: {e}"));
+                    }
+                    // Enter revision-browse mode so Left/Right step
+                    // revisions instead of moving the cursor. Both GUI
+                    // backends read this flag.
+                    app.enter_revision_browse();
+                    // The reference says "Replayed …" for the initial full
+                    // replay and only switches to "Browsing …" once a step
+                    // happens, so keep that distinction here (the shared
+                    // reload sets the Browsing text).
+                    let status = match replay.failed_line {
+                        Some(_) => app.core.status.clone(),
+                        None => crate::core::state::replay_status("Replayed", &p, &replay),
+                    };
+                    app.core.status = status.clone();
+                    MenuDispatch::Status(status)
                 }
                 Err(e) => MenuDispatch::Status(format!("Replay error: {e}")),
             }
@@ -995,17 +1160,35 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
         }
         "go_to_cell" => {
             if !path.is_empty() {
-                if let Some((addr, _, _)) = crate::addr::parse_cell_ref_at(&path, 0) {
-                    match addr {
-                        crate::grid::CellAddr::Main { row, col } => {
-                            app.core.cursor.row = HEADER_ROWS + row as usize;
-                            app.core.cursor.col = MARGIN_COLS + col as usize;
-                            app.core.status = format!("Go to {path}");
+                // One resolver for every backend: the hand-rolled `parse_cell_ref_at`
+                // + HEADER_ROWS/MARGIN_COLS arithmetic this replaced accepted only
+                // a bare `A1` main cell, so a row (`5`), a column (`C`), a header
+                // (`C~1`) or a margin (`[A1`) ref silently failed — the TUI's
+                // `go_to_cell` has always accepted all of them.
+                let current = app.core.cursor;
+                let target = {
+                    let sheet = app.core.workbook.active_sheet();
+                    crate::ui_core::resolve_go_target(&sheet.grid, current, &path)
+                };
+                match target {
+                    Ok(t) => {
+                        // Grow the body first, so a target past the current edge is
+                        // addressable (the ratatui reference does the same in
+                        // `go_to_cell_ref` before mapping the ref to a cursor).
+                        let (want_rows, want_cols) = (t.min_main_rows, t.min_main_cols);
+                        if want_rows.is_some() || want_cols.is_some() {
+                            let g = &mut app.core.workbook.active_sheet_mut().grid;
+                            let rows = want_rows.unwrap_or_else(|| g.main_rows()).max(g.main_rows());
+                            let cols = want_cols.unwrap_or_else(|| g.main_cols()).max(g.main_cols());
+                            g.set_main_size(rows, cols);
                         }
-                        _ => app.core.status = format!("Unknown cell '{path}'"),
+                        app.core.cursor = t.cursor;
+                        let g = &app.core.workbook.active_sheet().grid;
+                        let addr = t.cursor.to_addr(g);
+                        app.core.status =
+                            format!("Went to {}", crate::addr::cell_ref_text(&addr, g.main_cols()));
                     }
-                } else {
-                    app.core.status = format!("Unknown cell '{path}'");
+                    Err(msg) => app.core.status = msg,
                 }
             }
         }
@@ -1149,5 +1332,165 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
             }
         }
         _ => { app.core.status = format!("Menu: {action}"); }
+    }
+}
+
+#[cfg(test)]
+mod menu_presenter_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Records what a presenter was asked to show, so a test can assert the
+    /// shared mapping without a backend.
+    #[derive(Default)]
+    struct Recorder {
+        dialogs: Vec<(String, String)>,
+        pickers: Vec<(String, usize, Vec<String>)>,
+        prompts: Vec<(String, String)>,
+        edits: Vec<String>,
+        statuses: Vec<String>,
+        keybinds: u32,
+    }
+
+    impl MenuPresenter for Recorder {
+        fn show_dialog(&mut self, which: InfoDialog<'_>) {
+            let (title, text) = match which {
+                InfoDialog::About => (" About ".to_string(), crate::ui_core::about_page_body()),
+                InfoDialog::HelpFull => (" Help ".to_string(), crate::ui_core::help_page_body()),
+                InfoDialog::Other(t, b) => (t.to_string(), b.to_string()),
+            };
+            self.dialogs.push((title, text));
+        }
+        fn show_list_picker(&mut self, title: &str, rows: &[String], selected: usize) {
+            self.pickers.push((title.to_string(), selected, rows.to_vec()));
+        }
+        fn open_prompt(&mut self, label: &str, action: &str) {
+            self.prompts.push((label.to_string(), action.to_string()));
+        }
+        fn begin_edit_with(&mut self, value: &str) {
+            self.edits.push(value.to_string());
+        }
+        fn show_keybinds(&mut self) {
+            self.keybinds += 1;
+        }
+        fn set_status(&mut self, status: &str) {
+            self.statuses.push(status.to_string());
+        }
+    }
+
+    fn present(d: MenuDispatch) -> Rc<RefCell<Recorder>> {
+        let r = Rc::new(RefCell::new(Recorder::default()));
+        present_menu_dispatch(d, &mut *r.borrow_mut());
+        r
+    }
+
+    /// Every variant must route to exactly the primitive it names, with its
+    /// payload intact. This is the contract both backends now rely on, so a
+    /// variant added without a presenter arm fails here rather than silently
+    /// doing nothing in one backend.
+    #[test]
+    fn every_variant_routes_to_its_primitive() {
+        let r = present(MenuDispatch::Status("saved".into()));
+        assert_eq!(vec!["saved".to_string()], r.borrow().statuses);
+
+        let r = present(MenuDispatch::Edit { value: "2026-09-24".into() });
+        assert_eq!(vec!["2026-09-24".to_string()], r.borrow().edits);
+
+        let r = present(MenuDispatch::Prompt("Save as", "save_as"));
+        assert_eq!(vec![("Save as".to_string(), "save_as".to_string())], r.borrow().prompts);
+
+        // The three pickers draw their items from the shared modules, so the
+        // backend never re-lists them.
+        let r = present(MenuDispatch::AggregatePicker);
+        assert_eq!(1, r.borrow().pickers.len());
+        assert_eq!(super::super::agg_picker::items(), r.borrow().pickers[0].2);
+
+        let r = present(MenuDispatch::SpecialPicker);
+        assert_eq!(1, r.borrow().pickers.len());
+        assert_eq!(super::super::special_picker::items().len(), r.borrow().pickers[0].2.len());
+
+        let r = present(MenuDispatch::BalanceBooks);
+        assert_eq!(1, r.borrow().pickers.len());
+        assert_eq!(super::super::balance_picker::items().len(), r.borrow().pickers[0].2.len());
+
+        let r = present(MenuDispatch::About { status: "about".into() });
+        let b = r.borrow();
+        assert_eq!(1, b.dialogs.len());
+        assert_eq!(" About ", b.dialogs[0].0);
+        assert_eq!(crate::ui_core::about_page_body(), b.dialogs[0].1);
+        assert_eq!(vec!["about".to_string()], b.statuses);
+
+        let r = present(MenuDispatch::HelpFull { status: "help".into() });
+        assert_eq!(crate::ui_core::help_page_body(), r.borrow().dialogs[0].1);
+
+        // Keybindings is deliberately NOT a shared body (terminal and GUI list
+        // different keys), so it goes to the presenter's own method.
+        let r = present(MenuDispatch::HelpKeybinds { status: "keys".into() });
+        assert_eq!(1, r.borrow().keybinds);
+        assert!(r.borrow().dialogs.is_empty());
+    }
+
+    /// An empty status must reach the presenter as empty text: the
+    /// "keep the current status" convention is the presenter's to interpret
+    /// (the GUI skips it, pancurses skips it), not something the mapping
+    /// should silently swallow.
+    #[test]
+    fn empty_status_is_passed_through() {
+        let r = present(MenuDispatch::Status(String::new()));
+        assert_eq!(vec![String::new()], r.borrow().statuses);
+    }
+}
+
+#[cfg(test)]
+mod night_mode_dispatch_tests {
+    use super::*;
+
+    /// `toggle_night_mode` must actually flip the global palette, report the
+    /// new state, and be safe to press repeatedly.
+    ///
+    /// Asserted through `dispatch_menu_action` rather than the GUI backend
+    /// because that is the function *every* backend funnels menu actions
+    /// through: if this works, the menu item is wired on all of them, and a
+    /// backend that fails to repaint is a rendering question rather than a
+    /// dispatch one.
+    #[test]
+    fn toggle_night_mode_flips_the_palette_and_reports_it() {
+        use rswidgets::core::ColorScheme;
+
+        rswidgets::core::set_color_scheme(ColorScheme::Light);
+        let mut app = crate::gui::App::new_with_paths(vec![]);
+        let (mut scope, mut clip) = (0u8, String::new());
+
+        let d = dispatch_menu_action(&mut app, "toggle_night_mode", &mut scope, &mut clip);
+        match &d {
+            MenuDispatch::Status(s) => assert!(
+                s.contains("on"),
+                "the status must report that night mode is now on, got {s:?}"
+            ),
+            _ => panic!("expected a Status for the night-mode toggle"),
+        }
+        assert_eq!(
+            rswidgets::core::color_scheme(),
+            ColorScheme::Night,
+            "the action must have switched the global palette"
+        );
+
+        // Press it again: back to light, and the status says so.
+        let d2 = dispatch_menu_action(&mut app, "toggle_night_mode", &mut scope, &mut clip);
+        match &d2 {
+            MenuDispatch::Status(s) => assert!(
+                s.contains("off"),
+                "the status must report that night mode is now off, got {s:?}"
+            ),
+            _ => panic!("expected a Status for the night-mode toggle"),
+        }
+        assert_eq!(rswidgets::core::color_scheme(), ColorScheme::Light);
+
+        // A view setting must not touch the document: no op, no edit.
+        assert_eq!(
+            app.core.ops_applied, 0,
+            "night mode is a display setting and must not record an op"
+        );
     }
 }

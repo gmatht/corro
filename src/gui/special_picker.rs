@@ -65,6 +65,46 @@ pub fn index_for_digit(digit: char) -> Option<usize> {
     special_choice_index_for_digit(digit)
 }
 
+/// Where a picked special character should be spliced, as the *resulting*
+/// `(text, caret)` a backend then writes into its own editor widget.
+///
+/// The picker never commits the edit: it splices the choice into the
+/// in-progress text and leaves the user to commit. Both GUIs agree on the
+/// two cases, which differ only in where the base text comes from:
+///
+/// * **Already editing** — splice at the caret inside `edit_text` (the
+///   widget's live buffer), keeping the caret after the choice.
+/// * **Not editing** — start from the cursor cell's display text and append
+///   the choice (caret at the end), i.e. a seeded edit of `cell + choice`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpecialSplice {
+    /// The full text after splicing (what the editor widget should show).
+    pub text: String,
+    /// Caret position after the splice, as a **char** index.
+    pub caret: usize,
+}
+
+impl SpecialSplice {
+    /// Splice `choice` into the editor's live buffer at `caret`
+    /// (already-editing case). `caret`/`edit_text` are char-based, matching
+    /// the shared text-edit model, so multibyte choices never split a
+    /// codepoint.
+    pub fn into_edit(edit_text: &str, caret: usize, choice: &str) -> Self {
+        let mut text = edit_text.to_string();
+        let caret = crate::ui_core::insert_str_at_char(&mut text, caret, choice);
+        SpecialSplice { text, caret }
+    }
+
+    /// Seed a fresh edit from the cursor cell's display `cell_text` and
+    /// append `choice` (not-editing case).
+    pub fn into_cell(cell_text: &str, choice: &str) -> Self {
+        let mut text = cell_text.to_string();
+        let end = text.chars().count();
+        let caret = crate::ui_core::insert_str_at_char(&mut text, end, choice);
+        SpecialSplice { text, caret }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +171,36 @@ mod tests {
         assert_eq!(index_for_digit('x'), None);
         close(&mut a);
         assert_eq!(index(&a), None);
+    }
+
+    /// Splicing into an in-progress edit inserts at the caret, not at the
+    /// end — the same caret-awareness typing has.
+    #[test]
+    fn splice_into_edit_inserts_at_the_caret() {
+        // "ab" with the caret between a and b, splicing "X" -> "aXb", caret 2.
+        let s = SpecialSplice::into_edit("ab", 1, "X");
+        assert_eq!(s.text, "aXb");
+        assert_eq!(s.caret, 2);
+        // The caret is a *char* index: a multibyte choice must not split.
+        let s = SpecialSplice::into_edit("aθb", 2, "Ω");
+        assert_eq!(s.text, "aθΩb");
+        assert_eq!(s.caret, 3);
+        assert!(s.text.chars().count() == 4);
+        // A caret past the end clamps (append), never panics.
+        let s = SpecialSplice::into_edit("ab", 99, "X");
+        assert_eq!(s.text, "abX");
+        assert_eq!(s.caret, 3);
+    }
+
+    /// Not editing: the edit is seeded from the cell's text plus the choice,
+    /// with the caret after it.
+    #[test]
+    fn splice_into_cell_appends_the_choice() {
+        let s = SpecialSplice::into_cell("=1+2", "Ω");
+        assert_eq!(s.text, "=1+2Ω");
+        assert_eq!(s.caret, 5);
+        let s = SpecialSplice::into_cell("", "∞");
+        assert_eq!(s.text, "∞");
+        assert_eq!(s.caret, 1);
     }
 }

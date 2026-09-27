@@ -1278,3 +1278,158 @@ fn edit_workbook_external_editor_error_is_a_status() {
         other => panic!("expected Status, got {}", dispatch_hint(&other)),
     }
 }
+
+// ── Sheet ▸ Freeze (col_lock / row_lock) ────────────────────────────────────
+//
+// The gutter padlock can only be reached by clicking a ~10px icon, so these
+// two items are the keyboard route to the same edit. They matter as a pair
+// with the shared `LockState`: the menu, the gutter click and the terminal
+// backends must all read one state, or a lock set one way is invisible the
+// other.
+
+/// Both Freeze items must exist in the tree, under Sheet ▸ Freeze, with the
+/// action names the dispatchers key off. A rename on either side would
+/// silently fall through to the stub dispatcher.
+#[test]
+fn freeze_items_are_present_under_sheet() {
+    let leaves = all_leaves();
+    let by_action = |name: &str| {
+        leaves
+            .iter()
+            .find(|l| l.action == name)
+            .unwrap_or_else(|| panic!("no menu leaf for {name}"))
+    };
+
+    let col = by_action("col_lock");
+    assert_eq!(col.path, "Sheet > Freeze");
+    assert_eq!(col.label, "Col Lock");
+
+    let row = by_action("row_lock");
+    assert_eq!(row.path, "Sheet > Freeze");
+    assert_eq!(row.label, "X-Lock");
+}
+
+/// `col_lock` toggles the pin on the CURSOR's column and nothing else, and
+/// reports the gutter it acted on. Acting on the cursor is the whole contract:
+/// there is no picker, so a user who has just moved the cursor expects the
+/// column under it to be the one that freezes.
+#[test]
+fn col_lock_toggles_the_cursors_column() {
+    let mut app = seeded_app(None);
+    let mut pending_scope = 0u8;
+    let mut clipboard = String::new();
+    let col = app.core.cursor.col;
+
+    let out = dispatch_menu_action(&mut app, "col_lock", &mut pending_scope, &mut clipboard);
+    match &out {
+        MenuDispatch::Status(s) => assert!(
+            s.contains("locked") && !s.contains("unlocked"),
+            "first toggle should read as locked, got {s:?}"
+        ),
+        other => panic!("expected Status, got {}", dispatch_hint(&other)),
+    }
+    assert!(app.core.locks.col_locked(col), "cursor column should be pinned");
+    assert_eq!(
+        app.core.locks.pinned_cols(),
+        vec![col],
+        "only the cursor's column may be pinned"
+    );
+
+    // Toggling again releases it: the item is a toggle, not a set.
+    dispatch_menu_action(&mut app, "col_lock", &mut pending_scope, &mut clipboard);
+    assert!(
+        !app.core.locks.col_locked(col),
+        "a second toggle must unlock the column"
+    );
+    assert!(app.core.locks.is_empty());
+}
+
+/// See [`col_lock_toggles_the_cursors_column`] for the row axis.
+#[test]
+fn row_lock_toggles_the_cursors_row() {
+    let mut app = seeded_app(None);
+    let mut pending_scope = 0u8;
+    let mut clipboard = String::new();
+    let row = app.core.cursor.row;
+
+    dispatch_menu_action(&mut app, "row_lock", &mut pending_scope, &mut clipboard);
+    assert!(app.core.locks.row_locked(row), "cursor row should be pinned");
+    assert_eq!(app.core.locks.pinned_rows(), vec![row]);
+
+    dispatch_menu_action(&mut app, "row_lock", &mut pending_scope, &mut clipboard);
+    assert!(!app.core.locks.row_locked(row));
+    assert!(app.core.locks.is_empty());
+}
+
+/// The two axes are independent: freezing a column must not freeze the row
+/// under the cursor, or one menu click silently does double work.
+#[test]
+fn col_and_row_lock_do_not_interfere() {
+    let mut app = seeded_app(None);
+    let mut pending_scope = 0u8;
+    let mut clipboard = String::new();
+    let (row, col) = (app.core.cursor.row, app.core.cursor.col);
+
+    dispatch_menu_action(&mut app, "col_lock", &mut pending_scope, &mut clipboard);
+    assert!(app.core.locks.col_locked(col));
+    assert!(
+        !app.core.locks.row_locked(row),
+        "a column lock must not pin the row"
+    );
+
+    dispatch_menu_action(&mut app, "row_lock", &mut pending_scope, &mut clipboard);
+    assert_eq!(app.core.locks.pinned_cols(), vec![col]);
+    assert_eq!(app.core.locks.pinned_rows(), vec![row]);
+}
+
+/// Pins are per-sheet session state. Locking a column and then switching
+/// sheets must not carry the pin over: the new sheet has its own layout and a
+/// carried pin would freeze a column the user never chose.
+#[test]
+fn locks_do_not_survive_a_sheet_switch() {
+    let mut app = seeded_app(None);
+    let mut pending_scope = 0u8;
+    let mut clipboard = String::new();
+    dispatch_menu_action(&mut app, "col_lock", &mut pending_scope, &mut clipboard);
+    assert!(!app.core.locks.is_empty());
+
+    // Add a second sheet the way the `new_sheet` action does, then switch to
+    // it the way `sheet_next` does.
+    let id = app.core.workbook.next_sheet_id;
+    let idx = app
+        .core
+        .workbook
+        .add_sheet(format!("Sheet{id}"), corro::ops::SheetState::new_seeded());
+    let n = app.core.workbook.sheet_count();
+    assert!(n > 1, "need a second sheet for this test");
+    app.core.workbook.active_sheet = idx;
+    app.core.view_sheet_id = app.core.workbook.sheet_id(idx);
+
+    // The pin is dropped on the first read of the new sheet, which is what
+    // every backend does before drawing or toggling.
+    let sid = app.core.view_sheet_id;
+    let (rows, cols) = app.core.locks.ensure_sheet(sid);
+    assert!(rows.is_empty() && cols.is_empty(), "stale pins survived the switch");
+}
+
+/// The gutter padlock and the menu must be the same edit. The GUI's click path
+/// goes through `GuiState`'s pins, which now read `core.locks`; this asserts
+/// the state the menu writes is the state that state holds, so a lock cannot
+/// be visible in one place and absent from the other.
+#[test]
+fn menu_locks_are_visible_to_the_shared_state() {
+    let mut app = seeded_app(None);
+    let mut pending_scope = 0u8;
+    let mut clipboard = String::new();
+    let col = app.core.cursor.col;
+
+    dispatch_menu_action(&mut app, "col_lock", &mut pending_scope, &mut clipboard);
+
+    // The read path the GUI render uses (see `gui_backend::pinned_sets`).
+    let sid = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+    let (_rows, cols) = app.core.locks.ensure_sheet(sid);
+    assert!(
+        cols.contains(&col),
+        "the padlock would not show as locked after a menu Col Lock"
+    );
+}

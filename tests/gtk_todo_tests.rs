@@ -257,60 +257,78 @@ fn gui_spreadsheet_scrollbars() {
 /// content widget was dropped (destroying the native control) as soon as the
 /// builder function returned — only the dialog itself was leaked.
 ///
-/// Pin the structural invariant: both builders must leak their content widget
-/// (`Box::into_raw`) alongside the dialog, and must attach that content with
-/// `append_content_area` before `present()`.
+/// Both dialogs are now thin wrappers over `show_text_dialog`, so the
+/// structural invariants live in that one helper. They are asserted there
+/// (plus that the two public builders delegate to it), rather than duplicated
+/// per dialog.
 #[test]
 fn about_and_help_dialogs_keep_their_content_widgets_alive() {
     let src = fs::read_to_string("src/gui/dialogs.rs").unwrap();
 
-    for (name, content_var) in [("show_about_dialog", "tv"), ("show_keybinds_help", "tv")] {
+    // 1. The shared helper must attach content before presenting, and leak
+    //    both the content widget and the dialog.
+    let start = src
+        .find("fn show_text_dialog")
+        .expect("show_text_dialog not found");
+    let rest = &src[start..];
+    let end = rest[9..]
+        .find("\nfn ")
+        .map(|i| i + 9)
+        .unwrap_or(rest.len());
+    let body = &rest[..end];
+
+    assert!(
+        body.contains("append_content_area"),
+        "show_text_dialog must attach its content to the dialog"
+    );
+    assert!(
+        body.contains("Box::into_raw(Box::new(tv))"),
+        "show_text_dialog must leak its content widget (tv); dropping the \
+         wrapper destroys the native control and the dialog renders empty"
+    );
+    let attach = body.find("append_content_area").expect("append_content_area");
+    let present = body.find(".present()").expect(".present()");
+    assert!(
+        attach < present,
+        "show_text_dialog must append content before present()"
+    );
+
+    // 2. Both public dialogs must route through that helper (so they cannot
+    //    regress into their own, unprotected, widget handling).
+    for name in ["show_about_dialog", "show_keybinds_help"] {
         let start = src
             .find(&format!("pub fn {name}"))
             .unwrap_or_else(|| panic!("{name} not found"));
-        // Body ends at the next top-level `pub fn` (or EOF).
         let rest = &src[start..];
         let end = rest[9..]
             .find("\npub fn ")
             .map(|i| i + 9)
             .unwrap_or(rest.len());
         let body = &rest[..end];
-
         assert!(
-            body.contains("append_content_area"),
-            "{name} must attach its content to the dialog"
-        );
-        assert!(
-            body.contains(&format!("Box::into_raw(Box::new({content_var}))")),
-            "{name} must leak its content widget ({content_var}); dropping the \
-             wrapper destroys the native control and the dialog renders empty"
-        );
-        // The content must be attached before the dialog is shown.
-        let attach = body.find("append_content_area").unwrap();
-        let present = body.find(".present()").unwrap();
-        assert!(
-            attach < present,
-            "{name} must append content before present()"
+            body.contains("show_text_dialog("),
+            "{name} must delegate to show_text_dialog"
         );
     }
 }
 
 /// Regression: a NWG STATIC label collapses its client area to a single line
-/// height, so the two-line About text lost its second line. About must use a
-/// multi-line text view (the control the Keybindings dialog already uses).
+/// height, so the two-line About text lost its second line. The shared text
+/// dialog must use a multi-line text view, and neither About nor any other
+/// caller may fall back to a single-line label.
 #[test]
 fn about_dialog_uses_multiline_textview_not_a_label() {
     let src = fs::read_to_string("src/gui/dialogs.rs").unwrap();
-    let start = src.find("pub fn show_about_dialog").unwrap();
+    let start = src.find("fn show_text_dialog").unwrap();
     let rest = &src[start..];
-    let end = rest[9..].find("\npub fn ").map(|i| i + 9).unwrap_or(rest.len());
+    let end = rest[9..].find("\nfn ").map(|i| i + 9).unwrap_or(rest.len());
     let body = &rest[..end];
     assert!(
         body.contains("create_textview"),
-        "About must use a multi-line text view (a NWG STATIC label drops every line after the first)"
+        "the text dialog must use a multi-line text view (a NWG STATIC label drops every line after the first)"
     );
     assert!(
         !body.contains("new_label"),
-        "About must not use a single-line label"
+        "the text dialog must not use a single-line label"
     );
 }

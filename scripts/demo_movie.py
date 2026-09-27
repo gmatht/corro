@@ -218,6 +218,13 @@ def main() -> int:
     # captures each one about twice.
     ap.add_argument("--capture-fps", type=float, default=16.0, help="screenshot rate while replaying")
     ap.add_argument("--keep-frames", action="store_true", help="keep the intermediate frames")
+    ap.add_argument(
+        "--menu-tour-video",
+        type=Path,
+        default=None,
+        help="use this pre-recorded video for the menu tour replay segment "
+             "instead of capturing it live (avoids the broken menu-tour capture on GTK3)",
+    )
     args = ap.parse_args()
 
     for tool in ("ffmpeg", "Xvfb", "xwd", "convert"):
@@ -260,6 +267,20 @@ def main() -> int:
              "-framerate", str(fps), "-i", str(pattern),
              "-vf", vf,
              "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", str(args.crf),
+             str(out)],
+            check=True,
+        )
+        segments.append(out)
+
+    def add_video(video: Path, tag: str) -> None:
+        """Transcode an external video to a segment matching the movie format."""
+        out = work / f"seg-{len(segments):02d}.mp4"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-i", str(video),
+             "-vf", "fps={},scale=trunc(iw/2)*2:trunc(ih/2)*2".format(args.fps),
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", str(args.crf),
+             "-movflags", "+faststart",
              str(out)],
             check=True,
         )
@@ -326,33 +347,36 @@ def main() -> int:
         )
         add_card(Image.open(c), args.title_secs, f"card-{len(segments)}")
 
-        d = work / "menu-tour-frames"
-        d.mkdir()
-        tour_work = work / "menu-tour-base.corro"
-        tour_work.write_text(MENU_TOUR_WORKBOOK)
-        tour_seconds = len(MENU_TOUR) * MENU_TOUR_STEP_MS / 1000.0
-        subprocess.run(
-            [
-                sys.executable, "scripts/gui_movie.py", str(tour_work),
-                "--frames-dir", str(d),
-                # The replay itself is three short lines; the tour is the
-                # content, so type fast and hold briefly.
-                "--cps", str(max(args.cps, 30)),
-                "--confirm-ms", "60",
-                "--menu-hold-ms", "200",
-                "--capture-fps", str(args.capture_fps),
-                "--max-frames", str(int(args.capture_fps * (tour_seconds + 30))),
-                "--tour", menu_tour_script(),
-                "-o", str(work / "menu-tour.mp4"),
-            ],
-            check=True,
-            cwd=str(ROOT),
-        )
-        captured = sorted(d.glob("frame-*.ppm"))
-        if not captured:
-            sys.exit("error: no frames captured for the menu tour")
-        add_frames(d / "frame-%05d.ppm", len(captured), None, args.fps)
-        shutil.rmtree(d, ignore_errors=True)
+        if args.menu_tour_video:
+            add_video(args.menu_tour_video, "menu-tour-external")
+        else:
+            d = work / "menu-tour-frames"
+            d.mkdir()
+            tour_work = work / "menu-tour-base.corro"
+            tour_work.write_text(MENU_TOUR_WORKBOOK)
+            tour_seconds = len(MENU_TOUR) * MENU_TOUR_STEP_MS / 1000.0
+            subprocess.run(
+                [
+                    sys.executable, "scripts/gui_movie.py", str(tour_work),
+                    "--frames-dir", str(d),
+                    # The replay itself is three short lines; the tour is the
+                    # content, so type fast and hold briefly.
+                    "--cps", str(max(args.cps, 30)),
+                    "--confirm-ms", "60",
+                    "--menu-hold-ms", "200",
+                    "--capture-fps", str(args.capture_fps),
+                    "--max-frames", str(int(args.capture_fps * (tour_seconds + 30))),
+                    "--tour", menu_tour_script(),
+                    "-o", str(work / "menu-tour.mp4"),
+                ],
+                check=True,
+                cwd=str(ROOT),
+            )
+            captured = sorted(d.glob("frame-*.ppm"))
+            if not captured:
+                sys.exit("error: no frames captured for the menu tour")
+            add_frames(d / "frame-%05d.ppm", len(captured), None, args.fps)
+            shutil.rmtree(d, ignore_errors=True)
 
         for pair, title, desc, note in TWO_WINDOW:
             c = work / f"two-{pair}.png"

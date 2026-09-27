@@ -1,6 +1,6 @@
 use crate::core::state::CoreApp;
 mod app_alias;
-use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};use crate::io::load_workbook_revisions_partial;
+use crate::grid::{CellAddr, SelectionKind, SheetCursor, HEADER_ROWS, MARGIN_COLS};use crate::io::load_workbook_revisions_partial;
 use crate::io::PartialReplay;
 use std::path::Path;
 use crate::ops::WorkbookState;
@@ -8,6 +8,10 @@ use std::path::PathBuf;
 
 pub mod actions;
 pub mod agg_picker;
+#[cfg(any(feature = "gui", test))]
+mod once_callback;
+mod dialog_widgets;
+pub mod picker_dispatch;
 pub mod clipboard;
 pub mod viewport;
 pub mod compute;
@@ -22,9 +26,19 @@ pub mod render;
 pub mod sheet;
 pub mod special_picker;
 
-#[cfg(any(feature = "gui", feature = "gui-mobile", all(feature = "wasm", target_arch = "wasm32")))]
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    all(feature = "wasm", target_arch = "wasm32")
+))]
 mod gui_backend;
-#[cfg(any(feature = "gui", feature = "gui-mobile", all(feature = "wasm", target_arch = "wasm32")))]
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    all(feature = "wasm", target_arch = "wasm32")
+))]
 pub mod gui_movie;
 /// Android backend: the JNI entry point + run loop the `corro_android`
 /// cdylib calls (see `android/corro/src/lib.rs`).
@@ -52,7 +66,7 @@ pub mod android_backend;
 // menu definition — `examples/ios_ui.rs` prints that model on a desktop, and
 // `--features gui-mobile` is checked on Linux CI, so compiling the module
 // everywhere is what keeps those honest.
-#[cfg(any(feature = "gui", feature = "gui-mobile"))]
+#[cfg(any(feature = "gui", feature = "gui-mobile", feature = "gui-macos"))]
 pub mod ios_backend;
 /// macOS backend: the `extern "C"` entry point + bootstrap for the AppKit
 /// adapter (see `rustxWidgets/docs/MACOS_GUIDELINES.md`).
@@ -67,7 +81,14 @@ pub mod ios_backend;
 /// Not target-gated, for the same reason `ios_backend` is not: the menu model
 /// and dispatcher must keep compiling (and being tested) on a desktop, so a
 /// drift is caught without an Apple host.
-#[cfg(any(feature = "gui", feature = "gui-mobile"))]
+///
+/// `gui-macos` is included so a native Mac build can select *this* backend
+/// without also pulling in `rswidgets/ios` (which is what `gui-mobile` implies
+/// and is meaningless on a desktop). `gui-mobile` still reaches it, because
+/// `scripts/check_corro_macos.sh` checks the macOS cfg paths through that
+/// feature today, and removing it there would make that check compile less
+/// than it does now.
+#[cfg(any(feature = "gui", feature = "gui-mobile", feature = "gui-macos"))]
 pub mod macos_backend;
 #[cfg(feature = "pancurses")]
 mod pnc_backend;
@@ -107,6 +128,29 @@ pub struct App {
 }
 
 impl App {
+    /// Enter revision-browse mode: the user is stepping a `.corro` log's
+    /// revisions rather than editing a workbook.
+    ///
+    /// Two flags, because two layers need to know: `core.revision_browse`
+    /// marks the workbook as a browsable revision set (a read-only view,
+    /// consulted by the shared commit/reload paths), while `rev_browse`
+    /// drives key routing (Left/Right step instead of moving the cursor)
+    /// and the browse hint row. They are *always* entered and left
+    /// together, so both go through these two methods rather than being
+    /// assigned at each call site.
+    pub fn enter_revision_browse(&mut self) {
+        self.rev_browse = true;
+        self.core.revision_browse = true;
+    }
+
+    /// Leave revision-browse mode (Enter/Esc in the mode). The workbook
+    /// keeps the browsed contents; it just stops being treated as a
+    /// revision set, and keys route normally again.
+    pub fn leave_revision_browse(&mut self) {
+        self.rev_browse = false;
+        self.core.revision_browse = false;
+    }
+
     pub fn new_with_paths(paths: Vec<PathBuf>) -> Self {
         // Fresh-document content mirrors the TUI (App::new_with_revision_limit):
         // a CORRO_TEMPLATE workbook when set and readable, else the built-in
@@ -130,6 +174,7 @@ impl App {
         } else {
             (WorkbookState::new(), None)
         };
+        let view_sheet_id = workbook.sheet_id(workbook.active_sheet);
         App {
             core: CoreApp {
                 path: paths.first().cloned(),
@@ -143,15 +188,16 @@ impl App {
                 workbook,
                 cursor: SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS },
                 anchor: None,
+                selection_kind: SelectionKind::Cells,
                 watcher: None,
                 ops_applied: 0,
                 op_history: Vec::new(),
                 redo_history: Vec::new(),
-                view_sheet_id: 0,
+                view_sheet_id,
                 persisted_view_sort_cols: Default::default(),
                 linked_source_mtimes: Default::default(),
                 unsaved_file: None,
-                unsaved_auto_create: false,
+                unsaved_auto_create: true,
                 status: template_note.unwrap_or_default(),
                 exit_message: None,
                 clipboard_snapshot: None,
@@ -159,6 +205,7 @@ impl App {
                 edit_range_addrs: None,
                 pending_lost_edit: None,
                 pending_fit_to_content_on_commit: false,
+                locks: Default::default(),
             },
             rev_limit: None,
             rev_browse: false,
@@ -173,8 +220,7 @@ impl App {
 
     pub fn new_with_revision_browser(path: Option<PathBuf>) -> Self {
         let mut app = Self::new_with_paths(path.into_iter().collect());
-        app.rev_browse = true;
-        app.core.revision_browse = true;
+        app.enter_revision_browse();
         app
     }
 
@@ -348,7 +394,12 @@ impl App {
     /// not perturb the workbook it is replaying, but the viewport math needs
     /// `&mut App`. The clone is read-only from the caller's perspective —
     /// nothing done to it is ever copied back.
-    #[cfg(any(feature = "gui", feature = "gui-mobile", all(feature = "wasm", target_arch = "wasm32")))]
+    #[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    all(feature = "wasm", target_arch = "wasm32")
+))]
     pub(crate) fn copy_for_layout(&self) -> App {
         App {
             core: CoreApp {
@@ -363,6 +414,7 @@ impl App {
                 workbook: self.core.workbook.clone(),
                 cursor: self.core.cursor,
                 anchor: self.core.anchor,
+                selection_kind: self.core.selection_kind,
                 watcher: None,
                 status: self.core.status.clone(),
                 ops_applied: self.core.ops_applied,
@@ -372,13 +424,16 @@ impl App {
                 persisted_view_sort_cols: self.core.persisted_view_sort_cols.clone(),
                 linked_source_mtimes: Default::default(),
                 unsaved_file: None,
-                unsaved_auto_create: false,
+                unsaved_auto_create: true,
                 exit_message: None,
                 clipboard_snapshot: None,
                 edit_target_addr: None,
                 edit_range_addrs: None,
                 pending_lost_edit: None,
                 pending_fit_to_content_on_commit: false,
+                // Read-only layout clone: keep the pins so a replayed movie
+                // frames against the same frozen view as the live app.
+                locks: self.core.locks.clone(),
             },
             rev_limit: self.rev_limit,
             rev_browse: self.rev_browse,

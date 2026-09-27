@@ -96,6 +96,24 @@ pub fn numeric_columns(grid: &Grid) -> Vec<usize> {
         .collect()
 }
 
+/// Column choices for the Balance Books dialog: labels of all non-empty
+/// numeric columns, plus the index of the auto-detected default.
+///
+/// Both the GUI and pancurses backends call this to populate their column
+/// picker (dropdown or list), so the choices and default selection never
+/// drift apart.
+pub fn balance_column_choices(grid: &Grid) -> (Vec<String>, usize) {
+    let cols = numeric_columns(grid);
+    let labels: Vec<String> = cols
+        .iter()
+        .map(|&c| crate::addr::excel_column_name(c))
+        .collect();
+    let initial = choose_balance_column(grid)
+        .and_then(|auto| cols.iter().position(|&c| c == auto))
+        .unwrap_or(0);
+    (labels, initial)
+}
+
 pub fn source_rows_from_grid(grid: &Grid, col: usize) -> Vec<BalanceSourceRow> {
     let mut rows = Vec::new();
     for row in 0..grid.main_rows() {

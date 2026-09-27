@@ -1,4 +1,18 @@
-//! Shared cell-address parsing (Excel columns, global column suffixes, single-cell refs).
+//! Shared cell-address parsing (bijective base-26 column letters, global column
+//! suffixes, single-cell refs).
+//!
+//! The `excel_*` helpers below implement **bijective base-26** column naming
+//! (`A`..`Z`, `AA`, ..., `ZZZ`), the convention shared by Excel, LibreOffice
+//! Calc, Google Sheets and Gnumeric. The name says "Excel" because that is the
+//! scheme a reader will recognise, not because corro aims at Excel
+//! compatibility: `DESIGN.md` lists full Excel compatibility as a non-goal, and
+//! corro imports/exports **ODS** (LibreOffice), not `.xlsx`.
+//!
+//! Note also that the main region is not corro's only addressing scheme —
+//! headers use `~`, footers `_`, and the margins `[A` / `]A` with *mirrored*
+//! letters (see `mirror_margin_column_name`). Keeping "excel" in these two
+//! names disambiguates the main-region scheme from those; a bare
+//! `column_name` would not.
 
 use crate::grid::{CellAddr, ColumnAddr, HEADER_ROWS};
 
@@ -14,7 +28,9 @@ pub struct MainRows(pub usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct MainCols(pub usize);
 
-/// Parse Excel-style column name `A`..`ZZZ` → 0-based main column index.
+/// Parse a bijective base-26 column name `A`..`ZZZ` → 0-based main column
+/// index. (The `A`/`AA` scheme; see the module docs for why it is named after
+/// Excel.)
 pub fn parse_excel_column(name: &str) -> Option<u32> {
     let mut n: u32 = 0;
     for b in name.bytes() {
@@ -26,7 +42,8 @@ pub fn parse_excel_column(name: &str) -> Option<u32> {
     Some(n - 1)
 }
 
-/// 0-based main column index → Excel column letters.
+/// 0-based main column index → bijective base-26 column letters (`A`, `AA`, …).
+/// Inverse of [`parse_excel_column`].
 pub fn excel_column_name(main_col_index: usize) -> String {
     let mut n = main_col_index + 1;
     let mut s = String::new();
@@ -36,6 +53,17 @@ pub fn excel_column_name(main_col_index: usize) -> String {
         n /= 26;
     }
     s.chars().rev().collect()
+}
+
+/// A store's **global** column index → its base-26 letter.
+///
+/// Global columns include the left margin, so the letter is computed from the
+/// main-column index (`global - MARGIN_COLS`), saturating at 0 for a margin
+/// column. Several call sites (sort specs, movie op descriptions, format
+/// labels) spell this subtraction out by hand; this is the one name for it, so
+/// a column can never be labelled from the wrong origin in one of them.
+pub fn global_column_letter(global_col: usize) -> String {
+    excel_column_name(global_col.saturating_sub(crate::grid::MARGIN_COLS))
 }
 
 /// Margin label (`A` nearest the main grid/right edge, up to `ZZ`).

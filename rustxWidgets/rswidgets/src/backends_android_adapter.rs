@@ -671,7 +671,10 @@ mod android_adapter {
 
     impl Canvas {
         /// Canvas id for this view (0 = unknown; registry lookups miss).
-        fn canvas_id(&self) -> u64 {
+        /// This canvas's backend id. Exposed so a host can tell which canvas
+        /// a platform gesture belongs to (the sheet and the sheet-tab strip are
+        /// both canvases, and a drag means different things on each).
+        pub fn canvas_id(&self) -> u64 {
             crate::backends::android::canvas_id_for_view(self.0)
         }
 
@@ -741,6 +744,33 @@ mod android_adapter {
 
         pub fn grab_focus(&self) {}
         pub fn set_can_focus(&self, _can: bool) {}
+
+        /// Button/modifier-aware click. See the GTK backend's
+        /// `on_click_button`: added alongside `on_click` so the signature change
+        /// does not ripple through every backend, and so a backend that cannot
+        /// report a button (a terminal) stays compilable. Touch has no buttons,
+        /// so Android maps only the plain contract.
+        pub fn on_click_button(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            // Android: touch has no button number; only press is reported.
+        }
+
+        /// Pointer motion over the canvas; see the GTK backend's `on_motion`.
+        pub fn on_motion(&self, _cb: Box<dyn FnMut(f64, f64, u32)>) {
+            // Android: touch has no button number; only press is reported.
+        }
+
+        /// This canvas's top-left in screen coordinates, or `None` when the
+        /// backend cannot report one. Callers then open a context menu
+        /// unpositioned rather than guessing. See the GTK backend's
+        /// `screen_origin`.
+        pub fn screen_origin(&self) -> Option<(i32, i32)> {
+            None
+        }
+
+        /// Pointer release; see the GTK backend's `on_release`.
+        pub fn on_release(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            // Android: touch has no button number; only press is reported.
+        }
 
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
             let mut map = CLICK_CALLBACKS.lock().unwrap();
@@ -1250,6 +1280,16 @@ mod android_adapter {
 
     impl MenuBar {
         pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool {
+            false
+        }
+
+        /// Open the submenu whose mnemonic is `keyval` at a screen position.
+        ///
+        /// Only the GTK backend can do this (its `GtkMenu` takes a position
+        /// callback); elsewhere the menu system has no programmatic
+        /// popup-at-position call, so this reports `false` instead of
+        /// pretending. The caller surfaces that as an "unavailable" status.
+        pub fn popup_submenu_by_mnemonic_at(&self, _keyval: u32, _x: i32, _y: i32) -> bool {
             false
         }
         pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool {

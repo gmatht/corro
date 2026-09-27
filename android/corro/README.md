@@ -75,26 +75,42 @@ Touch interaction
 -----------------
 Android has no native scrolling for the sheet: the grid is drawn by Rust
 into a plain `Canvas`, and the adapter's `ScrolledWindow` is an inert
-`FrameLayout`. `SheetView.onTouchEvent` therefore classifies the gesture
-itself and hands whole-cell counts to Rust:
+`FrameLayout`. `SheetView` therefore classifies the raw touch stream and
+reports it; what a gesture *means* is Rust's decision, so the phone and desktop
+rules live in one place (`rswidgets::gridview`, mirrored for this app in
+`gui_backend::mobile_gesture`):
 
-* **tap** (`ACTION_UP` without exceeding touch slop) — moves the cursor to
-  the tapped cell;
-* **drag** — scrolls the viewport.
+* **pinch** (`ScaleGestureDetector`) — the sheet's view scale, 0.4x..4x, like a
+  photo. Everything the grid draws *and* everything a finger hits derives from
+  that one scale, so a tap after a pinch still lands on the cell under it;
+* **double tap** — reset the zoom to 1x;
+* **tap** — moves the cursor to the tapped cell;
+* **finger drag** — pans the viewport;
+* **long press, then drag** — selects a range (the phone's substitute for
+  shift-click);
+* **mouse/stylus drag** (the tool type is not a finger) — selects, as on a
+  desktop.
 
-The drag path accumulates the pixel delta from where the gesture *started*
-(not from where touch slop was exceeded — discarding the pre-slop travel
-loses the first row of every gesture), converts it to rows/columns using
-`nativeCellSize()`, and carries the sub-cell remainder into the next event
-so a slow drag still scrolls smoothly. `nativeCellSize()` exists so the
-conversion uses the very metrics Rust rendered with; a constant hardcoded
-in Java would drift with density or font changes.
+The drag path accumulates the pixel delta from where the gesture *started* (not
+from where touch slop was exceeded — discarding the pre-slop travel loses the
+first row of every gesture) and hands it to Rust (`nativeDragBy`), which is the
+only side that knows the live metrics: a pinch changes them, so a cell size
+cached in Java would pan by the stale amount after a zoom. Java keeps only the
+sub-cell remainder, so a slow drag still scrolls smoothly. `nativeCellSize()` is
+re-read after every zoom for the same reason; a constant hardcoded in Java
+would drift with density, font *or* pinch changes.
+
+A second finger cancels the one-finger gesture (`ACTION_POINTER_DOWN` →
+`nativeGestureCancel`), or a pinch would also scroll the sheet underneath
+itself.
 
 `scroll_viewport_by_cells` in `gui_backend.rs` moves the *cursor*, because
 this GUI has no independent scroll offset: `displayed_rows`/`displayed_cols`
 derive the viewport from `app.core.cursor` (`prev_start` is always 0), so
 the cursor is the viewport origin. That keeps one code path for "viewport
 moved" and keeps the selected cell visible for free.
+
+See `rustxWidgets/docs/ANDROID_GUIDELINES.md` §3.1 for the full export table.
 
 Layout notes
 ------------

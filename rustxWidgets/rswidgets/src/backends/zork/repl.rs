@@ -26,6 +26,11 @@ impl Default for ZorkApp {
 }
 
 impl BackendApp for ZorkApp {
+    /// A REPL owns its input loop: nothing else dispatches for us.
+    fn owns_event_loop(&self) -> bool {
+        true
+    }
+
     fn run(mut self: Box<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.state.nodes.is_empty() {
             return Ok(());

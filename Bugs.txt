@@ -1,2 +1,54 @@
 Does overwrites file without prompting
 What purpose does ' | ' serve in LINK?
+GUI: gui_new_doc_left_moves_blue_selection finds no cursor highlight
+The test scans the screenshot for the cursor cell's light blue (204,230,255)
+before pressing Left. The app initialises the cursor to the sentinel
+`SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS }`, and HEADER_ROWS is not
+in `displayed_rows`, so no cell is ever painted with CELL_CURSOR — the scan
+finds nothing. Pre-existing (HEAD's committed gui_backend.rs does the same
+initialisation), unrelated to the freeze/padlock work. Either the app should
+open with the cursor on A1, or the test should move the cursor before looking
+for the highlight.
+
+GUI: diag_parity fails on Insert ▸ Date, then leaks a corro process per item
+The ratatui reference shows "Choose an aggregate…" where pancurses shows
+"Loaded workbook …" for Insert ▸ Date, so the item does not match. Separately,
+each of the test's 11 items spawns a tmux session holding a live
+`corro --pancurses`; `wait_for_text` panicking leaves that session (and its
+child) running, so repeated failed runs pile up dozens of TUIs until the box
+is unusable. A SessionGuard now kills the session on drop. The Date mismatch
+itself is still open.
+
+GUI: gui_tab_click_switches_active_sheet sees the highlight in the first tab
+The status line correctly reads "Sheet 2 of 2", so the click did switch
+sheets, but the second verdict (the active-tab highlight must start past the
+first divider) does not. The active tab is probably not repainted on a
+mouse-driven sheet switch — the click path repaints the grid, not the tab
+strip. Needs a look at whether the tab strip redraws after a click-initiated
+sheet change (as opposed to a menu/keyboard one).
+
+GUI: gui_formula_click_then_type_inserts_at_caret_not_end types at the end
+Clicking into the formula entry mid-text and typing appends at the end
+instead of at the caret: the entry gets "1234567899" where the caret was
+after the first character. The log shows both the intended and the appended
+write being identical, so the click did not move the entry's caret. Likely
+the entry's click handler focuses the widget but never sets the caret
+position from the click x-coordinate.
+
+GUI: formula_row_stays_put_on_move measures fx at the wrong x
+The formula row IS stable now — the address and status labels are pinned with
+set_fixed_width, so nothing reflows. But the test's analyzer takes the first
+dark pixel after x>20 in the y=30..44 band, which used to be the address
+text and is now the pinned-but-wider slot's leading edge, so it reports 27
+before and 21 after. The measurement needs to find the "fx" caption itself
+(its own text band / a fixed offset past the pinned address slot) rather than
+"the first ink", which is no longer a proxy for it.
+
+GUI: gui_new_doc_left_moves_blue_selection has no cursor to measure
+The test screenshots the grid once, right after startup, and requires the
+blue cursor highlight (204,230,255) to be visible. It never is: measured on a
+live window, the grid has 0 highlight pixels at startup and 612 after the
+first key. So the test fails on its precondition before it ever presses Left.
+Unrelated to the formula row; it needs a settle (or a key) before the first
+screenshot. Confirmed pre-existing: it fails identically with the GTK label
+pin disabled.

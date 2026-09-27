@@ -15,7 +15,9 @@ pub use core::{locale_is_rtl, set_layout_direction, set_layout_direction_hook, s
 // Portable periodic tick (GTK timeout / Win32 WM_TIMER) — see core::add_periodic_tick.
 pub use core::add_periodic_tick;
 pub mod spreadsheet;
+pub mod gridview;
 pub mod overflow;
+pub mod tabbar;
 
 /// Re-export the dynamic GTK loader so host apps using the `gtk` backend can reach
 /// raw symbols (signal wiring, event state, ...) without depending on it directly.

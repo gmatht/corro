@@ -1491,6 +1491,35 @@ impl SimpleAction {
             }
         }
 
+        /// Button/modifier-aware click. See the GTK backend's
+        /// `on_click_button`: added alongside `on_click` so the signature change
+        /// does not ripple through every backend, and so a backend that cannot
+        /// report a button (terminal, mobile) stays compilable.
+        pub fn on_click_button(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            // wasm: the DOM handler does not yet forward button/state; a follow-up can
+            // wire MouseEvent::button into a stored callback.
+        }
+
+        /// Pointer motion over the canvas; see the GTK backend's `on_motion`.
+        pub fn on_motion(&self, _cb: Box<dyn FnMut(f64, f64, u32)>) {
+            // wasm: the DOM handler does not yet forward button/state; a follow-up can
+            // wire MouseEvent::button into a stored callback.
+        }
+
+        /// This canvas's top-left in screen coordinates, or `None` when the
+        /// backend cannot report one. Callers then open a context menu
+        /// unpositioned rather than guessing. See the GTK backend's
+        /// `screen_origin`.
+        pub fn screen_origin(&self) -> Option<(i32, i32)> {
+            None
+        }
+
+        /// Pointer release; see the GTK backend's `on_release`.
+        pub fn on_release(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            // wasm: the DOM handler does not yet forward button/state; a follow-up can
+            // wire MouseEvent::button into a stored callback.
+        }
+
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
             *self.click_cb.borrow_mut() = Some(cb);
             let cb2 = self.click_cb.clone();

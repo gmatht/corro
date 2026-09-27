@@ -66,7 +66,7 @@ side resolves it with `objc_getClass` and sends the listed selector.
 | Class | Contract |
 |---|---|
 | `CorroSceneDelegate` (or the app delegate) | On view load, calls the cdylib's `corro_ios_root_ready(root, viewController)`. That is the whole bootstrap: it ends in `rswidgets::backends::ios::init_with_root`. |
-| `SheetView : UIView` | Property/selector `corroSetCanvasId:` (called by `create_canvas`); `drawRect:` → `corro_ios_canvas_draw(canvas_id, ctx, w, h)`; `touchesEnded:` → `corro_ios_canvas_click(canvas_id, x, y)`; optional `corroSetContentSize:` for the viewport size. Without it, canvases are plain `UIView`s (the tree still builds, nothing draws). |
+| `SheetView : UIView` | Property/selector `corroSetCanvasId:` (called by `create_canvas`); `drawRect:` → `corro_ios_canvas_draw(canvas_id, ctx, w, h)`; `layoutSubviews` → `corro_ios_canvas_size(canvas_id, w, h)`; optional `corroSetContentSize:` for the viewport size. Touches are reported through the gesture exports in §3.1. Without it, canvases are plain `UIView`s (the tree still builds, nothing draws). |
 | `CorroIosTarget` | Class factory `targetWithCallbackId:` returning a target that, on its `corroFired:` action, calls `corro_ios_callback(callback_id)`. This is the `RustCallback.java` equivalent. |
 | `CorroIosText` | `measure:font:size:slant:weight:` → a `malloc`ed `CGRect*` (or null) with the text width/height; `drawText:ctx:font:x:y:size:r:g:b:a:slant:weight:` draws into the live `CGContextRef`. See §5 for why text is delegated. |
 | `CorroIosAlert` | `corroNewAlert` returns a dialog object; `corroAddAction:` adds a button; `corroPresentDialog:` on the view controller presents it. The class decides whether to use `UIAlertController` (iOS 8+) or `UIAlertView` (iOS 7). |
@@ -74,11 +74,50 @@ side resolves it with `objc_getClass` and sends the listed selector.
 | Text-field delegate | `editingChanged` → `corro_ios_entry_changed(viewPtr)`; `textFieldShouldReturn:` → `corro_ios_entry_activate(viewPtr)`; begin/end editing → `corro_ios_entry_focus(viewPtr, gained)`. These are the four entry signals. |
 | Menu bar / overflow button | Reads the model from `corro_ios_menu_model` (see §4) and dispatches a chosen item through `corro_ios_menu_action(name)`. |
 
+### 3.1 Touch gestures (pinch to zoom; drag pans unless a long press armed select)
+
+`SheetView` classifies the raw touch stream and reports it; what a gesture
+*means* is Rust's decision, so the phone rule lives in one place
+(`rswidgets::gridview`, mirrored for corro's live sheet in
+`gui_backend::mobile_gesture`) and is identical to Android's.
+
+| Gesture | Meaning |
+|---|---|
+| Pinch (`UIPinchGestureRecognizer`) | The sheet's view scale (0.4x..4x), like a photo. |
+| Finger drag | Pans the sheet. |
+| Long press, then drag | Selects a range — the phone's substitute for shift-click. |
+| Tap | Moves the cursor to the tapped cell. |
+| Mouse/trackpad drag | Selects (`UITouch.type != UITouchTypeIndirectPointer`). |
+| Double tap | Resets the zoom to 1x. |
+
+The exports the canvas view calls (all in `corro::gui::ios_backend`, declared in
+`app/CorroBridge.h`; a view that implements none still taps and draws):
+
+| ObjC call | Rust export | Purpose |
+|---|---|---|
+| `corro_ios_canvas_gesture_down(x, y, isTouch)` | `corro::gui::ios_backend::gesture_down` | Begin a gesture; `isTouch` picks the platform rule. |
+| `corro_ios_canvas_gesture_move(x, y) -> int32_t` | `gesture_move` | Outcome code: 0 ignored, 1 select, 2 scroll, 3 tap, 4 long press. |
+| `corro_ios_canvas_gesture_up(x, y)` | `gesture_up` | End it; a non-drag release is applied as a tap. |
+| `corro_ios_canvas_gesture_long_press(x, y)` | `gesture_long_press` | Arm selection for the drag that follows. |
+| `corro_ios_canvas_gesture_cancel()` | `gesture_cancel` | Drop the gesture without a tap (a second finger arrived, a system gesture fired). |
+| `corro_ios_canvas_drag_by(dx, dy, out)` | `drag_viewport` | Convert a pan in points to `[dRows, dCols]` with the live (zoom-aware) metrics. |
+| `corro_ios_canvas_cell_size(out)` | `touch_cell_size` | `[row_h, col_w]` in points — **re-read after every zoom**. |
+| `corro_ios_canvas_zoom(factor) -> double` | `zoom_viewport` | Multiply the view scale by the pinch's ratio. |
+| `corro_ios_canvas_zoom_reset() -> double` | `reset_viewport_zoom` | Back to 1x. |
+| `corro_ios_canvas_click(id, x, y)` | `dispatch_canvas_click` | Kept for hosts that deliver a tap directly (an accessibility activate, a scripted host) rather than through a `touchesEnded:`. |
+
+Two rules that matter:
+
+* The pixel→cell conversion must happen in Rust, not ObjC: the metrics change
+  with a pinch, so a cell size cached in the shim pans by the stale amount after
+  a zoom. The shim keeps only the *sub-cell remainder*.
+* A second touch must cancel the one-finger gesture, or a pinch also scrolls the
+  sheet underneath itself.
+
 **A missing shim degrades, never crashes.** Every resolution above returns
 null when the class is absent, and the callers log once and become no-ops:
 the widget tree still builds, the sheet just does not draw, or buttons are
-inert, or dialogs never present. That is how `examples/ios_ui.rs` runs on a
-desktop at all.
+inert, or dialogs never present. That is how `examples/ios_ui.rs` runs on adesktop at all.
 
 ## 4. The menu model (why the host builds the menu)
 

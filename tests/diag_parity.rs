@@ -16,6 +16,19 @@ mod tmux {
         String::from_utf8_lossy(&o.stdout).to_string()
     }
     pub fn kill_session(session: &str) { Command::new("tmux").args(["kill-session", "-t", session]).output().ok(); }
+
+    /// Kills its session when dropped, however the test leaves.
+    ///
+    /// A tmux session holds the `corro --pancurses` child it started, so a
+    /// test that panics anywhere after `new_session` (every `wait_for_text`
+    /// can) used to leave that child running for the rest of the machine's
+    /// life. A dozen failed runs piled up dozens of live TUI processes
+    /// competing for the terminal — which then made later, unrelated runs
+    /// time out waiting for their panes. Cleanup on drop closes the loop.
+    pub struct SessionGuard(pub String);
+    impl Drop for SessionGuard {
+        fn drop(&mut self) { kill_session(&self.0); }
+    }
 }
 
 fn ratatui_send(app: &mut corro::ui::App, code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) {
@@ -117,6 +130,9 @@ fn diag_parity() {
         let session = format!("diagp-{}-{}", std::process::id(), id);
         let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
         tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, tmp.display()));
+        // Bound to `_session` so every `wait_for_text` panic below still tears
+        // the session (and its corro child) down.
+        let _session = tmux::SessionGuard(session.clone());
         wait_for_text(&session, "[File]");
         send_settled(&session, &format!("M-{alt}"));
         // Wait for the popup to actually open (send_settled can return before

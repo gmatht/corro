@@ -28,6 +28,7 @@ fn test_data_files_are_consistent() {
     assert!(!text.contains("estT"), "subtotal-tiny.corro must not contain 'estT' (stale replayer output)");
 }
 
+#[cfg(feature = "ratatui")]
 use std::path::PathBuf;
 
 #[cfg(feature = "ratatui")]

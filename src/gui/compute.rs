@@ -4,8 +4,8 @@ use crate::agg::helpers::{
     left_margin_special_col_aggregate, previous_raw_block,
 };
 use crate::formula::cell_effective_display;
-use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, HEADER_ROWS, MARGIN_COLS};
-use crate::ops::{margin_key_agg_func, AggFunc, AggregateDef};
+use crate::grid::{CellAddr, GridBox, MainRange};
+use crate::ops::{AggFunc, AggregateDef};
 
 /// Compute row aggregate info for each display row.
 pub fn compute_row_agg_func(
@@ -19,99 +19,64 @@ pub fn compute_row_agg_func(
         let func = if lr < hr {
             None
         } else if lr < hr + mr {
-            left_margin_agg(g, (lr - hr) as u32)
+            crate::agg::helpers::left_margin_agg_func(g, (lr - hr) as u32)
         } else {
-            footer_agg(g, (lr - hr - mr) as u32)
+            crate::agg::helpers::footer_row_agg_func(g, lr - hr - mr)
         };
         row_agg_func.push(func);
     }
     row_agg_func
 }
 
-/// Check if the left-margin key column for the given main row has an aggregate marker.
-fn left_margin_agg(grid: &GridBox, main_row: u32) -> Option<AggFunc> {
-    let key_col = MARGIN_COLS - 1;
-    let val = grid.get(&CellAddr::Left { col: key_col, row: main_row })?;
-    margin_key_agg_func(&val)
-}
-
-/// Check if the footer row has an aggregate marker.
-fn footer_agg(grid: &GridBox, footer_row: u32) -> Option<AggFunc> {
-    let val = grid.get(&CellAddr::Footer {
-        row: footer_row,
-        col: ColumnAddr::Left(MARGIN_COLS - 1),
-    })?;
-    margin_key_agg_func(&val)
-}
-
-/// Check if the header for a given global column has an aggregate marker (right-col agg).
-pub fn right_col_agg(grid: &GridBox, global_col: usize) -> Option<AggFunc> {
-    let main_cols = grid.main_cols();
-    let mut labels: Vec<(u32, String)> = grid
-        .iter_nonempty()
-        .filter_map(|(addr, val)| match addr {
-            CellAddr::Header { row, col } if col.to_global(main_cols) == global_col => {
-                Some((row, val))
-            }
-            _ => None,
-        })
-        .collect();
-    labels.sort_unstable_by_key(|(row, _)| *row);
-    for (_, val) in labels {
-        if let Some(f) = margin_key_agg_func(&val) {
-            return Some(f);
-        }
-    }
-    None
+/// Per-display-column aggregate directive, the column-side mirror of
+/// [`compute_row_agg_func`].
+///
+/// Computed once per frame and indexed by the *column's position in
+/// `col_ixs`* (like `row_agg_func` is indexed by display-row position), so
+/// the paint loop can ask "is this column a totals column?" in O(1) instead
+/// of re-scanning the grid's header cells for every cell it draws —
+/// `right_col_agg_func` walks `grid.iter_nonempty()`, which is far too
+/// expensive to call per painted cell.
+pub fn compute_col_agg_func(g: &GridBox, col_ixs: &[usize]) -> Vec<Option<AggFunc>> {
+    col_ixs
+        .iter()
+        .map(|&c| crate::agg::helpers::right_col_agg_func(g, c))
+        .collect()
 }
 
 pub(crate) use crate::agg::helpers::footer_special_col_aggregate;
 
-/// Find the start of the aggregate block for a given main row (the row after
-/// the preceding left-margin aggregate marker), matching ratatui's
-/// row_total_block_start.
-pub fn row_total_block_start(g: &GridBox, current_main_row: u32) -> u32 {
-    for candidate in (0..current_main_row).rev() {
-        if left_margin_agg(g, candidate).is_some() {
-            return candidate + 1;
-        }
-    }
-    0
+/// Right-margin aggregate key for a global column (alias of the shared
+/// [`crate::agg::helpers::right_col_agg_func`]); public because the GUI
+/// integration tests reach it through `compute::`.
+pub fn right_col_agg(grid: &GridBox, global_col: usize) -> Option<AggFunc> {
+    crate::agg::helpers::right_col_agg_func(grid, global_col)
 }
 
-/// Check if the header at `HEADER_ROWS - 1` for the given main column has content
-/// (matching ratatui's `header_template_applies`).
-pub fn header_template_applies(grid: &GridBox, main_col: usize) -> bool {
-    grid.get(&CellAddr::Header {
-        row: (HEADER_ROWS - 1) as u32,
-        col: ColumnAddr::Main(main_col as u32),
-    })
-    .as_deref()
-    .is_some()
+/// Start of the aggregate block governing a main row (alias of the shared
+/// [`crate::agg::helpers::row_total_block_start`]).
+pub(crate) use crate::agg::helpers::row_total_block_start;
+
+/// Grow the grid when the cursor sits on the last main row or column and
+/// trailing blanks are below the navigation threshold.
+///
+/// Thin alias of the shared [`crate::ui_core::grow_grid_for_cursor`] so both
+/// GUI backends keep calling it through `compute::` (their existing import
+/// path) while the rule itself lives in one place.
+pub fn grow_grid_for_cursor(grid: &mut GridBox, cursor_row: usize, cursor_col: usize) {
+    crate::ui_core::grow_grid_for_cursor(grid, cursor_row, cursor_col)
 }
 
-/// Count trailing blank main columns (matching ratatui's trailing_blank_main_cols).
+/// Trailing blank main columns/rows (aliases of the shared
+/// [`crate::ui_core`] counters, kept for the backends' `compute::` import
+/// path).
 pub fn trailing_blank_main_cols(grid: &GridBox) -> usize {
-    let lm = MARGIN_COLS;
-    let mc = grid.main_cols();
-    match (0..mc).rev().find(|&c| {
-        grid.logical_col_has_content(lm + c)
-            || header_template_applies(grid, c)
-            || right_col_agg(grid, lm + c).is_some()
-    }) {
-        None => mc,
-        Some(last) => mc.saturating_sub(last + 1),
-    }
+    crate::ui_core::trailing_blank_main_cols(grid)
 }
 
-/// Count trailing blank main rows (matching ratatui's trailing_blank_main_rows).
+/// See [`trailing_blank_main_cols`].
 pub fn trailing_blank_main_rows(grid: &GridBox) -> usize {
-    let hr = HEADER_ROWS;
-    let mr = grid.main_rows();
-    match (0..mr).rev().find(|&r| grid.logical_row_has_content(hr + r)) {
-        None => mr,
-        Some(last) => mr.saturating_sub(last + 1),
-    }
+    crate::ui_core::trailing_blank_main_rows(grid)
 }
 
 /// Result of computing a cell's effective display text, style, and metadata.
@@ -283,6 +248,30 @@ pub enum CellDisplayStyle {
 }
 
 impl CellDisplayStyle {
+    /// The inverse of [`GridSink::style_bits`] (and of
+    /// [`Self::to_pancurses_style`], which shares its numbering): recover the
+    /// style from a stored style bit.
+    ///
+    /// Needed once the model (rather than a per-backend map) holds the style:
+    /// `SpreadsheetModel::cell_styles` stores the `u8`, while painting needs the
+    /// enum. An unknown bit is treated as `Default` rather than panicking — a
+    /// style written by a future version should degrade, not crash a repaint.
+    ///
+    /// Deliberately not `#[cfg(feature = "pancurses")]`, unlike its inverse:
+    /// this direction is what lets a *canvas* backend read the model.
+    pub fn from_style_bits(bits: u8) -> Self {
+        match bits {
+            1 => CellDisplayStyle::Cursor,
+            2 => CellDisplayStyle::Aggregate,
+            3 => CellDisplayStyle::FooterAggregate,
+            4 => CellDisplayStyle::Selected,
+            5 => CellDisplayStyle::ActiveHeader,
+            6 => CellDisplayStyle::InactiveHeader,
+            7 => CellDisplayStyle::Hyperlink,
+            _ => CellDisplayStyle::Default,
+        }
+    }
+
     /// Map to pancurses CELL_STYLE_* constants.
     #[cfg(feature = "pancurses")]
     pub fn to_pancurses_style(self) -> u8 {
@@ -295,6 +284,73 @@ impl CellDisplayStyle {
             CellDisplayStyle::ActiveHeader => 5,
             CellDisplayStyle::InactiveHeader => 6,
             CellDisplayStyle::Hyperlink => 7,
+        }
+    }
+}
+
+#[cfg(test)]
+mod style_bit_roundtrip_tests {
+    use super::CellDisplayStyle;
+    // `render` (and its `GridSink`) is only compiled with the `gui` feature;
+    // the pancurses-only and rswidgets-term sets have no such module.
+    #[cfg(feature = "gui")]
+    use crate::gui::render::GridSink;
+
+    /// Every style must survive a round-trip through its stored bit.
+    ///
+    /// This is load-bearing now that the model (not a backend map) holds the
+    /// style: a repaint converts bit → enum → bit, so a mismatch would silently
+    /// repaint cells with the wrong style rather than failing loudly.
+    ///
+    /// The bit→enum→bit direction is written with the feature-independent
+    /// [`GridSink::style_bits`] where it exists, falling back to
+    /// [`CellDisplayStyle::to_pancurses_style`] (the pancurses map, also
+    /// ungated) otherwise. Both share the numbering, and neither is gated on
+    /// the other's feature, so the test compiles on every feature set.
+    #[test]
+    fn every_style_round_trips_through_its_bits() {
+        for style in [
+            CellDisplayStyle::Default,
+            CellDisplayStyle::Cursor,
+            CellDisplayStyle::Aggregate,
+            CellDisplayStyle::FooterAggregate,
+            CellDisplayStyle::Selected,
+            CellDisplayStyle::ActiveHeader,
+            CellDisplayStyle::InactiveHeader,
+            CellDisplayStyle::Hyperlink,
+        ] {
+            #[cfg(feature = "gui")]
+            let bits = GridSink::style_bits(style);
+            #[cfg(all(not(feature = "gui"), feature = "pancurses"))]
+            let bits = style.to_pancurses_style();
+            #[cfg(all(not(feature = "gui"), not(feature = "pancurses")))]
+            let bits = match style {
+                CellDisplayStyle::Default => 0,
+                CellDisplayStyle::Cursor => 1,
+                CellDisplayStyle::Aggregate => 2,
+                CellDisplayStyle::FooterAggregate => 3,
+                CellDisplayStyle::Selected => 4,
+                CellDisplayStyle::ActiveHeader => 5,
+                CellDisplayStyle::InactiveHeader => 6,
+                CellDisplayStyle::Hyperlink => 7,
+            };
+            assert_eq!(
+                style,
+                CellDisplayStyle::from_style_bits(bits),
+                "style {style:?} must round-trip through bits {bits}"
+            );
+        }
+    }
+
+    /// An unknown bit must degrade to `Default`, not panic: a style written by
+    /// a newer version would otherwise crash a repaint.
+    #[test]
+    fn unknown_bits_degrade_to_default() {
+        for bits in [8u8, 42, 255] {
+            assert_eq!(
+                CellDisplayStyle::Default,
+                CellDisplayStyle::from_style_bits(bits)
+            );
         }
     }
 }

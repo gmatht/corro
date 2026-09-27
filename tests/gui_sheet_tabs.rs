@@ -199,6 +199,98 @@ fn fresh_fixture(tag: &str, body: &str) -> PathBuf {
     path
 }
 
+/// The y of the grid canvas's bottom edge: the lowest row that is still *grid
+/// body* — i.e. whose modal colour across the sheet is a cell/gutter fill
+/// rather than a scrollbar or window-chrome colour.
+///
+/// This is a *layout* measurement. The content-only assertions below (no tab
+/// yellow, no tab boxes) pass just as happily when the strip widget reserves
+/// an empty band and paints nothing, which is precisely the defect: the strip
+/// sat in the layout with a height request even when hidden, so the grid
+/// could never grow into it.
+///
+/// The anchor used to be the in-canvas status strip, but that strip was
+/// removed (the status text moved to the formula row) — it rendered as an
+/// empty grey band between the horizontal scrollbar and the last row. Body
+/// colour is the same kind of anchor and does not depend on any one extra
+/// widget being drawn.
+///
+/// The body fill depends on the sheet (a populated cell is white `(255,255,255)`,
+/// an empty margin cell is `(191,191,191)`), so accept the set: none of them is
+/// the scrollbar (`(126,129,130)`), the tab strip or the window background, and
+/// everything below the grid is one of those.
+fn grid_bottom_px(shot: &std::path::Path) -> i32 {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir()
+        .join(format!("corro-tabs-gridbottom-{}-{id}.py", std::process::id()));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nfrom collections import Counter\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\nBODY={(255,255,255),(191,191,191),(230,230,230),(230,242,255)}\ndef modal(y):\n    return Counter(px[x,y] for x in range(60, W-320, 4)).most_common(1)[0][0]\nrows=[y for y in range(H) if modal(y) in BODY]\nprint(max(rows) if rows else -1)\n",
+    )
+    .expect("write grid-bottom analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(shot)
+        .output()
+        .expect("grid-bottom analyzer");
+    let _ = std::fs::remove_file(&script);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let bottom: i32 = text.trim().parse().unwrap_or(-1);
+    assert!(
+        bottom > 0,
+        "no painted grid body found in {shot:?} (analyzer said {text:?})"
+    );
+    bottom
+}
+
+/// A hidden tab strip must return its space to the grid, and the grid must
+/// give it back when the strip appears.
+///
+/// Both captures use the same window size, so the grid's bottom edge is
+/// directly comparable: with one sheet it must sit a strip-height lower than
+/// with two. The lowest painted body row is the anchor because the tab strip
+/// renders *below* the grid, so the anchor moves only when the grid itself is
+/// resized — never when the strip is drawn.
+#[test]
+fn gui_hidden_tab_bar_returns_its_space_to_the_grid() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+
+    // Two sheets: the strip is shown, so the grid is at its shorter height.
+    let two = fresh_fixture("gridspace2", "CORRO_LOG 1\n$2:NEW_SHEET Sheet2\n");
+    let mut child = spawn_gui(&two);
+    let wid2 = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid2]);
+    std::thread::sleep(Duration::from_millis(1200));
+    let with_strip = grid_bottom_px(&screenshot(&wid2, "gridspace2"));
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&two);
+
+    // One sheet: the strip is hidden and the grid must reclaim its height.
+    let one = fresh_fixture("gridspace1", "CORRO_LOG 1\n");
+    let mut child = spawn_gui(&one);
+    let wid1 = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid1]);
+    std::thread::sleep(Duration::from_millis(1200));
+    let without_strip = grid_bottom_px(&screenshot(&wid1, "gridspace1"));
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&one);
+
+    // The point of the fix: hiding the strip hands the space back. The strip
+    // is 24px (TAB_H_BASE), so anything under ~12px means the slot is still
+    // being reserved and the grid is still short.
+    let reclaimed = without_strip - with_strip;
+    assert!(
+        reclaimed >= 12,
+        "a hidden tab strip must return its space to the grid: the one-sheet \
+         grid ends at {without_strip} but the two-sheet grid ends at {with_strip} \
+         (only {reclaimed}px reclaimed, expected at least a strip's worth)"
+    );
+}
+
 /// One sheet: no tab bar. The bottom chrome must show neither the active-tab
 /// yellow nor any long gutter-gray tab box run (gridlines are 1px; a tab box
 /// is a 20px+ run of (230,230,230)).

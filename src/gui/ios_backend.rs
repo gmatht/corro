@@ -125,6 +125,79 @@ pub fn log_ios(msg: &str) {
     eprintln!("corro(ios): {msg}");
 }
 
+// ---------------------------------------------------------------------------
+// Touch gestures (pinch to zoom; drag pans unless a long press armed select)
+// ---------------------------------------------------------------------------
+//
+// The gesture *policy* lives in the shared `gui_backend` (so Android, iOS and
+// the widget all behave identically); these are the thin exports the app's
+// `SheetView` shim calls. Each one is the iOS spelling of the matching
+// `android_backend` entry point.
+
+/// Apply a pinch step: multiply the sheet's view scale by `factor` (the
+/// `UIPinchGestureRecognizer`'s scale ratio since the previous callback).
+/// Returns the scale actually applied, clamped to the shared range.
+#[cfg(target_os = "ios")]
+pub fn zoom_viewport(factor: f64) -> f64 {
+    super::gui_backend::zoom_viewport_by(factor)
+}
+
+/// Reset the pinch scale to 1.0 (a double-tap or a menu item). Returns 1.0.
+#[cfg(target_os = "ios")]
+pub fn reset_viewport_zoom() -> f64 {
+    super::gui_backend::reset_viewport_zoom()
+}
+
+/// Begin a pointer gesture: `is_touch` is true for a finger (drag pans;
+/// long press arms selection) and false for a mouse/trackpad (drag selects).
+#[cfg(target_os = "ios")]
+pub fn gesture_down(canvas_id: u64, x: f64, y: f64, is_touch: bool) -> i32 {
+    super::gui_backend::mobile_gesture_down(canvas_id, x, y, is_touch)
+}
+
+/// The long-press recogniser fired: arm selection for the drag that follows.
+#[cfg(target_os = "ios")]
+pub fn gesture_long_press(canvas_id: u64, x: f64, y: f64) -> i32 {
+    super::gui_backend::mobile_gesture_long_press(canvas_id, x, y)
+}
+
+/// A pointer move during a gesture. Returns the shared outcome code
+/// (0 ignored, 1 select, 2 scroll, 3 tap, 4 long press).
+#[cfg(target_os = "ios")]
+pub fn gesture_move(canvas_id: u64, x: f64, y: f64) -> i32 {
+    super::gui_backend::mobile_gesture_move(canvas_id, x, y)
+}
+
+/// A pointer release. A non-drag release is a tap, which the shared handler
+/// has already applied by the time this returns.
+#[cfg(target_os = "ios")]
+pub fn gesture_up(canvas_id: u64, x: f64, y: f64) -> i32 {
+    super::gui_backend::mobile_gesture_up(canvas_id, x, y)
+}
+
+/// Cancel an in-flight gesture (a system gesture stole the touch, the app
+/// resigned active). Never produces a tap.
+#[cfg(target_os = "ios")]
+pub fn gesture_cancel(canvas_id: u64) {
+    super::gui_backend::mobile_gesture_cancel(canvas_id);
+}
+
+/// Pan the sheet by a pixel delta from a scroll drag, converting to whole
+/// cells with the current (zoom-aware) metrics. Returns `(d_rows, d_cols)`
+/// actually applied, so the host can keep its sub-cell remainder.
+#[cfg(target_os = "ios")]
+pub fn drag_viewport(canvas_id: u64, dx: f64, dy: f64) -> (i32, i32) {
+    super::gui_backend::drag_viewport_by_pixels(canvas_id, dx, dy)
+}
+
+/// The grid's row height and default column advance, in points, so the host
+/// can convert a drag in points to whole cells with the same metrics the
+/// renderer used (and the same ones a pinch scales). Returns `(row_h, col_w)`.
+#[cfg(target_os = "ios")]
+pub fn touch_cell_size() -> (f64, f64) {
+    (super::gui_backend::row_h(), super::gui_backend::char_w())
+}
+
 /// Entry point called from the host once it has a root view.
 ///
 /// Called by the `corro_ios` cdylib crate's `#[no_mangle] extern "C"`

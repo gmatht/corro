@@ -1,3 +1,6 @@
+// Win95/rust9x custom target_family gates are intentional
+#![cfg_attr(windows, allow(unexpected_cfgs))]
+
 #[cfg(windows)]
 mod nwg_backend {
     use native_windows_gui as nwg;

@@ -230,6 +230,43 @@ impl Canvas {
         ges.connect_pressed(move |_, _, x, y| { c.borrow_mut()(x, y); });
         self.0.add_controller(ges.clone()); self.2.borrow_mut().push(Box::new(ges));
     }
+    /// Button/modifier-aware click; see the GTK3 backend's `on_click_button`.
+    ///
+    /// Kept separate from `on_click` so the two APIs can coexist: `on_click` is
+    /// the minimal contract every backend implements, this one is for callers
+    /// that need to tell a right-click from a left-click (sheet-tab menus).
+    pub fn on_click_button(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+        let c = RefCell::new(cb); let ges = gtk4_static::GestureClick::new();
+        ges.connect_pressed(move |_, n, x, y| {{ c.borrow_mut()(x, y, if n > 0 {{ n as u32 }} else {{ 1 }}, 0); }});
+        self.0.add_controller(ges.clone()); self.2.borrow_mut().push(Box::new(ges));
+    }
+    /// Pointer motion.
+    ///
+    /// This uses `EventControllerMotion`, not `GestureClick`: click gestures
+    /// have no motion signal in GTK4, and a drag needs the position between the
+    /// press and the release. Modifier state is not carried by this controller,
+    /// so the callback reports 0 there.
+    pub fn on_motion(&self, cb: Box<dyn FnMut(f64, f64, u32)>) {
+        let c = RefCell::new(cb); let ctrl = gtk4_static::EventControllerMotion::new();
+        ctrl.connect_motion(move |_, x, y| {{ c.borrow_mut()(x, y, 0); }});
+        self.0.add_controller(ctrl.clone()); self.2.borrow_mut().push(Box::new(ctrl));
+    }
+    /// This canvas's top-left in screen coordinates, or `None` when unknown.
+    ///
+    /// Not implemented here: GTK4 has no convenient widget->root translation on
+    /// this path, so the caller opens the context menu unpositioned. See the
+    /// GTK backend's `screen_origin`.
+    pub fn screen_origin(&self) -> Option<(i32, i32)> {
+        None
+    }
+
+    /// Pointer release, ending a drag.
+    pub fn on_release(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+        let c = RefCell::new(cb); let ges = gtk4_static::GestureClick::new();
+        ges.connect_released(move |_, n, x, y| {{ c.borrow_mut()(x, y, if n > 0 {{ n as u32 }} else {{ 1 }}, 0); }});
+        self.0.add_controller(ges.clone()); self.2.borrow_mut().push(Box::new(ges));
+    }
+
     pub fn on_key(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) { self.on_key_raw(cb); }
     pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
         let c = RefCell::new(cb); let ctrl = gtk4_static::EventControllerKey::new();
@@ -283,6 +320,14 @@ pub struct MenuBar(pub gtk4_static::PopoverMenuBar);
 impl MenuBar {
     pub fn new(model: &gio::Menu) -> Self { MenuBar(gtk4_static::PopoverMenuBar::from_model(Some(model))) }
     pub fn activate_submenu_by_mnemonic(&self, _k: u32) -> bool { false }
+
+    /// Open the submenu whose mnemonic is `keyval` at a screen position.
+    ///
+    /// Not implemented here; see the GTK3 backend's version, which is what the
+    /// desktop build uses.
+    pub fn popup_submenu_by_mnemonic_at(&self, _keyval: u32, _x: i32, _y: i32) -> bool {
+        false
+    }
     pub fn activate_submenu_item_by_mnemonic(&self, _k: u32) -> bool { false }
     pub unsafe fn insert_action_group(&self, name: &str, p: *mut std::ffi::c_void) {
         let group = gio::ActionGroup::from_glib_none(p as *mut _);

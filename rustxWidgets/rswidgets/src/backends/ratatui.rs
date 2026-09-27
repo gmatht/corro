@@ -227,6 +227,11 @@ impl RatatuiApp {
 }
 
 impl BackendApp for RatatuiApp {
+    /// A REPL owns its input loop: nothing else dispatches for us.
+    fn owns_event_loop(&self) -> bool {
+        true
+    }
+
     fn run(self: Box<Self>) -> Result<(), Box<dyn StdError + Send + Sync>> {
         use crossterm::event::{self, Event, KeyCode};
         use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};

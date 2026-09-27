@@ -13,7 +13,13 @@
 //! before `extrapolate_selection()` matched on it, so the seed lookup fell
 //! through and Enter produced "Select cells with a pattern, then Extrapolate".
 //!
-//! Runs headlessly on the default (ratatui) features — no tmux needed.
+//! Runs headlessly on the default (ratatui) features — no tmux needed. The
+//! whole file is gated on that feature: it drives `corro::ui::App` and its
+//! `bench_*` helpers, which do not exist in a gui/pancurses-only build, so
+//! without the gate `cargo check --all-targets --no-default-features
+//! --features pancurses` failed to compile this test rather than skipping it.
+
+#![cfg(feature = "ratatui")]
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 

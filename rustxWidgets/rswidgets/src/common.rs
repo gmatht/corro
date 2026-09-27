@@ -84,7 +84,18 @@ macro_rules! common_types_mod {
         #[derive(Clone)]
         pub struct Label { pub inner: PlatformLabel }
         #[derive(Clone)]
-        pub struct Entry { pub inner: PlatformEntry }
+        pub struct Entry {
+            pub inner: PlatformEntry,
+            /// Tracked caret position for backends where `get_position`
+            /// returns `None` (WASM, iOS, macOS, Android, zork). Updated by
+            /// `set_position`; used as fallback by `get_position`. Backends
+            /// with a real caret (GTK, NWG, pancurses) never consult it.
+            caret_override: std::rc::Rc<std::cell::Cell<Option<usize>>>,
+            /// When `true`, the `connect_changed` callback is suppressed.
+            /// Set by `set_text_suppressing_changed` so programmatic
+            /// `set_text` calls don't re-enter the edit logic.
+            suppress_changed: std::rc::Rc<std::cell::Cell<bool>>,
+        }
         #[derive(Clone)]
         pub struct Canvas { pub inner: PlatformCanvas }
         #[derive(Clone)]
@@ -120,27 +131,91 @@ macro_rules! common_types_mod {
             pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
             pub fn set_visible(&self, visible: bool) { self.inner.set_visible(visible); }
             pub fn set_markup(&self, markup: &str) { self.inner.set_markup(markup); }
+            /// Pin the label's width so changing its text never reflows the
+            /// siblings packed after it. `None` releases the pin.
+            pub fn set_fixed_width(&self, w: Option<i32>) { self.inner.set_fixed_width(w); }
+            /// Left margin of the label's contents, in device px. Pairs with
+            /// `set_fixed_width`: a pinned, left-aligned label sits flush
+            /// against its slot's edge, and this restores the inset.
+            pub fn set_margin_start(&self, px: i32) { self.inner.set_margin_start(px); }
+            /// Set the x alignment of the label's text (0.0 left .. 1.0 right).
+            pub fn set_xalign(&self, x: f32) { self.inner.set_xalign(x); }
             pub fn raw_handle(&self) -> *mut std::os::raw::c_void { self.inner.raw_handle() }
         }
         impl AsRef<*mut std::os::raw::c_void> for Label {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
         }
         impl Entry {
+            /// Wrap a platform-specific Entry with tracked caret and
+            /// suppress-changed state.
+            pub fn new(inner: PlatformEntry) -> Self {
+                Entry {
+                    inner,
+                    caret_override: std::rc::Rc::new(std::cell::Cell::new(None)),
+                    suppress_changed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                }
+            }
             pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
             pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
-            /// Caret position as a character index, or `None` when the
-            /// backend cannot report one (callers then keep the caret they
-            /// track themselves).
-            pub fn get_position(&self) -> Option<usize> { self.inner.get_position() }
-            /// Move the caret (character index). Backends without caret
-            /// support ignore this.
-            pub fn set_position(&self, pos: usize) { self.inner.set_position(pos); }
+            /// Caret position as a character index. Falls back to the
+            /// internally tracked position when the backend cannot report one
+            /// natively (WASM, iOS, macOS, Android, zork — see their adapters).
+            /// GTK, NWG and pancurses report a real caret, so the fallback is
+            /// not used on those.
+            pub fn get_position(&self) -> Option<usize> {
+                self.inner.get_position().or_else(|| self.caret_override.get())
+            }
+            /// Move the caret (character index). Also updates the internal
+            /// tracked position so backends without native caret support
+            /// stay consistent.
+            pub fn set_position(&self, pos: usize) {
+                self.caret_override.set(Some(pos));
+                self.inner.set_position(pos);
+            }
+            /// Set the entry text while preserving the current caret
+            /// position. The native `set_text` may reset the caret to
+            /// the end on some backends; this method saves and restores it.
+            pub fn set_text_preserving_caret(&self, text: &str) {
+                let pos = self.get_position();
+                self.inner.set_text(text);
+                if let Some(p) = pos {
+                    // Restore after set_text; clamp to new length.
+                    let len = text.chars().count();
+                    let clamped = p.min(len);
+                    self.caret_override.set(Some(clamped));
+                    self.inner.set_position(clamped);
+                }
+            }
+            /// Set the entry text without firing the `connect_changed`
+            /// callback. Use this for programmatic updates (preset edit
+            /// buffers, movie replay, Insert Date/Time) where the app
+            /// already knows the new value and the callback would cause
+            /// re-entrant edits.
+            pub fn set_text_suppressing_changed(&self, text: &str) {
+                self.suppress_changed.set(true);
+                self.inner.set_text(text);
+                self.suppress_changed.set(false);
+            }
+            /// Whether the suppress_changed flag is currently set.
+            pub fn is_suppressing_changed(&self) -> bool {
+                self.suppress_changed.get()
+            }
             pub fn grab_focus(&self) { self.inner.grab_focus(); }
             pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }
             pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
             pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
             pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
-            pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, crate::Error> { self.inner.connect_changed(f) }
+            /// Register a change callback. The callback is suppressed when
+            /// `set_text_suppressing_changed` is active, so programmatic
+            /// text updates don't re-enter edit logic.
+            pub fn connect_changed(&self, mut f: impl FnMut() + 'static) -> Result<u64, crate::Error> {
+                let suppress = self.suppress_changed.clone();
+                self.inner.connect_changed(move || {
+                    if !suppress.get() {
+                        f();
+                    }
+                })
+            }
             pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) { self.inner.on_key_raw(cb); }
             pub fn add_class(&self, class_name: &str) { self.inner.add_class(class_name); }
             pub fn remove_class(&self, class_name: &str) { self.inner.remove_class(class_name); }
@@ -170,6 +245,16 @@ macro_rules! common_types_mod {
             pub fn queue_redraw(&self) { self.inner.queue_redraw(); }
             pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
             pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) { self.inner.on_click(cb); }
+            /// Forward the button/modifier-aware click through to the wrapped
+            /// canvas, so a caller can use the richer API without knowing
+            /// whether it holds a plain canvas or this wrapper.
+            pub fn on_click_button(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) { self.inner.on_click_button(cb); }
+            /// This canvas's top-left in screen coordinates, or `None` when
+            /// unknown. Used to place the sheet-tab context menu at the
+            /// pointer; see `MenuBar::popup_submenu_by_mnemonic_at`.
+            pub fn screen_origin(&self) -> Option<(i32, i32)> { self.inner.screen_origin() }
+            pub fn on_motion(&self, cb: Box<dyn FnMut(f64, f64, u32)>) { self.inner.on_motion(cb); }
+            pub fn on_release(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) { self.inner.on_release(cb); }
             pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
             pub fn set_content_size(&self, w: i32, h: i32) { self.inner.set_content_size(w, h); }
             pub fn grab_focus(&self) { self.inner.grab_focus(); }
@@ -200,6 +285,12 @@ macro_rules! common_types_mod {
         impl MenuBar {
             pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
                 self.inner.activate_submenu_by_mnemonic(keyval)
+            }
+            /// Open the submenu whose mnemonic is `keyval` at a screen position
+            /// (the sheet-tab context menu). Unpositioned on backends without a
+            /// position hook.
+            pub fn popup_submenu_by_mnemonic_at(&self, keyval: u32, screen_x: i32, screen_y: i32) -> bool {
+                self.inner.popup_submenu_by_mnemonic_at(keyval, screen_x, screen_y)
             }
             pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
                 self.inner.activate_submenu_item_by_mnemonic(keyval)
@@ -305,6 +396,10 @@ mod common_types {
     }
     impl Entry {
         pub fn on_key(&self, f: Box<dyn FnMut(u32) -> bool>) { self.inner.on_key(f); }
+    }
+    impl TextView {
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
     }
     impl ScrolledWindow {
         pub fn set_child(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.set_child(child); }

@@ -140,11 +140,131 @@ pub extern "C" fn corro_ios_canvas_size(canvas_id: u64, w: i32, h: i32) {
     rswidgets::backends_ios_adapter::record_canvas_size(canvas_id, w, h);
 }
 
-/// Called from `SheetView.touchesEnded:` (or its tap recogniser): moves the
-/// cursor to the tapped cell and redraws.
+/// Called from `SheetView` to route a tap to the canvas that owns it
+/// (`Canvas::on_click` was registered per canvas id). The sheet's tap handler
+/// moves the cursor; the sheet-tab strip's selects/reorders a tab.
 #[no_mangle]
 pub extern "C" fn corro_ios_canvas_click(canvas_id: u64, x: f64, y: f64) {
     rswidgets::backends_ios_adapter::dispatch_canvas_click(canvas_id, x, y);
+}
+
+// ---------------------------------------------------------------------------
+// Pinch to zoom
+// ---------------------------------------------------------------------------
+
+/// Called from `SheetView`'s `UIPinchGestureRecognizer`: multiply the sheet's
+/// view scale by `factor` — the recogniser's `scale` ratio since the previous
+/// callback.
+///
+/// UIKit has no sheet-level zoom, so the host forwards the ratio and the shared
+/// Rust zoom applies it. Everything the grid draws *and* everything a finger
+/// hits derives from that one scale, so a pinch moves the grid, the gutter, the
+/// headers and the hit targets together.
+///
+/// Returns the scale actually applied (clamped to the shared
+/// `0.4..=4.0` range), so the host can mirror it and log it.
+#[no_mangle]
+pub extern "C" fn corro_ios_canvas_zoom(factor: f64) -> f64 {
+    corro::gui::ios_backend::zoom_viewport(factor)
+}
+
+/// Called from `SheetView` on a double-tap: reset the pinch scale to 1.0.
+/// Returns the applied scale (always 1.0).
+#[no_mangle]
+pub extern "C" fn corro_ios_canvas_zoom_reset() -> f64 {
+    corro::gui::ios_backend::reset_viewport_zoom()
+}
+
+// ---------------------------------------------------------------------------
+// Touch gestures (drag pans; long press then drag selects)
+// ---------------------------------------------------------------------------
+//
+// Every call carries the canvas id: the sheet and the sheet-tab strip are both
+// canvases, and Rust ignores gestures for any canvas that is not the sheet, so
+// the strip keeps its own click/reorder handling.
+
+/// Called from `SheetView` on `touchesBegan:`. `is_touch` is 1 for a finger
+/// (drag pans; long press selects) and 0 for a mouse/trackpad (drag selects,
+/// as on a desktop).
+#[no_mangle]
+pub extern "C" fn corro_ios_canvas_gesture_down(canvas_id: u64, x: f64, y: f64, is_touch: i32) {
+    let _ = corro::gui::ios_backend::gesture_down(canvas_id, x, y, is_touch != 0);
+}
+
+/// Called from `SheetView`'s `UILongPressGestureRecognizer`: arm selection so
+/// the drag that follows extends the selection instead of scrolling.
+#[no_mangle]
+pub extern "C" fn corro_ios_canvas_gesture_long_press(canvas_id: u64, x: f64, y: f64) {
+    let _ = corro::gui::ios_backend::gesture_long_press(canvas_id, x, y);
+}
+
+/// Called from `SheetView` on `touchesMoved:`. Returns the shared outcome code
+/// (0 ignored, 1 select, 2 scroll, 3 tap, 4 long press) so the host knows
+/// whether to pan.
+#[no_mangle]
+pub extern "C" fn corro_ios_canvas_gesture_move(canvas_id: u64, x: f64, y: f64) -> i32 {
+    corro::gui::ios_backend::gesture_move(canvas_id, x, y)
+}
+
+/// Called from `SheetView` on `touchesEnded:`.
+///
+/// A release that never dragged is reported as a *tap* (`3`), not applied: the
+/// shim then routes it to the canvas's own click handler
+/// (`corro_ios_canvas_click`), which is per canvas — so the tab strip's taps do
+/// not end up moving the sheet's cursor.
+#[no_mangle]
+pub extern "C" fn corro_ios_canvas_gesture_up(canvas_id: u64, x: f64, y: f64) -> i32 {
+    corro::gui::ios_backend::gesture_up(canvas_id, x, y)
+}
+
+/// Called from `SheetView` on `touchesCancelled:`. Never produces a tap.
+#[no_mangle]
+pub extern "C" fn corro_ios_canvas_gesture_cancel(canvas_id: u64) {
+    corro::gui::ios_backend::gesture_cancel(canvas_id);
+}
+
+/// Called from `SheetView` for a scroll drag: pan the sheet by the pixel delta
+/// since the last event, converting to whole cells with the zoom-aware metrics.
+/// Writes the applied `[dRows, dCols]` into `out` (which must have room for
+/// two `i32`s), so the host can keep its sub-cell remainder.
+///
+/// # Safety
+/// `out` must point to at least two writable `i32`s.
+#[no_mangle]
+pub unsafe extern "C" fn corro_ios_canvas_drag_by(
+    canvas_id: u64,
+    dx: f64,
+    dy: f64,
+    out: *mut i32,
+) {
+    let (d_rows, d_cols) = corro::gui::ios_backend::drag_viewport(canvas_id, dx, dy);
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: the contract above says `out` has room for two i32s.
+    unsafe {
+        *out = d_rows;
+        *out.add(1) = d_cols;
+    }
+}
+
+/// The grid's row height and default column advance, in points, so the host's
+/// drag accumulation uses the same metrics the renderer does. Writes
+/// `[row_h, col_w]` into `out` (which must have room for two `f64`s).
+///
+/// # Safety
+/// `out` must point to at least two writable `f64`s.
+#[no_mangle]
+pub unsafe extern "C" fn corro_ios_canvas_cell_size(out: *mut f64) {
+    let (row_h, col_w) = corro::gui::ios_backend::touch_cell_size();
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: the contract above says `out` has room for two f64s.
+    unsafe {
+        *out = row_h;
+        *out.add(1) = col_w;
+    }
 }
 
 /// Called from `SheetView` for hardware-keyboard input (a physical keyboard

@@ -1,0 +1,379 @@
+name: macOS
+
+# Builds and verifies corro's AppKit backend on a hosted macOS runner.
+#
+# ## Why this exists separately from the iOS workflow
+#
+# iOS and macOS are the same Rust (both build on `rswidgets::backends::apple`)
+# but they are not the same *product*: iOS has a phone's chrome and a phone's
+# input model, macOS has a real `NSMenu`, a real mouse and a real scroll wheel.
+# The thing that was actually missing was not the Rust — that type-checked
+# behind two unreferenced local scripts — but the host half: the
+# `corro_macos_*` C entry points were documented in `MACOS_GUIDELINES.md` §3
+# and **defined nowhere**, so a macOS app had no way to get a first frame. That
+# is what `macos/corro` now provides, and this workflow is what keeps it
+# honest.
+#
+# What runs here, in the order that fails fastest:
+#
+#   1. the *Linux* job — cfg type-checks for three Apple targets, the shim
+#      generator's own tests, the bridge-contract diff, and corro's
+#      host-pipeline test. No macOS minutes, and it catches the class of
+#      regression that is actually common: an adapter drifting from the shared
+#      `common_types` contract, or a header drifting from the exports.
+#   2. the *macOS* job — compiles the host crate for real and links a
+#      Objective-C test host against it. Linking is the part `-Zbuild-std`
+#      `cargo check` cannot do, and a missing or mis-signed `corro_macos_*`
+#      symbol is a *link* error, so this job is what proves the bridge header
+#      and the Rust exports actually agree at the ABI level.
+#
+# What is deliberately NOT claimed:
+#
+#   * No app bundle and no screenshot, unlike iOS. An `NSApplication` needs a
+#     window server, and a hosted runner has no window server for a GUI app
+#     (that is the same wall the iOS workflow's own header documents for
+#     interaction: the simulator proves startup → first frame, nothing more).
+#     A launchable `.app` needs a developer machine; `MACOS_GUIDELINES.md` §6
+#     says so and this file does not pretend otherwise.
+#   * No interaction test. `xcrun simctl` has no macOS equivalent, so the
+#     mouse/keyboard paths are covered by the compile checks plus the shared
+#     desktop live-GUI tests (`tests/gui_click_commit.rs`,
+#     `tests/gui_edit_parity.rs`) running the *same* `gui_backend` code.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "macos/**"
+      - "rustxWidgets/rswidgets/src/backends/macos.rs"
+      - "rustxWidgets/rswidgets/src/backends/apple.rs"
+      - "rustxWidgets/rswidgets/src/backends_macos_adapter.rs"
+      - "rustxWidgets/rswidgets/src/apple_generator.rs"
+      - "src/gui/macos_backend.rs"
+      - "tests/macos_pipeline_preview.rs"
+      - ".github/workflows/macos.yml"
+  pull_request:
+    paths:
+      - "macos/**"
+      - "rustxWidgets/rswidgets/src/backends/macos.rs"
+      - "rustxWidgets/rswidgets/src/backends/apple.rs"
+      - "rustxWidgets/rswidgets/src/backends_macos_adapter.rs"
+      - "rustxWidgets/rswidgets/src/apple_generator.rs"
+      - "src/gui/macos_backend.rs"
+      - "tests/macos_pipeline_preview.rs"
+
+env:
+  CARGO_TERM_COLORS: false
+
+jobs:
+  # ── The cheap half: the Rust macOS cfg paths, on Linux ──────────────
+  # Same shape as the iOS workflow's `rust-ios-check`, and the same reasoning:
+  # fast, no macOS minutes, and it tests the thing that actually breaks.
+  rust-macos-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+
+      - name: macOS cfg checks (x86_64, aarch64, and an iOS regression guard)
+        # Both scripts, in this order: the adapter first (a broken adapter is
+        # the more common failure and gives the clearer error), then corro.
+        run: |
+          rustxWidgets/scripts/check_rswidgets_macos.sh
+          scripts/check_corro_macos.sh
+
+      - name: The macOS-gated tests must at least COMPILE
+        # `check` above does not build test targets, so the 8
+        # `#[cfg(target_os = "macos")]` tests in backends_macos_adapter.rs and
+        # backends/macos.rs had never been compiled by anything — and they were
+        # broken: E0425 on `super::strip_markup` (the module's test block is a
+        # sibling of `mod macos_adapter`, unlike the iOS one) and E0451 on a
+        # private `Menu` literal.
+        #
+        # Building the test target is enough to catch that class of drift, and
+        # it needs no macOS minutes. The Mac job runs them for real.
+        run: |
+          set -euo pipefail
+          echo "--- rswidgets lib tests for apple-darwin ---"
+          cargo +nightly check -p rswidgets --no-default-features \
+            --features macos,headless --lib --tests \
+            --target aarch64-apple-darwin -Zbuild-std=std,panic_abort
+          echo "--- corro lib tests for apple-darwin ---"
+          cargo +nightly check --features gui-macos --lib --tests \
+            --target aarch64-apple-darwin -Zbuild-std=std,panic_abort
+          echo "both test targets compile clean for aarch64-apple-darwin"
+
+      - name: Shim generator contract tests
+        # The generator is what keeps the Rust side and the Objective-C side
+        # from drifting. Its tests are platform-independent (they compare
+        # emitted text), so they run on Linux — which is the only place they
+        # can run cheaply enough to run at all.
+        run: cargo test --quiet -p rswidgets --no-default-features --features ratatui,headless,pancurses --lib apple_generator
+
+      - name: Bridge header matches the Rust exports
+        # `corro_macos_*` is a hand-written declaration of an ABI the Rust
+        # side owns. A missing declaration is a link error (the Mac job below
+        # catches it), but a *changed signature* is not: it compiles and then
+        # corrupts the register file inside `objc_msgSend`. This diff is what
+        # makes that a CI failure instead of a crash.
+        run: macos/corro/scripts/check_bridge.sh
+
+      - name: Type-check the host crate (corro_macos)
+        # The host crate is a standalone workspace, so the root `cargo check`
+        # above never sees it — and a break in it would otherwise only be
+        # found by the Mac job, where it costs macOS minutes. `check` is
+        # enough: it compiles the extern "C" surface against the real corro
+        # and rswidgets APIs, which is where a rename or a signature change
+        # actually breaks. Linking needs a Mac (the Mac job does it).
+        run: |
+          cd macos/corro
+          cargo +nightly check --target aarch64-apple-darwin \
+            -Zbuild-std=std,panic_abort
+
+      - name: Regenerate the shims and check they match what is committed
+        # Cheap, and it is the same staleness check the Mac job does — but
+        # here it costs no minutes and, more importantly, it runs on *every*
+        # PR. A stale generated .m is a runtime crash for a real host, and the
+        # only thing that catches it is a diff.
+        #
+        # Generate into a TEMP directory and diff that, rather than
+        # regenerating in place and diffing the tree. The generator is
+        # deliberately additive — it never overwrites an existing file, so a
+        # hand-edited shim survives — which means regenerating in place cannot
+        # REPAIR a stale one. Diffing against a fresh generation is the only
+        # formulation that both detects staleness and tells you what it should
+        # be, and it never touches the working tree (a check that rewrites
+        # files is a check that can dirty a developer's checkout).
+        run: |
+          set -euo pipefail
+          FRESH="$(mktemp -d)"
+          RSWIDGETS_APPLE_PROJECT="$FRESH" cargo +nightly check \
+            --package corro_macos --target aarch64-apple-darwin \
+            -Zbuild-std=std,panic_abort --features generate-apple-shims \
+            --manifest-path macos/corro/Cargo.toml
+          status=0
+          for f in CorroGeneratedShims.h CorroGeneratedShims.m; do
+            committed="macos/corro/app/$f"
+            if ! diff -u "$committed" "$FRESH/app/$f"; then
+              echo "::error::$committed is stale; regenerate with --features generate-apple-shims and commit the result"
+              status=1
+            fi
+          done
+          [ "$status" -eq 0 ] && echo "shims are in sync with apple_generator"
+          exit "$status"
+
+      - name: Run the macOS host-pipeline preview
+        # corro's half of the host contract, and the twin of
+        # tests/ios_pipeline_preview.rs: the menu model a real NSMenu is built
+        # from, every `app.<action>` name mapping back to a real menu action,
+        # the macOS and iOS models being the *same* model, and the pointer
+        # metrics (cell size, pinch clamp) a mouse host depends on.
+        #
+        # There is no adapter call here — backends_macos_adapter.rs only
+        # compiles for target_os = "macos", and there is no macOS equivalent of
+        # `simctl` to synthesise input with. The steps above compile it; this
+        # file is what replaces an interactive test on Linux.
+        run: cargo test --quiet --features gui-macos-host --test macos_pipeline_preview
+
+  # ── The real half: build and LINK the host crate on a Mac ───────────
+  # `-Zbuild-std` + `cargo check` (the Linux job) is metadata only: it never
+  # links, so it cannot see a symbol that the bridge header declares and the
+  # Rust crate does not export. Linking is the only thing that proves the two
+  # agree, so this job exists for that and for the ObjC compile.
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Show toolchain versions
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          cargo --version
+
+      - name: Regenerate the Objective-C shims and check they are current
+        # The shims are generated from rswidgets' signature table and checked
+        # in. Regenerating here and failing on a diff is what stops a stale
+        # committed .m from being what a real host compiles against — the
+        # failure mode is a *runtime* crash, not a compile error, so nothing
+        # else in this workflow would notice.
+        #
+        # Generate into a temp directory rather than in place: the generator is
+        # additive by design (it never overwrites, so a hand-edited shim
+        # survives), which means an in-place regeneration cannot repair a stale
+        # file — it would just fail forever. Diffing a fresh generation also
+        # never dirties the checkout.
+        #
+        # `check`, not `build`: the generator is a build script, so `check` runs
+        # it too, and this way the step cannot fail for an unrelated reason (a
+        # link error, a missing SDK piece) and mask the staleness it exists to
+        # catch. The real build is the next step.
+        run: |
+          set -euo pipefail
+          FRESH="$(mktemp -d)"
+          RSWIDGETS_APPLE_PROJECT="$FRESH" cargo +nightly check \
+            --package corro_macos --target aarch64-apple-darwin \
+            -Zbuild-std=std,panic_abort --features generate-apple-shims \
+            --manifest-path macos/corro/Cargo.toml
+          status=0
+          for f in CorroGeneratedShims.h CorroGeneratedShims.m; do
+            if ! diff -u "macos/corro/app/$f" "$FRESH/app/$f"; then
+              echo "::error::macos/corro/app/$f is stale; regenerate with --features generate-apple-shims and commit the result"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Build the host staticlib
+        # `-Zbuild-std` is REQUIRED, not optional. macOS targets are tier-2 and
+        # `rustup target add` normally supplies their std — but a *runner
+        # image* may not have it, and the failure is
+        # `E0463: can't find crate for core`, which reads like a toolchain
+        # problem rather than a missing target. Carrying the flag makes this
+        # step independent of what the image happens to have installed.
+        #
+        # `build`, not `check`: this must produce object code for the next step
+        # to link, and `check` never links.
+        run: |
+          cd macos/corro
+          cargo +nightly build --release --target aarch64-apple-darwin \
+            -Zbuild-std=std,panic_abort
+
+      - name: Run the macOS-gated unit tests
+        # The reason this job exists rather than only the Linux one.
+        #
+        # `backends_macos_adapter.rs` and `backends/macos.rs` carry 8 tests
+        # behind `#[cfg(target_os = "macos")]`. Until now *nothing* ran them:
+        # the Linux job uses `cargo check`, which does not build test targets,
+        # and no macOS job existed. They were not even compiling — the module's
+        # test block is a *sibling* of `mod macos_adapter` (the iOS adapter
+        # nests its own), so `super::strip_markup` did not resolve and the menu
+        # test reached for a private `Menu` literal. Both were E0425/E0451 that
+        # a compile check cannot see.
+        #
+        # The Linux job still runs `check --lib --tests` for this target (a
+        # compile gate costs no macOS minutes); this step is the half only a
+        # Mac can do, which is actually *executing* them.
+        run: |
+          set -euo pipefail
+          echo "--- rswidgets: the 8 macOS-gated adapter tests ---"
+          cargo +nightly test -p rswidgets --no-default-features \
+            --features macos,headless --lib --target aarch64-apple-darwin \
+            -Zbuild-std=std,panic_abort
+          echo "--- corro: gui:: tests compiled for an Apple target ---"
+          cargo +nightly test --features gui-macos --lib \
+            --target aarch64-apple-darwin -Zbuild-std=std,panic_abort
+
+      - name: The host-contract test, now on a real macOS
+        # `tests/macos_pipeline_preview.rs` is `cfg(not(target_os = "macos"))`,
+        # because its whole premise is that the AppKit adapter is NOT compiled
+        # and the menu model is being checked as plain data. On a Mac the
+        # module does not exist, so this step is deliberately a *negative*
+        # check: the file must compile to nothing there, which is what proves
+        # its cfg guard is correct rather than accidentally always-true.
+        #
+        # The Mac-specific half of the contract is the extern "C" surface, and
+        # the link step below is what covers it.
+        run: |
+          set -euo pipefail
+          echo "the macos host-contract test is off-target on macOS by design:"
+          if cargo +nightly test --features gui-macos --test macos_pipeline_preview \
+               --target aarch64-apple-darwin -Zbuild-std=std,panic_abort \
+               -- --list 2>&1 | grep -qE "macos_pipeline_preview.*tests,"; then
+            echo "::error::macos_pipeline_preview should compile to zero tests on macOS (its cfg guard is not target_os-aware)"
+            exit 1
+          fi
+          echo "confirmed: 0 tests on macOS, as the cfg intends"
+
+      - name: Link an Objective-C host against the bridge header
+        # The point of the job. Compiles a real .m that imports
+        # CorroMacBridge.h and *references every corro_macos_* symbol*, then
+        # links it against the staticlib. A missing export or a signature the
+        # linker cannot reconcile fails HERE, with a diagnostic naming the
+        # symbol, instead of at runtime inside objc_msgSend.
+        #
+        # A tiny host is enough: this is not a "does the app run" test (there
+        # is no window server on a runner for that — see the file header). It
+        # is an ABI test, and the smallest thing that is one.
+        run: |
+          set -euo pipefail
+          cd macos/corro
+          LIB="target/aarch64-apple-darwin/release/libcorro_macos.a"
+          test -f "$LIB" || { echo "::error::no staticlib at $LIB"; exit 1; }
+
+          cat > /tmp/host_abi.m <<'OBJC'
+          // References every corro_macos_* export so the linker must resolve
+          // it. Kept in step with app/CorroMacBridge.h by
+          // scripts/check_bridge.sh -- a symbol the Rust crate stops
+          // exporting fails the link here.
+          #import <AppKit/AppKit.h>
+          // Resolved via -Iapp below. The quoted include is relative to the
+          // *including file* (this one, in /tmp), not to -I, so
+          // "app/CorroMacBridge.h" would NOT be found from here -- the
+          // directory prefix has to come from the include path.
+          #import "CorroMacBridge.h"
+
+          void corro_mac_abi_refs(void) {
+              uint64_t id = 1;
+              double dd[2] = {0, 0};
+              int32_t ic[2] = {0, 0};
+              double *ddp = dd;
+              int32_t *icp = ic;
+              const char *l = NULL, *a = NULL;
+              corro_macos_canvas_draw(id, NULL, 1, 1);
+              corro_macos_canvas_size(id, 1, 1);
+              corro_macos_canvas_click(id, 0.0, 0.0);
+              corro_macos_canvas_click_button(id, 0.0, 0.0, 0, 0);
+              corro_macos_canvas_motion(id, 0.0, 0.0, 0);
+              corro_macos_canvas_release(id, 0.0, 0.0, 0, 0);
+              (void)corro_macos_canvas_key(id, 0, 0);
+              corro_macos_canvas_cell_size(ddp);
+              corro_macos_canvas_scroll_by(0, 0, icp);
+              (void)corro_macos_canvas_zoom(1.0);
+              (void)corro_macos_canvas_zoom_reset();
+              corro_macos_entry_changed(id);
+              corro_macos_entry_activate(id);
+              (void)corro_macos_entry_focus(id, true);
+              corro_macos_callback(id);
+              corro_macos_menu_action("app.about");
+              (void)corro_macos_menu_count();
+              (void)corro_macos_menu_item_count(0);
+              (void)corro_macos_menu_item(0, 0, &l, &a);
+              corro_macos_root_ready(NULL, NULL);
+          }
+          OBJC
+
+          xcrun clang -c /tmp/host_abi.m -o /tmp/host_abi.o -Iapp -fobjc-arc
+          xcrun clang /tmp/host_abi.o "$LIB" -o /tmp/host_abi \
+            -framework AppKit -framework CoreGraphics -framework Foundation \
+            -framework objc
+          echo "linked: every corro_macos_* export resolved"
+
+      - name: The generated shims and the bridge header are one contract
+        # Re-run the Linux-side diff on the Mac too: cheap, and it means a
+        # failure points at the file rather than at a link error.
+        run: macos/corro/scripts/check_bridge.sh
+
+      - name: Compile the generated AppKit shims
+        # The link step above proves every corro_macos_* symbol resolves, but
+        # it does not compile the *other* half of the contract: the shims the
+        # Rust adapter messages into. Those are `@interface`s declaring
+        # selectors; if a declaration and the `@implementation` disagree, or a
+        # generated method is malformed ObjC, nothing else in this workflow
+        # notices — a host would only find out when it adds the file to a
+        # target.
+        #
+        # `-c` only (no link): this is about the generated source being valid
+        # AppKit Objective-C, and compiling it is exactly that check.
+        run: |
+          set -euo pipefail
+          cd macos/corro
+          xcrun clang -c app/CorroGeneratedShims.m -o /tmp/shims.o \
+            -Iapp -fobjc-arc -Wall
+          echo "compiled: app/CorroGeneratedShims.m is valid AppKit Objective-C"

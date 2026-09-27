@@ -10,8 +10,8 @@
 //! which is intentionally kept for behaviour comparison.
 #![cfg(feature = "rswidgets-term")]
 
-use crate::grid::{GridBox, HEADER_ROWS, MARGIN_COLS};
-use crate::gui::compute::{self, CellDisplayStyle};
+use crate::grid::GridBox;
+use crate::gui::compute::CellDisplayStyle;
 use crate::gui::render::{fill_cells, CellSink};
 use crate::ops::{AggFunc, WorkbookState};
 use rswidgets::spreadsheet::{paint, SpreadsheetModel};

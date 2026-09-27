@@ -27,6 +27,11 @@ pub struct Viewport {
     pub row_labels: Vec<(u32, String)>,
     pub column_layout: Vec<(u32, u32, String)>,
     pub row_agg_func: Vec<Option<AggFunc>>,
+    /// Aggregate directive per *displayed* column, positionally aligned with
+    /// `col_ixs` (the column mirror of `row_agg_func`). `Some` marks a totals
+    /// column, which the painter shades so computed values do not read as
+    /// entered data.
+    pub col_agg_func: Vec<Option<AggFunc>>,
     pub mr: usize,
     pub mc: usize,
     /// Character width the columns were trimmed to fit. `fill_cells` needs it
@@ -105,9 +110,59 @@ impl Viewport {
         build(app, display_rows, cursor, data_cols, data_width, hr, lm)
     }
 
-    /// Build a viewport from already-known `display_rows`/`col_ixs` without
-    /// recomputing the visible indices (used for the in-viewport refresh where
-    /// nothing scrolled).
+    /// Build a viewport from already-known `display_rows`/`col_ixs` and a
+    /// ready column-width map, without recomputing visible indices (the
+    /// in-viewport refresh path, where nothing scrolled) and without touching
+    /// `app` beyond reading the active sheet's shape.
+    ///
+    /// `data_width` is the sum of the given widths (what the caller laid the
+    /// frame out for); pass the map the caller actually paints with, so the
+    /// gutter widths in `column_layout` and the spill budget in `fill_cells`
+    /// agree. Both GUI backends build their frame through this one function
+    /// (GTK supplies padlock-aware `display_col_width` values, pancurses its
+    /// own), so the derived labels/aggregates cannot drift between them.
+    pub fn from_parts(
+        app: &App,
+        display_rows: &[usize],
+        col_ixs: &[usize],
+        col_widths: &HashMap<usize, usize>,
+        hr: usize,
+    ) -> Viewport {
+        let rec = app.core.workbook.active_sheet().clone();
+        let g = &rec.grid;
+        let mr = g.main_rows();
+        let mc = g.main_cols();
+        let row_labels: Vec<(u32, String)> = display_rows
+            .iter()
+            .enumerate()
+            .map(|(idx, &r)| (idx as u32, ui_row_label(r, mr)))
+            .collect();
+        let column_layout: Vec<(u32, u32, String)> = col_ixs
+            .iter()
+            .map(|&c| {
+                let w = *col_widths.get(&c).unwrap_or(&1);
+                (c as u32, w as u32, ui_column_fragment(c, mc))
+            })
+            .collect();
+        let row_agg_func = compute::compute_row_agg_func(g, display_rows, hr, mr);
+        let col_agg_func = compute::compute_col_agg_func(g, &col_ixs);
+        Viewport {
+            display_rows: display_rows.to_vec(),
+            col_ixs: col_ixs.to_vec(),
+            col_widths: col_widths.clone(),
+            row_labels,
+            column_layout,
+            row_agg_func,
+            col_agg_func,
+            mr,
+            mc,
+            data_width: col_widths.values().copied().sum(),
+        }
+    }
+
+    /// Build a viewport from already-known `display_rows`/`col_ixs`, taking
+    /// each column's width from the grid. `data_width` is left at 0 because
+    /// the caller paints at its own layout width (see [`Self::refill`]).
     pub fn snapshot(
         app: &App,
         display_rows: &[usize],
@@ -117,34 +172,13 @@ impl Viewport {
     ) -> Viewport {
         let rec = app.core.workbook.active_sheet().clone();
         let g = &rec.grid;
-        let mr = g.main_rows();
-        let mc = g.main_cols();
         let col_widths: HashMap<usize, usize> =
             col_ixs.iter().map(|&c| (c, g.col_width(c).max(1))).collect();
-        let row_labels: Vec<(u32, String)> = display_rows
-            .iter()
-            .enumerate()
-            .map(|(idx, &r)| (idx as u32, ui_row_label(r, mr)))
-            .collect();
-        let column_layout: Vec<(u32, u32, String)> = col_ixs
-            .iter()
-            .map(|&c| {
-                let w = g.col_width(c).max(1);
-                (c as u32, w as u32, ui_column_fragment(c, mc))
-            })
-            .collect();
-        let row_agg_func = compute::compute_row_agg_func(g, display_rows, hr, mr);
-        Viewport {
-            display_rows: display_rows.to_vec(),
-            col_ixs: col_ixs.to_vec(),
-            col_widths,
-            row_labels,
-            column_layout,
-            row_agg_func,
-            mr,
-            mc,
-            data_width: 0,
-        }
+        let mut vp = Self::from_parts(app, display_rows, col_ixs, &col_widths, hr);
+        // `snapshot` callers size the paint separately; a summed width here
+        // would silently re-trim their layout.
+        vp.data_width = 0;
+        vp
     }
 }
 
@@ -187,6 +221,7 @@ fn build(
         })
         .collect();
     let row_agg_func = compute::compute_row_agg_func(g, display_rows, hr, mr);
+    let col_agg_func = compute::compute_col_agg_func(g, &col_ixs);
     Viewport {
         display_rows: display_rows.to_vec(),
         col_ixs,
@@ -194,6 +229,7 @@ fn build(
         row_labels,
         column_layout,
         row_agg_func,
+        col_agg_func,
         mr,
         mc,
         data_width,

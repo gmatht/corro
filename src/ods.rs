@@ -1091,30 +1091,8 @@ fn fold_numbers(func: crate::ops::AggFunc, xs: &[f64]) -> String {
     }
 }
 
-pub(crate) fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<crate::ops::AggFunc> {
-    let key_col = ColumnAddr::Left(MARGIN_COLS - 1);
-    let val = grid.get(&CellAddr::Footer {
-        row: footer_row_idx as u32,
-        col: key_col,
-    })?;
-    crate::ops::margin_key_agg_func(&val)
-}
-
 fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<crate::ops::AggFunc> {
-    let mut labels: Vec<(u32, String)> = grid
-        .iter_nonempty()
-        .filter_map(|(addr, val)| match addr {
-            CellAddr::Header { row, col } if col.to_global(grid.main_cols()) == global_col => Some((row, val)),
-            _ => None,
-        })
-        .collect();
-    labels.sort_unstable_by_key(|(row, _)| *row);
-    for (_, val) in labels {
-        if let Some(f) = crate::ops::margin_key_agg_func(&val) {
-            return Some(f);
-        }
-    }
-    None
+    crate::agg::helpers::right_col_agg_func(grid, global_col)
 }
 
 fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<crate::ops::AggFunc> {
@@ -1226,7 +1204,7 @@ fn ods_tui_flags(
     let is_underlined_boundary_row =
         (hr > 0 && logical_row == hr - 1) || last_display_main_row == Some(logical_row);
     let footer_agg = if logical_row >= hr + mr {
-        footer_row_agg_func(grid, logical_row - hr - mr)
+        crate::agg::helpers::footer_row_agg_func(grid, logical_row - hr - mr)
     } else {
         None
     };

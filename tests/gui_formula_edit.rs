@@ -129,6 +129,48 @@ fn ocr_entry_zone(shot: &PathBuf) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// True when the window has painted real content (the menu/formula strips and
+/// the grid), judged by pixel ink rather than OCR.
+///
+/// The readiness gate below exists to detect a *stalled present-pump* (a blank
+/// window), not to read text — OCR is used only as the fast path because it is
+/// cheap when the app is up. Under heavy machine load OCR intermittently
+/// returns empty for a window that has in fact painted, which made the gate
+/// flake; a pixel-ink check is load-independent and is what actually
+/// distinguishes "blank" from "drawn".
+fn window_has_painted_content(shot: &PathBuf) -> bool {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let crop = std::env::temp_dir().join(format!("corro-formula-ink-{id}.png"));
+    // Sample the full window at low resolution: a stalled window is a flat
+    // fill, a painted one has hundreds of dark glyph/gridline pixels.
+    let ok = Command::new("convert")
+        .arg(shot)
+        .args(["-colorspace", "Gray", "-resize", "25%"])
+        .arg(&crop)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let mut ink = 0usize;
+    if ok {
+        if let Ok(out) = Command::new("convert")
+            .arg(&crop)
+            .args(["-format", "%[fx:int(mean*1000)]", "info:"])
+            .output()
+        {
+            // A near-uniform (blank) frame has a mean brightness close to the
+            // background; text and gridlines pull it down. Threshold well below
+            // any painted frame's mean.
+            let mean: i64 = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(1000);
+            ink = (1000 - mean.clamp(0, 1000)) as usize;
+        }
+    }
+    let _ = std::fs::remove_file(&crop);
+    ink > 5
+}
+
 /// Wait for the first painted frame (deadline-polled appearance event).
 /// Fresh Xvfb servers sometimes stall present()'s pump, leaving a blank
 /// window for many seconds; a Down/Up poke partway kicks the frame clock
@@ -138,11 +180,15 @@ fn await_first_paint(wid: &str) {
     let mut poked = false;
     loop {
         let shot = screenshot(wid, "firstpaint");
+        // Ready when the entry shows its address/`fx` chrome (fast path) OR
+        // the window simply has painted content. The OCR path alone is
+        // load-flaky; the ink check is what the gate actually means.
         let text = ocr_entry_zone(&shot);
+        let painted = text.contains('A') || text.contains("fx") || window_has_painted_content(&shot);
         let _ = std::fs::remove_file(&shot);
-        if text.contains('A') || text.contains("fx") || Instant::now() > verdict {
+        if painted || Instant::now() > verdict {
             assert!(
-                text.contains('A') || text.contains("fx"),
+                painted,
                 "app never painted (present-pump stall), OCR: {text:?}"
             );
             break;

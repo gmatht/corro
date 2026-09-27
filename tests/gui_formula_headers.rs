@@ -109,16 +109,30 @@ fn screenshot(wid: &str, tag: &str) -> PathBuf {
     let _ = std::fs::remove_file(&xwd);    png
 }
 
-/// OCR the formula-bar address label (top-left, left of `fx`). Crops just
-/// the label strip (48px — calibrated: wider crops catch the `fx` caption)
-/// upscales 3x, and reads one line with an address whitelist (uppercase +
-/// digits + symbols; address labels never contain lowercase).
+/// OCR the formula-bar address label (top-left, left of `fx`). Reads one
+/// line with an address whitelist (uppercase + digits + symbols; address
+/// labels never contain lowercase).
+///
+/// The crop is calibrated, and both of its edges are load-bearing:
+///
+/// * **Height 16px, not 34px.** The formula row's glyphs are only ~9px tall
+///   (y=32..40). A 34px band is mostly empty space, and tesseract sizes its
+///   layout on the whole band: the glyphs become a small blob it reads as one
+///   garbage character (observed: `A1` -> `"E"`). Cropping the actual text
+///   rows and upscaling 5x reads it reliably.
+/// * **Width 96px, not 48px.** The address sits in a slot pinned to
+///   [`ADDR_SLOT_W_BASE`] (92px), so a margin address like `[AA_1` is wider
+///   than 48px and a 48px crop would truncate it. 96px covers the whole slot
+///   and still stops well short of the `fx` caption, which starts at x=111.
+///
+/// Both numbers are re-derived from a live window whenever the formula row's
+/// layout changes, so re-run and re-calibrate if the bar is restyled.
 fn ocr_addr_label(png: &PathBuf) -> String {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let crop = std::env::temp_dir().join(format!("corro-fhdr-crop-{id}.png"));
     Command::new("convert")
         .arg(png)
-        .args(["-crop", "48x34+0+20", "-resize", "300%"])
+        .args(["-crop", "96x16+4+30", "-resize", "500%"])
         .arg(&crop)
         .status()
         .expect("convert crop");
@@ -852,7 +866,9 @@ fn gui_ring_key_step_commits_margin() {
     xdotool(&["key", "--window", &wid, "Q"]);
     std::thread::sleep(Duration::from_millis(500));
     xdotool(&["key", "--window", &wid, "Return"]);
-    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10));
+    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10), "commit ]A1", |ls| {
+        ls.iter().any(|l| l == "SET ]A1 Q")
+    });
     let _ = child.kill();
     let _ = child.wait();
     assert!(
@@ -866,18 +882,29 @@ fn gui_ring_key_step_commits_margin() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Poll the fixture file until a SET line lands (commit proof), or panic.
-fn wait_file_lines(path: &PathBuf, deadline: Instant) -> Vec<String> {
+/// Poll the fixture file with a deadline until `pred` holds of its lines, or
+/// panic.
+///
+/// The predicate (not "any SET line") is what makes the wait event-based for
+/// fixtures that already contain a `SET` line: pollong for the *committed*
+/// line cannot be satisfied by the fixture's own seed, which is what let a
+/// seeded test observe the seed and race ahead of the real commit.
+fn wait_file_lines(
+    path: &PathBuf,
+    deadline: Instant,
+    what: &str,
+    pred: impl Fn(&[String]) -> bool,
+) -> Vec<String> {
     loop {
         if let Ok(content) = std::fs::read_to_string(path) {
             let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-            if lines.iter().any(|l| l.starts_with("SET ")) {
+            if pred(&lines) {
                 return lines;
             }
         }
         if Instant::now() > deadline {
             panic!(
-                "timed out waiting for commit in {}\ncontent: {:?}",
+                "timed out waiting for {what} in {}\ncontent: {:?}",
                 path.display(),
                 std::fs::read_to_string(path).unwrap_or_default()
             );
@@ -923,7 +950,9 @@ fn gui_true_margin_stays_margin() {
     xdotool(&["key", "--window", &wid, "W"]);
     std::thread::sleep(Duration::from_millis(500));
     xdotool(&["key", "--window", &wid, "Return"]);
-    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10));
+    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10), "commit margin", |ls| {
+        ls.iter().any(|l| l.starts_with("SET ]"))
+    });
     let _ = child.kill();
     let _ = child.wait();
     assert!(
@@ -1007,7 +1036,9 @@ fn gui_footer_commit_past_ring() {
     xdotool(&["key", "--window", &wid, "Q"]);
     std::thread::sleep(Duration::from_millis(500));
     xdotool(&["key", "--window", &wid, "Return"]);
-    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10));
+    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10), "commit A_2", |ls| {
+        ls.iter().any(|l| l == "SET A_2 Q")
+    });
     let _ = child.kill();
     let _ = child.wait();
     assert!(

@@ -546,7 +546,7 @@ fn describe_op(op: &Op, workbook: &ops::WorkbookState) -> String {
             let names: Vec<String> = cols
                 .iter()
                 .map(|s| {
-                    let name = addr::excel_column_name(s.col.saturating_sub(MARGIN_COLS));
+                    let name = addr::global_column_letter(s.col);
                     if s.desc {
                         format!("!{name}")
                     } else {
@@ -559,14 +559,14 @@ fn describe_op(op: &Op, workbook: &ops::WorkbookState) -> String {
         Op::SetCellFormat { format, .. } => format!("format cell: {}", format_label(format)),
         Op::SetColumnFormat { col, format, .. } => format!(
             "format column {}: {}",
-            addr::excel_column_name(col.saturating_sub(MARGIN_COLS)),
+            addr::global_column_letter(*col),
             format_label(format)
         ),
         Op::SetAllColumnFormat { format } => format!("format all columns: {}", format_label(format)),
         Op::SetMaxColWidth { width } => format!("default column width {width}"),
         Op::SetColWidth { col, width } => format!(
             "column {} width {}",
-            addr::excel_column_name(col.saturating_sub(MARGIN_COLS)),
+            addr::global_column_letter(*col),
             width.map(|w| w.to_string()).unwrap_or_else(|| "auto".into())
         ),
         other => format!("{other:?}"),

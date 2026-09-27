@@ -15,6 +15,25 @@ pub const FOOTER_ROWS: usize = 999_999_999;
 /// mirror names (e.g. A..ZZ). Use usize for indexes.
 pub const MARGIN_COLS: usize = 26 * 27; // A..ZZ inclusive
 
+/// Which axes an anchor↔cursor selection covers.
+///
+/// The ratatui reference has always modelled this (`SelectionKind`): a plain
+/// Shift+arrow band is `Cells`, while the row/column selection commands
+/// (`r`/`c` there, a gutter-header click in the GUIs) promote it to `Rows` or
+/// `Cols` so the whole main-body row/column highlights and only the matching
+/// gutter headers glow. Kept here beside [`SheetCursor`] because every
+/// backend that holds a selection (ratatui, the widget-tree GUI, pancurses'
+/// host state) needs the same three cases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionKind {
+    /// Both axes: the classic anchor↔cursor rectangle.
+    Cells,
+    /// Whole main-body rows: every column of the covered rows is selected.
+    Rows,
+    /// Whole main-body columns: every row of the covered columns is selected.
+    Cols,
+}
+
 /// Global row/col cursor used by the UI and core logic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SheetCursor {
@@ -1848,7 +1867,7 @@ impl Grid {
     pub fn sort_specs_to_log(cols: &[SortSpec]) -> String {
         cols.iter()
             .map(|spec| {
-                let name = crate::addr::excel_column_name(spec.col.saturating_sub(MARGIN_COLS));
+                let name = crate::addr::global_column_letter(spec.col);
                 if spec.desc {
                     format!("!{name}")
                 } else {

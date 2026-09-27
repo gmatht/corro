@@ -40,8 +40,8 @@ mod ios_adapter {
     use once_cell::sync::Lazy;
 
     use crate::backends::ios::{
-        self as core_ios, alloc_init, cls, msg0, msg0i, msg0v, msg1bv, msg1i, msg1iv, msg1v,
-        msg4cv, nsstring, nsstring_to_rust, own, Kind, WidgetMeta,
+        self as core_ios, alloc_init, cls, msg0, msg0i, msg0v, msg1bv, msg1cv, msg1i, msg1iv,
+        msg1v, msg4cv, nsstring, nsstring_to_rust, own, Kind, WidgetMeta,
     };
     use crate::core::{DrawContext, Error, Widget};
 
@@ -468,6 +468,72 @@ mod ios_adapter {
         /// callers can pass the same string everywhere.
         pub fn set_markup(&self, markup: &str) {
             self.set_text(&strip_markup(markup));
+        }
+
+        /// Pin the label's width so changing its text never reflows the
+        /// siblings packed after it. `None` releases the pin.
+        ///
+        /// The AppKit twin of this method is the reference for *why* a pin is
+        /// more than a width request; the mechanism is the same on UIKit: an
+        /// `NSLayoutConstraint` alone does not beat
+        /// `-intrinsicContentSize` (content-hugging 250), so the hugging
+        /// priority has to go up as well or the label stays shrink-to-fit.
+        /// `corroSetPinnedWidth:` (host shim) installs the required width
+        /// equality constraint; a negative width releases it.
+        ///
+        /// iOS is a touch platform, so the formula bar is laid out a little
+        /// differently than on the desktop, but the address slot still must
+        /// not resize as the address changes — hence the same pin.
+        pub fn set_fixed_width(&self, w: Option<i32>) {
+            core_ios::with_meta_mut(self.0, |m| m.fixed_width = w);
+            if self.0.is_null() {
+                return;
+            }
+            unsafe {
+                msg1iv(self.0, "corroSetPinnedWidth:", w.unwrap_or(-1) as isize);
+                msg1iv(
+                    self.0,
+                    "corroSetContentHugging:",
+                    if w.is_some() { 1000 } else { 250 },
+                );
+            }
+            unsafe { msg0v(self.0, "setNeedsLayout") };
+        }
+
+        /// Left margin of the label's contents, in points. Pairs with
+        /// [`Label::set_fixed_width`]: a pinned, left-aligned label sits flush
+        /// against its slot's edge, and this restores the inset the
+        /// shrink-to-fit label had.
+        pub fn set_margin_start(&self, px: i32) {
+            core_ios::with_meta_mut(self.0, |m| m.margin_start = px);
+            if self.0.is_null() {
+                return;
+            }
+            unsafe { msg1cv(self.0, "setHeadIndent:", px as f64) };
+        }
+
+        /// Set the x alignment of the label's text (0.0 left .. 1.0 right).
+        ///
+        /// `UILabel` centres its text by default, so with a pinned width the
+        /// text would float mid-slot and drift as it changes width — the same
+        /// reflow the pin exists to stop, relocated to the glyphs. The
+        /// 0.0..1.0 range is mapped onto the three real anchors by nearest
+        /// third (the same mapping NWG uses for `SS_CENTER`/`SS_RIGHT`).
+        pub fn set_xalign(&self, x: f32) {
+            core_ios::with_meta_mut(self.0, |m| m.xalign = x);
+            if self.0.is_null() {
+                return;
+            }
+            // NSTextAlignment scale: 0 left, 1 centre, 2 right (UIKit uses
+            // the same integer constants).
+            let align: isize = if x < 1.0 / 3.0 {
+                0
+            } else if x < 2.0 / 3.0 {
+                1
+            } else {
+                2
+            };
+            unsafe { msg1iv(self.0, "setTextAlignment:", align) };
         }
 
         pub fn raw_handle(&self) -> *mut c_void {
@@ -951,7 +1017,10 @@ mod ios_adapter {
 
     impl Canvas {
         /// Canvas id for this view (0 = unknown; registry lookups miss).
-        fn canvas_id(&self) -> u64 {
+        /// This canvas's backend id. Exposed so a host can tell which canvas
+        /// a platform gesture belongs to (the sheet and the sheet-tab strip are
+        /// both canvases, and a drag means different things on each).
+        pub fn canvas_id(&self) -> u64 {
             core_ios::canvas_id_for_view(self.0)
         }
 
@@ -1035,6 +1104,32 @@ mod ios_adapter {
 
         pub fn grab_focus(&self) {}
         pub fn set_can_focus(&self, _can: bool) {}
+
+        /// Button/modifier-aware click. See the GTK backend's
+        /// `on_click_button`: added alongside `on_click` so the signature change
+        /// does not ripple through every backend, and so a backend that cannot
+        /// report a button (terminal, mobile) stays compilable.
+        pub fn on_click_button(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            // iOS/UIKit: touch has no button number; only press is reported.
+        }
+
+        /// Pointer motion over the canvas; see the GTK backend's `on_motion`.
+        pub fn on_motion(&self, _cb: Box<dyn FnMut(f64, f64, u32)>) {
+            // iOS/UIKit: touch has no button number; only press is reported.
+        }
+
+        /// This canvas's top-left in screen coordinates, or `None` when the
+        /// backend cannot report one. Callers then open a context menu
+        /// unpositioned rather than guessing. See the GTK backend's
+        /// `screen_origin`.
+        pub fn screen_origin(&self) -> Option<(i32, i32)> {
+            None
+        }
+
+        /// Pointer release; see the GTK backend's `on_release`.
+        pub fn on_release(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            // iOS/UIKit: touch has no button number; only press is reported.
+        }
 
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
             let mut map = CLICK_CALLBACKS.lock().unwrap();
@@ -1619,6 +1714,16 @@ mod ios_adapter {
 
     impl MenuBar {
         pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool {
+            false
+        }
+
+        /// Open the submenu whose mnemonic is `keyval` at a screen position.
+        ///
+        /// Only the GTK backend can do this (its `GtkMenu` takes a position
+        /// callback); elsewhere the menu system has no programmatic
+        /// popup-at-position call, so this reports `false` instead of
+        /// pretending. The caller surfaces that as an "unavailable" status.
+        pub fn popup_submenu_by_mnemonic_at(&self, _keyval: u32, _x: i32, _y: i32) -> bool {
             false
         }
         pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool {

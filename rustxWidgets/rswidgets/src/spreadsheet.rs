@@ -59,7 +59,6 @@ fn fire_commit_edit(row: u32, col: u32, text: String) {
 }
 
 /// Backend-agnostic spreadsheet data model.
-#[derive(Default)]
 pub struct SpreadsheetModel {
     pub cells: HashMap<(u32, u32), String>,
     pub cell_styles: HashMap<(u32, u32), u8>,
@@ -90,6 +89,48 @@ pub struct SpreadsheetModel {
     pub formula_bar_entry: Option<String>,
     pub cursor_move_callbacks: Vec<CursorMoveCb>,
     pub commit_edit_callbacks: Vec<CommitEditCb>,
+    /// View scale, 1.0 = the base metrics. Pinch-to-zoom on a phone, or any
+    /// host that wants a bigger/smaller sheet, sets this; the renderer, the
+    /// column layout and the hit-test all multiply their metrics by it, so
+    /// what is drawn and what a pointer lands on can never disagree. Clamped
+    /// into [`MIN_ZOOM`](Self::MIN_ZOOM)..=[`MAX_ZOOM`](Self::MAX_ZOOM) by
+    /// [`set_zoom`](Self::set_zoom).
+    pub zoom: f64,
+}
+
+impl Default for SpreadsheetModel {
+    fn default() -> Self {
+        SpreadsheetModel {
+            cells: HashMap::new(),
+            cell_styles: HashMap::new(),
+            raw_cells: HashMap::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            anchor: None,
+            margin_cols: 0,
+            main_cols: 0,
+            header_row_count: 0,
+            main_row_count: 0,
+            column_layout: Vec::new(),
+            row_labels: Vec::new(),
+            menu_text: String::new(),
+            border_title: String::new(),
+            status_text: String::new(),
+            formula_bar_trailing: String::new(),
+            tab_titles: Vec::new(),
+            tab_active: 0,
+            editing: false,
+            edit_buf: String::new(),
+            edit_pos: 0,
+            formula_bar_address: None,
+            formula_bar_entry: None,
+            cursor_move_callbacks: Vec::new(),
+            commit_edit_callbacks: Vec::new(),
+            // The identity scale, not zero: a manually built model (the widget
+            // does this) must render at the base metrics.
+            zoom: 1.0,
+        }
+    }
 }
 
 impl SpreadsheetModel {
@@ -100,6 +141,7 @@ impl SpreadsheetModel {
             margin_cols: 1,
             header_row_count: 1,
             column_layout: (0..cols).map(|c| (c, 12u32, format!("{}", c + 1))).collect(),
+            zoom: 1.0,
             ..Default::default()
         }
     }
@@ -195,24 +237,93 @@ impl SpreadsheetModel {
     pub const HEADER_H: f64 = 22.0;
     pub const ROW_LABEL_W: f64 = 64.0;
 
+    /// Smallest/largest view scale a pinch may reach. 0.4 keeps a whole
+    /// spreadsheet legible on a phone; 4.0 is beyond what a finger gesture
+    /// comfortably reaches and stops a runaway multiplier from growing the
+    /// layout without bound.
+    pub const MIN_ZOOM: f64 = 0.4;
+    pub const MAX_ZOOM: f64 = 4.0;
+
+    /// The view scale, with the degenerate values (0 from a `Default`-built
+    /// struct, NaN from a bad multiplication) normalised to 1.0. Reading the
+    /// scale always goes through here so a nonsense `zoom` cannot collapse
+    /// the layout to zero-sized cells.
+    pub fn zoom(&self) -> f64 {
+        if self.zoom.is_finite() && self.zoom > 0.0 {
+            self.zoom
+        } else {
+            1.0
+        }
+    }
+
+    /// Set the view scale, clamped to [`MIN_ZOOM`](Self::MIN_ZOOM)..=
+    /// [`MAX_ZOOM`](Self::MAX_ZOOM). Returns the scale actually applied.
+    ///
+    /// NaN has no ordering and so cannot be clamped; it means "no zoom" rather
+    /// than poisoning the metrics. A +/- infinity *is* clampable ("as big/small
+    /// as possible"), and matches the host-side `set_view_zoom`.
+    pub fn set_zoom(&mut self, zoom: f64) -> f64 {
+        let z = if zoom.is_nan() { 1.0 } else { zoom };
+        self.zoom = z.clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+        self.zoom()
+    }
+
+    /// Multiply the current scale by `factor` (a pinch's span ratio), keeping
+    /// the point under the fingers fixed.
+    ///
+    /// `anchor_x`/`anchor_y` are in the same pixel space as
+    /// [`paint`](fn@paint) (origin at the grid's top-left). The model has no
+    /// independent scroll offset (the cursor *is* the viewport in corro's GUI,
+    /// and the widget renders the whole model), so anchoring is expressed by
+    /// the caller: the gesture layer re-derives its scroll offsets from the
+    /// same pixel, and the widget's `hit_test` keeps pointing at the cell that
+    /// was under the fingers because it scales from the same origin. The
+    /// parameters are accepted here so a host with an offset can implement
+    /// true focus-preserving zoom without changing this signature.
+    ///
+    /// Returns the scale actually applied after clamping.
+    pub fn zoom_by(&mut self, factor: f64, anchor_x: f64, anchor_y: f64) -> f64 {
+        let _ = (anchor_x, anchor_y);
+        if !factor.is_finite() || factor <= 0.0 {
+            return self.zoom();
+        }
+        self.set_zoom(self.zoom() * factor)
+    }
+
+    /// Convenience: pixel metrics at the current scale. The renderer and the
+    /// hit-test both use these rather than the raw constants, so a zoomed grid
+    /// keeps drawing and pointing in agreement.
+    pub fn char_w(&self) -> f64 {
+        Self::CHAR_W * self.zoom()
+    }
+    pub fn row_h(&self) -> f64 {
+        Self::ROW_H * self.zoom()
+    }
+    pub fn header_h(&self) -> f64 {
+        Self::HEADER_H * self.zoom()
+    }
+    pub fn row_label_w(&self) -> f64 {
+        Self::ROW_LABEL_W * self.zoom()
+    }
+
     /// X pixel offset of a given global column (after the left label area).
     fn col_x(&self, global_col: u32) -> f64 {
-        let mut x = Self::ROW_LABEL_W;
+        let mut x = self.row_label_w();
         for &(gc, w, _) in &self.column_layout {
             if gc >= global_col {
                 break;
             }
-            x += w as f64 * Self::CHAR_W;
+            x += w as f64 * self.char_w();
         }
         x
     }
     fn col_width(&self, global_col: u32) -> f64 {
         for &(gc, w, _) in &self.column_layout {
             if gc == global_col {
-                return w as f64 * Self::CHAR_W;
+                return w as f64 * self.char_w();
             }
         }
-        12.0 * Self::CHAR_W
+        12.0 * self.char_w()
     }
     fn col_title(&self, global_col: u32) -> String {
         for (gc, _, t) in &self.column_layout {
@@ -257,10 +368,15 @@ fn parse_address(a: &str) -> Option<(u32, u32)> {
 
 /// Paint the whole spreadsheet into `dc` using the cross-platform 2D API.
 pub fn paint(model: &SpreadsheetModel, dc: &mut dyn DrawContext, _w: i32, _h: i32) {
-    dc.clear(0.96, 0.96, 0.96, 1.0);
+    // One lookup per frame, then pass the copy down: this function fills
+    // hundreds of rects and draws hundreds of strings, and re-taking the theme
+    // lock per call would put a shared-lock acquisition in the innermost loop.
+    let t = crate::core::theme();
+    let paper = t.color(crate::core::Role::Paper);
+    dc.clear(paper.r, paper.g, paper.b, 1.0);
 
-    let header_h = model.header_row_count as f64 * SpreadsheetModel::HEADER_H;
-    let row_label_w = SpreadsheetModel::ROW_LABEL_W;
+    let header_h = model.header_row_count as f64 * model.header_h();
+    let row_label_w = model.row_label_w();
 
     // Total columns to draw = margin + main.
     let total_cols = model.margin_cols + model.main_cols;
@@ -268,7 +384,7 @@ pub fn paint(model: &SpreadsheetModel, dc: &mut dyn DrawContext, _w: i32, _h: i3
 
     // ---- grid cells ----
     for r in 0..total_rows {
-        let ry = header_h + r as f64 * SpreadsheetModel::ROW_H;
+        let ry = header_h + r as f64 * model.row_h();
         let is_header_row = r < model.header_row_count;
         for c in 0..total_cols {
             let cx = if c < model.margin_cols {
@@ -285,10 +401,11 @@ pub fn paint(model: &SpreadsheetModel, dc: &mut dyn DrawContext, _w: i32, _h: i3
 
             let style = model.cell_styles.get(&(r, c)).copied().unwrap_or(style::DEFAULT);
             let is_cursor = r == model.cursor_row && c == model.cursor_col;
+            let is_selected = style == style::SELECTED;
 
             // background
-            let bg = bg_for(style, is_cursor, model.editing);
-            dc.fill_rect(cx, ry, cw, SpreadsheetModel::ROW_H, bg.0, bg.1, bg.2, bg.3);
+            let bg = bg_for(&t, style, is_cursor, model.editing);
+            dc.fill_rect(cx, ry, cw, model.row_h(), bg.0, bg.1, bg.2, bg.3);
 
             // text
             let text = if is_header_row {
@@ -299,7 +416,11 @@ pub fn paint(model: &SpreadsheetModel, dc: &mut dyn DrawContext, _w: i32, _h: i3
                 model.cells.get(&(r, c)).cloned().unwrap_or_default()
             };
             if !text.is_empty() {
-                let (fr, fg, fb) = fg_for(style);
+                // Text on a highlight fill takes the highlight ink, not body
+                // ink: in night mode the caret/selection fills are *lighter*
+                // than the body, so body ink would be low-contrast on the very
+                // cell the user is looking at.
+                let (fr, fg, fb) = fg_for(&t, style, is_cursor || is_selected);
                 if style_bold(style) {
                     // Draw twice with a 1px offset to fake bold (no font weight API yet).
                     dc.draw_text(cx + 2.0, ry + 3.0, &text, "monospace", 13.0, fr, fg, fb, 1.0);
@@ -318,19 +439,24 @@ pub fn paint(model: &SpreadsheetModel, dc: &mut dyn DrawContext, _w: i32, _h: i3
                 }
             }
 
-            // cursor outline
+            // cursor outline. Drawn in the accent colour rather than a
+            // hardcoded blue: a saturated blue that reads as "focused" on a
+            // white sheet disappears on a near-black one.
             if is_cursor && !model.editing {
-                dc.stroke_rect(cx, ry, cw, SpreadsheetModel::ROW_H, 0.0, 0.4, 0.85, 1.0, 2.0);
+                let c = t.color(crate::core::Role::TextAccent);
+                dc.stroke_rect(cx, ry, cw, model.row_h(), c.r, c.g, c.b, 1.0, 2.0);
             }
 
             // grid line
-            dc.stroke_rect(cx, ry, cw, SpreadsheetModel::ROW_H, 0.8, 0.8, 0.8, 1.0, 0.5);
+            let g = t.color(crate::core::Role::Gridline);
+            dc.stroke_rect(cx, ry, cw, model.row_h(), g.r, g.g, g.b, 1.0, 0.5);
         }
     }
 
     // ---- formula bar (top strip above the grid) ----
     let fb_y = 0.0;
-    dc.fill_rect(0.0, fb_y, 4096.0, SpreadsheetModel::HEADER_H, 0.9, 0.92, 0.95, 1.0);
+    let hbg = t.color(crate::core::Role::Header);
+    dc.fill_rect(0.0, fb_y, 4096.0, model.header_h(), hbg.r, hbg.g, hbg.b, 1.0);
     let addr = model
         .formula_bar_address
         .clone()
@@ -342,51 +468,81 @@ pub fn paint(model: &SpreadsheetModel, dc: &mut dyn DrawContext, _w: i32, _h: i3
         model.formula_bar_entry.clone().unwrap_or_default()
     };
     let fb_text = format!("{}  {}", addr, entry);
-    dc.draw_text(4.0, 4.0, &fb_text, "monospace", 13.0, 0.1, 0.1, 0.2, 1.0);
+    let txt = t.color(crate::core::Role::Text);
+    dc.draw_text(4.0, 4.0, &fb_text, "monospace", 13.0, txt.r, txt.g, txt.b, 1.0);
     if !model.formula_bar_trailing.is_empty() {
+        let m = t.color(crate::core::Role::TextMuted);
         dc.draw_text(
             row_label_w,
             4.0,
             &model.formula_bar_trailing,
             "monospace",
             13.0,
-            0.3,
-            0.3,
-            0.3,
+            m.r,
+            m.g,
+            m.b,
             1.0,
         );
     }
 
     // ---- tabs (bottom strip) ----
     if !model.tab_titles.is_empty() {
-        let tab_h = SpreadsheetModel::HEADER_H;
-        let ty = header_h + total_rows as f64 * SpreadsheetModel::ROW_H;
-        dc.fill_rect(0.0, ty, 4096.0, tab_h, 0.92, 0.92, 0.92, 1.0);
+        let tab_h = model.header_h();
+        let ty = header_h + total_rows as f64 * model.row_h();
+        let strip = t.color(crate::core::Role::TabStrip);
+        dc.fill_rect(0.0, ty, 4096.0, tab_h, strip.r, strip.g, strip.b, 1.0);
+        let tab_text = t.color(crate::core::Role::Text);
         let mut tx = 4.0;
-        for (i, t) in model.tab_titles.iter().enumerate() {
+        for (i, title) in model.tab_titles.iter().enumerate() {
             let active = i == model.tab_active;
-            let (r, g, b) = if active { (0.6, 0.75, 0.95) } else { (0.85, 0.85, 0.85) };
+            let c = t.color(if active {
+                crate::core::Role::TabActive
+            } else {
+                crate::core::Role::TabIdle
+            });
             let w = 80.0;
-            dc.fill_rect(tx, ty + 2.0, w, tab_h - 4.0, r, g, b, 1.0);
-            dc.draw_text(tx + 4.0, ty + 5.0, t, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
+            dc.fill_rect(tx, ty + 2.0, w, tab_h - 4.0, c.r, c.g, c.b, 1.0);
+            dc.draw_text(
+                tx + 4.0,
+                ty + 5.0,
+                title,
+                "monospace",
+                12.0,
+                tab_text.r,
+                tab_text.g,
+                tab_text.b,
+                1.0,
+            );
             tx += w + 4.0;
         }
     }
 
     // ---- border title / status (left gutter bottom) ----
     if !model.border_title.is_empty() {
-        dc.draw_text(4.0, header_h + 2.0, &model.border_title, "monospace", 12.0, 0.2, 0.2, 0.2, 1.0);
-    }
-    if !model.status_text.is_empty() {
+        let m = t.color(crate::core::Role::TextMuted);
         dc.draw_text(
             4.0,
-            header_h + (total_rows as f64 + 1.0) * SpreadsheetModel::ROW_H,
+            header_h + 2.0,
+            &model.border_title,
+            "monospace",
+            12.0,
+            m.r,
+            m.g,
+            m.b,
+            1.0,
+        );
+    }
+    if !model.status_text.is_empty() {
+        let m = t.color(crate::core::Role::TextMuted);
+        dc.draw_text(
+            4.0,
+            header_h + (total_rows as f64 + 1.0) * model.row_h(),
             &model.status_text,
             "monospace",
             11.0,
-            0.3,
-            0.3,
-            0.3,
+            m.r,
+            m.g,
+            m.b,
             1.0,
         );
     }
@@ -419,43 +575,49 @@ fn style_bold(s: u8) -> bool {
     matches!(s, style::ACTIVE_HEADER | style::INACTIVE_HEADER | style::AGGREGATE | style::FOOTER_AGGREGATE)
 }
 
-fn bg_for(s: u8, is_cursor: bool, editing: bool) -> (f64, f64, f64, f64) {
-    if is_cursor {
+fn bg_for(t: &crate::core::Theme, s: u8, is_cursor: bool, editing: bool) -> (f64, f64, f64, f64) {
+    use crate::core::Role;
+    let c = if is_cursor {
         if editing {
-            (1.0, 1.0, 0.8, 1.0)
+            t.color(Role::CursorEditing)
         } else {
-            (0.8, 0.9, 1.0, 1.0)
+            t.color(Role::Cursor)
         }
     } else if matches!(s, style::ACTIVE_HEADER | style::INACTIVE_HEADER) {
-        (0.88, 0.9, 0.93, 1.0)
+        t.color(Role::Header)
     } else {
-        (1.0, 1.0, 1.0, 1.0)
-    }
+        t.color(Role::CellBody)
+    };
+    c.rgba()
 }
 
-fn fg_for(s: u8) -> (f64, f64, f64) {
-    match s {
-        style::AGGREGATE | style::FOOTER_AGGREGATE => (0.4, 0.4, 0.4),
-        style::HYPERLINK => (0.0, 0.0, 0.85),
-        _ => (0.05, 0.05, 0.1),
-    }
+fn fg_for(t: &crate::core::Theme, s: u8, on_highlight: bool) -> (f64, f64, f64) {
+    use crate::core::Role;
+    let c = match s {
+        style::AGGREGATE | style::FOOTER_AGGREGATE => t.color(Role::Aggregate),
+        style::HYPERLINK => t.color(Role::TextAccent),
+        // A link on a highlight fill would otherwise be light-blue-on-light.
+        _ if on_highlight => t.color(Role::TextOnHighlight),
+        _ => t.color(Role::Text),
+    };
+    (c.r, c.g, c.b)
 }
 
 /// Map a pixel coordinate (from a click) back to a cell, if any.
 pub fn cell_at(model: &SpreadsheetModel, x: f64, y: f64) -> Option<(u32, u32)> {
-    let header_h = model.header_row_count as f64 * SpreadsheetModel::HEADER_H;
+    let header_h = model.header_row_count as f64 * model.header_h();
     if y < header_h {
         return None;
     }
-    let r = ((y - header_h) / SpreadsheetModel::ROW_H).floor() as u32;
+    let r = ((y - header_h) / model.row_h()).floor() as u32;
     if r >= model.header_row_count + model.main_row_count {
         return None;
     }
     let total_cols = model.margin_cols + model.main_cols;
-    let mut cx = SpreadsheetModel::ROW_LABEL_W;
+    let mut cx = model.row_label_w();
     for c in 0..total_cols {
         let cw = if c < model.margin_cols {
-            SpreadsheetModel::ROW_LABEL_W / model.margin_cols.max(1) as f64
+            model.row_label_w() / model.margin_cols.max(1) as f64
         } else {
             model.col_width(c)
         };

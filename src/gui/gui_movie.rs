@@ -35,11 +35,15 @@ const FRAME_H: i32 = 800;
 /// Height of the window chrome above the grid: menu bar + formula bar, the
 /// same two strips the interactive window stacks over the canvas.
 const CHROME_H: f64 = 56.0;
-/// Height of the column-label strip inside the grid.
-const HEADER_H: f64 = 24.0;
-const ROW_H: f64 = 20.0;
+/// Height of the column-label strip inside the grid (the live backend's
+/// `header_h`, at scale 1).
+const HEADER_H: f64 = crate::gui::gui_backend::HEADER_H_BASE;
+/// Row height and character advance: the live `row_h()` / `char_w()` base
+/// metrics. Sharing the constants keeps a recorded frame laid out exactly
+/// like the window (the frame is painted without the density scale).
+const ROW_H: f64 = crate::gui::gui_backend::ROW_H_BASE;
 const ROW_LABEL_W: f64 = 50.0;
-const CHAR_W: f64 = 7.2;
+const CHAR_W: f64 = crate::gui::gui_backend::CHAR_W_BASE;
 /// Height of the status band painted over the bottom of a frame.
 const STATUS_H: f64 = 30.0;
 
@@ -195,7 +199,10 @@ fn paint_sheet(dc: &mut RasterDrawContext, app: &crate::gui::App, w: i32, h: i32
         )
     };
     let col_widths = stretch_columns_to_width(&vp, w);
-    dc.clear(0.94, 0.94, 0.94, 1.0);
+    crate::gui::gui_backend::chrome::clear_to(
+        dc,
+        crate::gui::gui_backend::chrome::palette().paper(),
+    );
     crate::gui::gui_backend::render_grid_body(
         dc,
         app,

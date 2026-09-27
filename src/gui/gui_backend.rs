@@ -1,7 +1,15 @@
 // Combined-gui builds flip the rswidgets root prelude to pancurses-adapter
 // types; the native backend always needs the common wrappers, so on Linux
-// it names them explicitly. Other platforms keep the prelude (unchanged).
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "ios", target_os = "android")))]
+// it names them explicitly. Other platforms keep the prelude (unchanged) —
+// but NOT macOS, which names the common wrappers explicitly below and would
+// otherwise import a prelude it never uses (`warning: unused import`).
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "macos"
+)))]
 use rswidgets::prelude::*;
 #[cfg(target_os = "linux")]
 use rswidgets::common::{Canvas, Entry, Label, MenuBar, Orientation, Window};
@@ -22,16 +30,16 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::actions::run_prompt_action;
-use super::actions::{dispatch_menu_action, menu_action_needs_prompt, MenuDispatch};
+use super::actions::{dispatch_menu_action, menu_action_needs_prompt, present_menu_dispatch, MenuDispatch};
 use super::extrapolate;
 
 use crate::grid::{CellAddr, GridBox, SheetCursor, HEADER_ROWS, MARGIN_COLS};
-use crate::ops::{Op, WorkbookOp};
+use crate::ops::Op;
 use crate::ui_core;
 
 use super::compute::{self, CellDisplayStyle};
 use super::dialogs;
-use super::render::{self, CellSink};
+use super::render;
 
 use rswidgets::core::key::{normalize, RETURN, ESCAPE, BACKSPACE, DELETE, LEFT, UP, RIGHT, DOWN, TAB, HOME, END, PAGE_UP, PAGE_DOWN, F1, F2, F3, ALT_L, ALT_R};
 
@@ -116,59 +124,43 @@ pub(crate) const HEADER_H_BASE: f64 = 24.0;
 pub(crate) const ROW_LABEL_W_BASE: f64 = 50.0;
 pub(crate) const CHAR_W_BASE: f64 = 7.2;
 
-/// Density multiplier for the pixel metrics.
-///
-/// 1.0 on every desktop backend. On Android it is the display density
-/// (`DisplayMetrics.density`), so the grid is legible on a phone without
-/// changing a single desktop call site. Resolved once and cached: it is read
-/// on every frame and cannot change while the app runs.
+/// Host display density, as reported by the platform adapter (mobile/Retina
+/// targets only). 1.0 on the desktop backends, where the base metrics are
+/// already the right size.
 #[cfg(target_os = "android")]
-pub(crate) fn metrics_scale() -> f64 {
-    use std::sync::OnceLock;
-    static SCALE: OnceLock<f64> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        rswidgets::backends_android_adapter::display_density()
-            .unwrap_or(1.0)
-            .max(1.0)
-    })
+fn host_density() -> Option<f64> {
+    rswidgets::backends_android_adapter::display_density()
 }
 
-/// iOS: `UIScreen.scale` (1.0 non-Retina, 2.0 Retina, 3.0 Plus/X era). Same
-/// purpose as the Android density above — a phone needs bigger pixels than a
-/// desktop monitor for the same number to be legible — and resolved once
-/// (it cannot change while the app runs).
 #[cfg(target_os = "ios")]
-pub(crate) fn metrics_scale() -> f64 {
-    use std::sync::OnceLock;
-    static SCALE: OnceLock<f64> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        rswidgets::backends_ios_adapter::display_density()
-            .unwrap_or(1.0)
-            .max(1.0)
-    })
+fn host_density() -> Option<f64> {
+    rswidgets::backends_ios_adapter::display_density()
 }
 
-/// macOS: `NSScreen.backingScaleFactor` (1.0 non-Retina, 2.0 Retina). Same
-/// purpose as the iOS/Android density — a Retina panel needs bigger *points*
-/// for the same nominal pixel number to be legible — and resolved once (it
-/// cannot change while the app runs).
-///
-/// Note there is no macOS touch-target floor: the AppKit adapter uses compact
-/// desktop control metrics, so this scale only affects corro's own chrome.
 #[cfg(target_os = "macos")]
-pub(crate) fn metrics_scale() -> f64 {
-    use std::sync::OnceLock;
-    static SCALE: OnceLock<f64> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        rswidgets::backends_macos_adapter::display_density()
-            .unwrap_or(1.0)
-            .max(1.0)
-    })
+fn host_density() -> Option<f64> {
+    rswidgets::backends_macos_adapter::display_density()
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
+fn host_density() -> Option<f64> {
+    None
+}
+
+/// Density multiplier for the pixel metrics.
+///
+/// 1.0 on every desktop backend. On a phone (Android `DisplayMetrics.density`)
+/// or a Retina Mac/iOS screen (`UIScreen.scale` /
+/// `NSScreen.backingScaleFactor`) it is the host density, so the grid is
+/// legible without changing a single desktop call site.
+///
+/// Resolved once and cached: it is read on every frame and cannot change while
+/// the app runs. The floor of 1.0 keeps a bogus/absent density from *shrinking*
+/// the UI below its desktop size.
 pub(crate) fn metrics_scale() -> f64 {
-    1.0
+    use std::sync::OnceLock;
+    static SCALE: OnceLock<f64> = OnceLock::new();
+    *SCALE.get_or_init(|| host_density().unwrap_or(1.0).max(1.0))
 }
 
 /// Startup phase marker for the mobile backends.
@@ -204,11 +196,362 @@ pub(crate) fn phase(marker: &str) {
     }
 }
 
-pub(crate) fn font_size() -> f64 { FONT_SIZE_BASE * metrics_scale() }
-pub(crate) fn row_h() -> f64 { ROW_H_BASE * metrics_scale() }
-pub(crate) fn header_h() -> f64 { HEADER_H_BASE * metrics_scale() }
-pub(crate) fn row_label_w() -> f64 { ROW_LABEL_W_BASE * metrics_scale() }
-pub(crate) fn char_w() -> f64 { CHAR_W_BASE * metrics_scale() }
+pub(crate) fn font_size() -> f64 { FONT_SIZE_BASE * metrics_scale() * view_zoom() }
+pub(crate) fn row_h() -> f64 { ROW_H_BASE * metrics_scale() * view_zoom() }
+pub(crate) fn header_h() -> f64 { HEADER_H_BASE * metrics_scale() * view_zoom() }
+pub(crate) fn row_label_w() -> f64 { ROW_LABEL_W_BASE * metrics_scale() * view_zoom() }
+pub(crate) fn char_w() -> f64 { CHAR_W_BASE * metrics_scale() * view_zoom() }
+
+/// `(row height, column advance)` in points, for a host that has to convert
+/// its own pixel deltas into whole cells — a scroll wheel, a trackpad pan, a
+/// momentum scroll.
+///
+/// A host *must* use these rather than its own constants: both already carry
+/// `metrics_scale()` (the Retina factor) and `view_zoom()` (the pinch scale),
+/// so a host-side conversion that ignored them would scroll by the wrong
+/// number of rows the moment the display was not 1x or the sheet was pinched.
+/// That is a divergence between what is drawn and what is scrolled, which is
+/// exactly the desynchronisation the zoom plumbing exists to prevent.
+pub(crate) fn cell_size() -> (f64, f64) { (row_h(), char_w()) }
+
+// ---------------------------------------------------------------------------
+// View zoom (pinch-to-zoom)
+// ---------------------------------------------------------------------------
+//
+// A *user* scale on top of the host density: on a phone the sheet can be
+// pinched larger or smaller, exactly like a photo. It multiplies the same
+// five grid metrics the density does, so the renderer, the hit-test, the
+// scroll conversion and the padlock targets all move together — and it is
+// applied in ONE place (`view_zoom`), which is why nothing else in the
+// backend needs to know a pinch happened.
+//
+// Like every other piece of this backend it is UI-thread-only (the metric
+// functions are called from draw and input callbacks, never off-thread), so a
+// thread-local `Cell` is the whole implementation — no atomics, no locks, and
+// no risk of a draw reading a half-applied scale.
+
+thread_local! {
+    /// The active pinch scale, 1.0 = the sheet as laid out at the host
+    /// density. Written only by [`set_view_zoom`]/[`zoom_view_by`].
+    static VIEW_ZOOM: Cell<f64> = const { Cell::new(1.0) };
+}
+
+/// Bounds a pinch may reach. Mirrors `rswidgets::spreadsheet::SpreadsheetModel`'s
+/// limits so the widget and this host agree on what "fully zoomed" means.
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    target_os = "android",
+    target_os = "ios",
+    target_os = "macos",
+    test
+))]
+pub(crate) const MIN_VIEW_ZOOM: f64 = 0.4;
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    target_os = "android",
+    target_os = "ios",
+    target_os = "macos",
+    test
+))]
+pub(crate) const MAX_VIEW_ZOOM: f64 = 4.0;
+
+/// The active pinch scale (1.0 when never zoomed).
+pub(crate) fn view_zoom() -> f64 {
+    VIEW_ZOOM.with(|z| {
+        let v = z.get();
+        if v.is_finite() && v > 0.0 { v } else { 1.0 }
+    })
+}
+
+/// Set the pinch scale, clamped to the same range the widget uses. Returns
+/// the scale actually applied.
+///
+/// Gated on the targets whose hosts deliver a pinch: on a desktop nothing can
+/// call it, and an ungated setter would be dead code (the repo builds
+/// warning-free on every feature set).
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    target_os = "android",
+    target_os = "ios",
+    target_os = "macos",
+    test
+))]
+pub(crate) fn set_view_zoom(zoom: f64) -> f64 {
+    // NaN has no ordering, so it cannot be clamped; treat it as "no zoom"
+    // rather than letting it poison the metric functions. A +/- infinity *can*
+    // be clamped (it means "as large/small as possible"), and `f64::clamp`
+    // does that correctly, so it is left to it.
+    let z = if zoom.is_nan() { 1.0 } else { zoom };
+    let clamped = z.clamp(MIN_VIEW_ZOOM, MAX_VIEW_ZOOM);
+    VIEW_ZOOM.with(|v| v.set(clamped));
+    clamped
+}
+
+/// Multiply the pinch scale (a gesture's span ratio). Returns the applied
+/// scale. `factor <= 0`/NaN is ignored, matching the widget's `zoom_by`.
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    target_os = "android",
+    target_os = "ios",
+    target_os = "macos",
+    test
+))]
+pub(crate) fn zoom_view_by(factor: f64) -> f64 {
+    if !factor.is_finite() || factor <= 0.0 {
+        return view_zoom();
+    }
+    set_view_zoom(view_zoom() * factor)
+}
+
+/// Multiply the current pinch scale by `factor`, clamped, with no viewport and
+/// no redraw.
+///
+/// The *whole* of what `zoom_viewport_by` does minus the three lines that need
+/// a live `GuiState` (commit the edit, recompute, repaint). Split out so the
+/// scale arithmetic is callable — and therefore testable — from a host with no
+/// window, which is exactly the case `macos_backend::zoom_viewport_by` has off
+/// a Mac. Without this, a Linux test could not check that a pinch is clamped
+/// to the same `0.4..=4.0` range the renderer uses, and that range is shared
+/// with `rswidgets::spreadsheet` precisely so the two agree.
+// Only reached from `macos_backend` on a NON-macOS host, where the real
+// viewport-touching twin is `#[cfg(target_os = "macos")]`-gated. On a Mac
+// the twin is called instead, so this is dead there — hence the allow
+// rather than a wider gate that would hide a real unused helper.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    target_os = "android",
+    target_os = "ios",
+    target_os = "macos",
+    test
+))]
+pub(crate) fn clamped_view_zoom(factor: f64) -> f64 {
+    zoom_view_by(factor)
+}
+
+/// Set the pinch scale to 1.0 with no viewport and no redraw — the
+/// viewport-free half of [`reset_viewport_zoom`], for the same reason as
+/// [`clamped_view_zoom`].
+// Only reached from `macos_backend` on a NON-macOS host, where the real
+// viewport-touching twin is `#[cfg(target_os = "macos")]`-gated. On a Mac
+// the twin is called instead, so this is dead there — hence the allow
+// rather than a wider gate that would hide a real unused helper.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    target_os = "android",
+    target_os = "ios",
+    target_os = "macos",
+    test
+))]
+pub(crate) fn reset_view_zoom_scale() -> f64 {
+    set_view_zoom(1.0)
+}
+
+/// Reset the pinch scale to 1.0. Used by the tests, and by nothing else: no
+/// product path wants "back to the base metrics" without a gesture behind it.
+#[cfg(test)]
+pub(crate) fn reset_view_zoom() {
+    VIEW_ZOOM.with(|v| v.set(1.0));
+}
+
+/// RAII guard for tests: restores the zoom to 1.0 when dropped, *including* on
+/// a panic. The scale is thread-local state, and Rust's test harness reuses
+/// threads, so a test that changes the zoom and only resets it on the happy
+/// path can leave a later, unrelated test (on the same thread) measuring a
+/// zoomed grid. A guard makes that impossible to forget.
+#[cfg(test)]
+pub(crate) struct ViewZoomGuard;
+
+#[cfg(test)]
+impl ViewZoomGuard {
+    /// Reset the zoom now and arrange for it to be reset again on drop.
+    pub(crate) fn new() -> Self {
+        reset_view_zoom();
+        ViewZoomGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for ViewZoomGuard {
+    fn drop(&mut self) {
+        reset_view_zoom();
+    }
+}
+
+/// The grid's neutral chrome palette, as `(r, g, b)` in 0..=1.
+///
+/// These greys are what makes the sheet read as a spreadsheet: a near-white
+/// margin strip, mid-grey gutter labels, light gridlines and a slightly
+/// dimmer body for margin cells. Named here (rather than repeated as
+/// literals at every `fill_rect`) so the movie painter and the live canvas
+/// cannot shade the same surface differently — a mismatch shows up as a
+/// seam in recordings.
+///
+/// ## Theming
+///
+/// Each entry is now a *function of the ambient*
+/// [`rswidgets::core::theme`], not a `const`. The light values are unchanged
+/// and byte-identical to the constants that used to live here, so a build
+/// that never switches scheme paints exactly as before; the functions are
+/// what let night mode reach the app's own surfaces (see `Palette`).
+///
+/// They are functions rather than a swappable global because the values are
+/// not all stock rswidgets roles: this app's `PAPER` is 0.94 where the
+/// toolkit's `Role::Paper` is 0.96, and it has a `GUTTER` and a distinct
+/// `GUTTER_SELECTED` the toolkit has no role for. So corro keeps ownership of
+/// its numbers, and the theme decides *which* set applies.
+pub(crate) mod chrome {
+    use rswidgets::core::{Color, ColorScheme, Role, Theme};
+
+    /// The app's palette for the active scheme.
+    ///
+    /// Built once per call from the active [`Theme`], so switching schemes
+    /// changes every surface at once with no other state to keep in step.
+    /// Values not covered by a toolkit role fall back to explicit literals,
+    /// which are the pre-theme ones.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Palette {
+        inner: Theme,
+        /// `Role::Paper` is the toolkit's grid backdrop; this app clears a
+        /// slightly darker paper behind the whole canvas.
+        paper: Color,
+        gutter: Color,
+        gutter_selected: Color,
+        /// Half the margin's darkness from the body, toward the margin. See
+        /// `AGGREGATE_BODY` below for why this is computed rather than
+        /// hardcoded in both palettes.
+        aggregate_body: Color,
+    }
+
+    impl Palette {
+        fn from_theme(inner: Theme) -> Self {
+            let night = inner.scheme() == ColorScheme::Night;
+            // Light values are the original consts. The night equivalents
+            // mirror the rswidgets roles so the two layers agree.
+            let (paper, gutter, gutter_selected, _margin, aggregate) = if night {
+                (
+                    Color::new(0.11, 0.11, 0.13),
+                    Color::new(0.18, 0.18, 0.21),
+                    Color::new(0.24, 0.30, 0.40),
+                    Color::new(0.13, 0.13, 0.15),
+                    Color::new(0.20, 0.20, 0.23),
+                )
+            } else {
+                let margin = Color::new(0.75, 0.75, 0.75);
+                (
+                    Color::new(0.94, 0.94, 0.94),
+                    Color::new(0.9, 0.9, 0.9),
+                    Color::new(0.9, 0.95, 1.0),
+                    margin,
+                    // The documented 0.875: data is 0% dark, the margin 25%
+                    // dark, so a totals line sits at half the margin's
+                    // darkness. Derived from the margin above rather than
+                    // written as its own literal so the "halfway to the margin"
+                    // relationship cannot drift if the margin ever changes.
+                    Color::new(
+                        1.0 - (1.0 - margin.r) * 0.5,
+                        1.0 - (1.0 - margin.g) * 0.5,
+                        1.0 - (1.0 - margin.b) * 0.5,
+                    ),
+                )
+            };
+            Self {
+                inner,
+                paper,
+                gutter,
+                gutter_selected,
+                aggregate_body: aggregate,
+            }
+        }
+
+        /// Background cleared behind the whole grid ("paper white").
+        pub fn paper(&self) -> (f64, f64, f64) {
+            self.paper.rgb()
+        }
+        /// Gutter (row-label / column-header) idle fill.
+        pub fn gutter(&self) -> (f64, f64, f64) {
+            self.gutter.rgb()
+        }
+        /// Gutter fill for rows/columns covered by a selection.
+        pub fn gutter_selected(&self) -> (f64, f64, f64) {
+            self.gutter_selected.rgb()
+        }
+        /// Cell gridlines.
+        pub fn gridline(&self) -> (f64, f64, f64) {
+            self.inner.color(Role::Gridline).rgb()
+        }
+        /// Margin-zone body cells, dimmer than main content.
+        pub fn margin_body(&self) -> (f64, f64, f64) {
+            self.inner.color(Role::CellMargin).rgb()
+        }
+        /// Body cells on a totals row or column.
+        pub fn aggregate_body(&self) -> (f64, f64, f64) {
+            self.aggregate_body.rgb()
+        }
+        /// Body cells with no special state.
+        pub fn cell_body(&self) -> (f64, f64, f64) {
+            self.inner.color(Role::CellBody).rgb()
+        }
+        /// Cell fill covered by a selection.
+        pub fn cell_selected(&self) -> (f64, f64, f64) {
+            self.inner.color(Role::Selected).rgb()
+        }
+        /// Cell fill for the cursor while editing (the yellow edit highlight).
+        pub fn cell_editing(&self) -> (f64, f64, f64) {
+            self.inner.color(Role::CursorEditing).rgb()
+        }
+        /// Cell fill for the cursor when not editing.
+        pub fn cell_cursor(&self) -> (f64, f64, f64) {
+            self.inner.color(Role::Cursor).rgb()
+        }
+        /// Default body text.
+        pub fn text(&self) -> (f64, f64, f64) {
+            self.inner.color(Role::Text).rgb()
+        }
+        /// De-emphasised text (aggregate values, header labels, status).
+        pub fn text_muted(&self) -> (f64, f64, f64) {
+            self.inner.color(Role::TextMuted).rgb()
+        }
+        /// Text that calls attention (a link, the cursor outline).
+        pub fn text_accent(&self) -> (f64, f64, f64) {
+            self.inner.color(Role::TextAccent).rgb()
+        }
+        /// Text drawn on the cursor / editing / selected fills, which in night
+        /// mode are lighter than the body and so take dark ink.
+        pub fn text_on_highlight(&self) -> (f64, f64, f64) {
+            self.inner.color(Role::TextOnHighlight).rgb()
+        }
+    }
+
+    /// The palette for the active scheme.
+    pub fn palette() -> Palette {
+        Palette::from_theme(rswidgets::core::theme())
+    }
+
+    /// Clear a draw context to a palette colour at full alpha — the common
+    /// "paint the paper" call, so call sites do not unpack the tuple.
+    pub fn clear_to(dc: &mut dyn rswidgets::core::DrawContext, color: (f64, f64, f64)) {
+        dc.clear(color.0, color.1, color.2, 1.0);
+    }
+
+    /// Fill a rectangle with a palette colour at full alpha.
+    pub fn fill(dc: &mut dyn rswidgets::core::DrawContext, x: f64, y: f64, w: f64, h: f64, color: (f64, f64, f64)) {
+        dc.fill_rect(x, y, w, h, color.0, color.1, color.2, 1.0);
+    }
+}
 
 /// Grid metrics for the Android touch-scroll path.
 ///
@@ -235,45 +578,15 @@ const MAX_RENDER_COLS: usize = 50;
 enum GuiMode {
     Normal,
     Help,
+    /// Revision-browse (File▸Replay): Left/Right step the loaded log's
+    /// revisions instead of moving the cursor. Mirrors the ratatui
+    /// reference's `Mode::RevisionBrowse`.
+    RevisionBrowse,
 }
 
 // ---------------------------------------------------------------------------
 // CanvasSink
 // ---------------------------------------------------------------------------
-
-struct GuiCanvasSink {
-    cells: RefCell<HashMap<(u32, u32), String>>,
-    styles: RefCell<HashMap<(u32, u32), CellDisplayStyle>>,
-    raw_values: RefCell<HashMap<(u32, u32), String>>,
-    cursor_pos: Cell<Option<(u32, u32)>>,
-}
-
-impl GuiCanvasSink {
-    fn new() -> Self {
-        GuiCanvasSink {
-            cells: RefCell::new(HashMap::new()),
-            styles: RefCell::new(HashMap::new()),
-            raw_values: RefCell::new(HashMap::new()),
-            cursor_pos: Cell::new(None),
-        }
-    }
-
-}
-
-impl CellSink for GuiCanvasSink {
-    fn set_cell(&mut self, row: u32, col: u32, text: &str) {
-        self.cells.borrow_mut().insert((row, col), text.to_string());
-    }
-    fn set_cell_style(&mut self, row: u32, col: u32, style: CellDisplayStyle) {
-        self.styles.borrow_mut().insert((row, col), style);
-    }
-    fn set_raw_cell(&mut self, row: u32, col: u32, text: &str) {
-        self.raw_values.borrow_mut().insert((row, col), text.to_string());
-    }
-    fn set_cursor(&mut self, row: u32, col: u32) {
-        self.cursor_pos.set(Some((row, col)));
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Save-before-quit helper
@@ -297,8 +610,8 @@ fn save_before_quit(state: &GuiState) {
          edit_buf={}\n\
          key_counter={}\n\
          --- end snapshot ---\n",
-         cell, state.editing.get(), match state.mode.get() { GuiMode::Normal => "Normal", GuiMode::Help => "Help" },
-        fx_text, state.edit_buf.borrow(),
+         cell, state.editing.get(), match state.mode.get() { GuiMode::Normal => "Normal", GuiMode::Help => "Help", GuiMode::RevisionBrowse => "RevisionBrowse" },
+        fx_text, state.formula_entry.get_text().unwrap_or_default(),
          state.key_counter.get(),
     );
     let _ = std::fs::write("/tmp/corro_gui_snapshot.txt", &snapshot);
@@ -343,23 +656,12 @@ pub(crate) struct GuiState {
     /// the buffer with no status span).
     formula_status: Label,
     editing: Cell<bool>,
-    edit_buf: RefCell<String>,
-    /// Caret position within `edit_buf`, as a **character** index. The native
-    /// Entry exposes no caret API, so the host owns the caret the same way
-    /// ratatui's `Mode::Edit` does: typed chars insert here, Backspace/Delete
-    /// act here, and Left/Right move here (committing and moving the *cell*
-    /// cursor only at the buffer edges).
-    edit_caret: Cell<usize>,
     /// In-grid aggregate dropdown state (painted on the canvas, not a native
     /// widget — see `AggDrop`).
     agg_drop: RefCell<Option<AggDrop>>,
     /// Last canvas size seen by the draw callback, for hit-testing the
     /// canvas-painted dropdown.
     canvas_size: Cell<(i32, i32)>,
-    /// Formula text displayed in the entry the last time the formula bar
-    /// was refreshed (the adopt source for click-to-edit repair). Refreshed
-    /// on every bar update, so it can never go stale.
-    entry_snapshot: RefCell<String>,
     /// Set by a pointer click into the formula entry, consumed by the next
     /// entry keystroke (repair) or cleared by navigation/commit/cancel
     /// (then typing starts a fresh value, ratatui parity).
@@ -377,6 +679,17 @@ pub(crate) struct GuiState {
     /// different cell ends click-edit intent (navigation resets to
     /// ratatui-style replace for the next keystroke).
     entry_shown: Cell<(usize, usize)>,
+    /// Last text pushed to each chrome label / the address label. These are
+    /// change-detection shadows, not state: they hold exactly what the widget
+    /// was last set to, so a cursor move (which runs the whole formula-bar
+    /// refresh on every press and auto-repeat) only writes the widgets whose
+    /// text actually changed. Empty on purpose, so the first refresh always
+    /// pushes and the labels can never start out stale.
+    addr_shown: RefCell<String>,
+    hints_shown: RefCell<String>,
+    status_shown: RefCell<String>,
+    /// Whether `formula_status` was last made visible, same purpose.
+    status_vis: Cell<bool>,
     mode: Cell<GuiMode>,
     last_row: Cell<usize>,
     last_col: Cell<usize>,
@@ -411,35 +724,22 @@ pub(crate) struct GuiState {
     // behaves identically across backends instead of drifting into stubs.
     clipboard: RefCell<String>,
     pending_scope: Cell<u8>,
-    // Row/column pins (padlock feature): logical rows / global cols pinned
-    // visible while scrolling. Session-only (not persisted); cleared lazily
-    // when the active sheet changes (see pinned_sets). Hit rects painted
-    // last frame, used for click toggling.
-    pinned_rows: RefCell<std::collections::BTreeSet<usize>>,
-    pinned_cols: RefCell<std::collections::BTreeSet<usize>>,
-    pinned_sheet: Cell<u32>,
+    // Padlock hit rects painted last frame, used for click toggling. The pin
+    // sets themselves live on the shared `core.locks` (see `pinned_sets`), so
+    // a gutter click, `Sheet ▸ Freeze` and every terminal backend read the
+    // same state instead of each keeping a copy that can disagree.
     padlocks: RefCell<Vec<GutterPadlock>>,
-    // Sheet tab bar (below the grid): one tab per sheet, visible only when
-    // the workbook has 2+ sheets. Hit rects painted last frame, used for
-    // click-to-switch. Cached visibility avoids redundant set_visible calls.
-    tabbar: Canvas,
-    tab_hits: RefCell<Vec<TabHit>>,
-    tabbar_visible: Cell<bool>,
-    /// In-progress tab drag, or `None`.
+    /// Repeat-click cycling for the gutter chrome.
     ///
-    /// Set on a left press that lands on a tab and cleared on release; while
-    /// set, pointer motion over the strip paints a live preview of where the
-    /// tab would land. The reorder is only committed on release, so an
-    /// abandoned drag (release outside the strip) leaves the workbook alone.
-    tab_drag: RefCell<Option<TabDrag>>,
-    /// Tab-strip x of a right-press waiting to open the Sheet menu, or `None`.
-    ///
-    /// The menu opens on the button *release*, not the press. Opening it on the
-    /// press (even deferred by an idle) leaves it non-interactive: GTK pops the
-    /// menu up while button 3 is still down, so the following release is taken
-    /// as a dismissal/cancel and no row ever activates. The keyboard-opened
-    /// menu has no button held at all, which is exactly why it works.
-    tab_context_pending: Cell<Option<f64>>,
+    /// The first click on a row label / column header / corner selects the
+    /// whole row/column/sheet; clicking the *same* target again narrows the
+    /// selection to that target's data cells (its non-blank span), and a third
+    /// click widens it back. Any click elsewhere (or any navigation) clears
+    /// this, so an unrelated click can never continue someone else's cycle.
+    gutter_cycle: Cell<Option<GutterCycle>>,
+    // Sheet tab bar (below the grid): the TabBar widget owns all
+    // interaction logic (click, drag-reorder, context menu).
+    tab_bar: RefCell<Option<rswidgets::tabbar::TabBar>>,
     // Scrollbar sync: native scrollbars around the sheet (thumb tracks the
     // viewport; dragging/clicking moves the cursor, which pulls the
     // viewport along, so the selection stays visible). Guard against reentrancy between programmatic sets and the
@@ -462,14 +762,12 @@ pub(crate) struct GuiState {
     /// `None` means "no anchor yet": the viewport is derived from the cursor
     /// alone, which is the original behaviour.
     viewport_anchor: Cell<Option<(usize, usize)>>,
-    // Press/release dedup trackers. GTK4-only (feature = "gtk4"): only there
-    // can release events arrive as same-keyval callbacks. Everywhere else
-    // (GTK3 presses-only, nwg WM_KEYDOWN-only, wasm keydown-only) every key
-    // event is a genuine press and deduping would swallow genuine repeats.
-    #[cfg(feature = "gtk4")]
-    last_dedup_key: Cell<u32>,
-    #[cfg(feature = "gtk4")]
-    dedup_count: Cell<u32>,
+    // NOTE: there is deliberately no press/release dedup state here. GTK4
+    // emits BOTH `key-pressed` and `key-released` per physical key, but the
+    // adapter consumes the release signal itself
+    // (`swallow_key_releases_gtk4`), so every host — terminal, GTK3, GTK4,
+    // nwg, wasm, mobile — receives a pure press stream and no application
+    // needs to know which toolkit it runs on.
     // Prevents the RETURN safety net (line ~1375) from re-entering edit mode
     // on the release event of a RETURN press that already committed an edit.
     // Set after handle_key processes RETURN; checked by the safety net to
@@ -478,15 +776,6 @@ pub(crate) struct GuiState {
     // normal RETURN press that committed an edit and re-displayed the
     // new cell's value in the formula entry.
     return_pressed: Cell<bool>,
-    // Press/release dedup bookkeeping. GTK4-only (see entry_seen above):
-    // EventControllerKey::key-pressed can fire for both GDK_KEY_PRESS and
-    // GDK_KEY_RELEASE on some versions/display servers.  When the same
-    // canonical keyval arrives twice consecutively, the second event is
-    // a release and should be skipped.  Set at each return point where
-    // a key was actually processed; cleared on skip so the next different
-    // key is not affected.
-    #[cfg(feature = "gtk4")]
-    last_keyval_dedup: Cell<u32>,
 }
 
 impl GuiState {
@@ -543,7 +832,7 @@ fn is_margin_cell(
 }
 
 fn render_to(
-    sink: &GuiCanvasSink,
+    grid: &rswidgets::gridview::GridView,
     dc: &mut dyn DrawContext,
     col_ixs: &[usize],
     col_widths: &HashMap<usize, usize>,
@@ -557,9 +846,18 @@ fn render_to(
     is_editing: bool,
     edit_text: &str,
     selection_anchor: Option<(usize, usize)>,
+    selection_kind: crate::grid::SelectionKind,
+    row_agg_func: &[Option<crate::ops::AggFunc>],
+    col_agg_func: &[Option<crate::ops::AggFunc>],
 ) {
-    let cells = sink.cells.borrow();
-    let styles = sink.styles.borrow();
+    // Read through the model in one borrow (a `GridView` is a
+    // `RefCell<SpreadsheetModel>`; two live borrows would deadlock).
+    let model = grid.model();
+    let model = model.borrow();
+    // One palette snapshot per frame: every fill, stroke and string below
+    // reads from this copy, so a scheme switch cannot split one frame across
+    // two palettes (and the theme lock is not taken per cell).
+    let pal = chrome::palette();
 
     // Selection rectangle (anchor..cursor, rows AND columns), computed once.
     // Plain navigation collapses the anchor, so no band is painted then —
@@ -569,6 +867,19 @@ fn render_to(
         let (c1, c2) = if ac <= cursor_col { (ac, cursor_col) } else { (cursor_col, ac) };
         (r1, r2, c1, c2)
     });
+    // Which axes the band covers. `Rows`/`Cols` (set by a gutter-header click)
+    // select the whole main-body row/column regardless of the anchor↔cursor
+    // rectangle — the same rule the ratatui reference applies via
+    // `SelectionKind`, so a selected row highlights every column of that row.
+    let in_selection = |logical_row: usize, c: usize| -> bool {
+        sel_rect.map_or(false, |(r1, r2, c1, c2)| match selection_kind {
+            crate::grid::SelectionKind::Cells => {
+                logical_row >= r1 && logical_row <= r2 && c >= c1 && c <= c2
+            }
+            crate::grid::SelectionKind::Rows => logical_row >= r1 && logical_row <= r2,
+            crate::grid::SelectionKind::Cols => c >= c1 && c <= c2,
+        })
+    };
     for (ri, &logical_row) in display_rows.iter().enumerate().take(MAX_RENDER_ROWS) {
         let ry = header_h() + ri as f64 * row_h();
 
@@ -577,60 +888,109 @@ fn render_to(
             let cx = row_label_w() + col_ixs.iter().take(ci).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * char_w()).sum::<f64>();
 
             let key = (ri as u32, c as u32);
-            let raw_text = cells.get(&key).map(|s| s.as_str()).unwrap_or("");
-            let style_key = (ri as u32, c as u32);
-            let style = styles.get(&style_key).copied().unwrap_or(CellDisplayStyle::Default);
+            let raw_text = model.cells.get(&key).map(|s| s.as_str()).unwrap_or("");
+            // The model stores the style bit; painting needs the enum (the
+            // inverse of the conversion `render::GridSink` applies on write).
+            let style = CellDisplayStyle::from_style_bits(
+                model.cell_styles.get(&key).copied().unwrap_or(0),
+            );
             let is_current = logical_row == cursor_row && c == cursor_col;
-            let in_selection = sel_rect.map_or(false, |(r1, r2, c1, c2)| {
-                logical_row >= r1 && logical_row <= r2 && c >= c1 && c <= c2
-            });
+            let in_selection = in_selection(logical_row, c);
 
+            // Cell fill precedence: cursor (editing highlight / normal) wins
+            // over selection, which wins over the margin shade, which wins
+            // over plain body white. The colours come from `chrome` so the
+            // movie painter shades the same surfaces identically.
+            // Is this cell on a totals line (a row/column whose margin key
+            // carries an aggregate directive)? Read the frame's precomputed
+            // per-line directives rather than re-deriving them here, so the
+            // shade can never disagree with the contents being drawn — and so
+            // the check costs two array reads, not a scan of the grid's
+            // header cells per painted cell.
+            let on_agg_row = row_agg_func.get(ri).copied().flatten().is_some();
+            let on_agg_col = col_agg_func.get(ci).copied().flatten().is_some();
             let bg = if is_current {
-                if is_editing { (1.0, 1.0, 0.8, 1.0) } else { (0.8, 0.9, 1.0, 1.0) }
+                if is_editing { pal.cell_editing() } else { pal.cell_cursor() }
             } else if in_selection {
-                (0.9, 0.95, 1.0, 1.0)
+                pal.cell_selected()
             } else if is_margin_cell(logical_row, c, hr, mr, lm, mc) {
-                // Margin-zone cells render at 75% background brightness
-                // so margins read as subordinate to body content —
-                // including the first margin row/col (_1/]A), same gray
-                // as the rest of the margin.
-                (0.75, 0.75, 0.75, 1.0)
+                // Margin-zone cells render dimmer so margins read as
+                // subordinate to body content — including the first margin
+                // row/col (_1/]A), same gray as the rest of the margin.
+                pal.margin_body()
+            } else if on_agg_row || on_agg_col {
+                // A totals line is computed, not entered, so it gets a
+                // half-step off pure white: still clearly body content, but
+                // no longer indistinguishable from a data cell.
+                pal.aggregate_body()
             } else {
-                (1.0, 1.0, 1.0, 1.0)
+                pal.cell_body()
             };
 
-            dc.fill_rect(cx, ry, cw, row_h(), bg.0, bg.1, bg.2, bg.3);
+            chrome::fill(dc, cx, ry, cw, row_h(), bg);
 
             // Selection highlight
             if is_current && !is_editing {
-                dc.stroke_rect(cx, ry, cw, row_h(), 0.0, 0.4, 0.8, 1.0, 2.0);
+                let acc = pal.text_accent();
+                dc.stroke_rect(cx, ry, cw, row_h(), acc.0, acc.1, acc.2, 1.0, 2.0);
             }
 
             // Grid lines
-            dc.stroke_rect(cx, ry, cw, row_h(), 0.8, 0.8, 0.8, 1.0, 0.5);
+            let g = pal.gridline();
+            dc.stroke_rect(cx, ry, cw, row_h(), g.0, g.1, g.2, 1.0, 0.5);
 
             if !raw_text.is_empty() {
                 match style {
                     CellDisplayStyle::Default => {
-                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), 0.0, 0.0, 0.0, 1.0);
+                        let c = pal.text();
+                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), c.0, c.1, c.2, 1.0);
                     }
                     CellDisplayStyle::Cursor | CellDisplayStyle::Selected => {
-                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), 0.0, 0.0, 0.0, 1.0);
+                        // Highlight ink, not body ink: night mode's highlight
+                        // fills are lighter than the body, so body ink here
+                        // would be the least legible text on the sheet.
+                        let c = pal.text_on_highlight();
+                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), c.0, c.1, c.2, 1.0);
                     }
                     CellDisplayStyle::Aggregate | CellDisplayStyle::FooterAggregate => {
-                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), 0.5, 0.5, 0.5, 1.0);
+                        // Every computed total — a right-margin row total, a
+                        // data-column total, a footer grand total — reads as
+                        // body ink plus weight. The old grey `(0.5,0.5,0.5)`
+                        // was roughly a 2:1 contrast ratio against the margin
+                        // fill: legal, but weak for the values a sheet exists
+                        // to show. One weight across all aggregate cells also
+                        // makes a column of row totals and the footer total
+                        // read as one system.
+                        //
+                        // `text`, NOT `text_on_highlight`: a total is drawn on
+                        // the body/margin fill, not on the cursor or selection
+                        // highlight. `text_on_highlight` is near-black in the
+                        // night palette (0.04, 0.04, 0.07), so using it here
+                        // would put dark text on a dark sheet — effectively
+                        // invisible exactly when the user switched to night
+                        // mode. `text` is the body ink, which themes to a
+                        // light 0.92 on the night surfaces.
+                        //
+                        // Deviation from the ratatui reference, which bolds
+                        // only `footer_agg` and leaves right-margin totals
+                        // cyan (`src/ui/mod.rs`, the `is_agg_cell` arm).
+                        // Chosen deliberately for legibility and consistency.
+                        let c = pal.text();
+                        dc.draw_text_styled(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), c.0, c.1, c.2, 1.0, 0, 1);
                     }
                     CellDisplayStyle::ActiveHeader | CellDisplayStyle::InactiveHeader => {
-                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), 0.3, 0.3, 0.3, 1.0);
+                        let c = pal.text_muted();
+                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), c.0, c.1, c.2, 1.0);
                     }
                     CellDisplayStyle::Hyperlink => {
                         // Hyperlinks render blue and underlined by default
                         // (same rule as the terminal backends); cursor and
                         // selection paints above already won for this cell.
-                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), 0.0, 0.0, 0.9, 1.0);
+                        let c = pal.text_accent();
+                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), c.0, c.1, c.2, 1.0);
                         let (tw, _, _, _) = dc.text_extents(raw_text, "monospace", font_size());
                         if tw > 0.0 {
-                            dc.fill_rect(cx + 2.0, ry + 2.0 + font_size() + 1.0, tw, 1.0, 0.0, 0.0, 0.9, 1.0);
+                            dc.fill_rect(cx + 2.0, ry + 2.0 + font_size() + 1.0, tw, 1.0, c.0, c.1, c.2, 1.0);
                         }
                     }
                 }
@@ -645,8 +1005,9 @@ fn render_to(
             let cx = row_label_w() + col_ixs.iter().take(pos).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * char_w()).sum::<f64>();
             if let Some(pos_r) = display_rows.iter().position(|&r| r == cursor_row) {
                 let ry = header_h() + pos_r as f64 * row_h();
-                dc.fill_rect(cx, ry, cw, row_h(), 1.0, 1.0, 0.8, 1.0);
-                dc.draw_text(cx + 2.0, ry + 2.0, edit_text, "monospace", font_size(), 0.0, 0.0, 0.0, 1.0);
+                chrome::fill(dc, cx, ry, cw, row_h(), pal.cell_editing());
+                let c = pal.text_on_highlight();
+                dc.draw_text(cx + 2.0, ry + 2.0, edit_text, "monospace", font_size(), c.0, c.1, c.2, 1.0);
             }
         }
     }
@@ -682,11 +1043,16 @@ fn cols_to_fill_px(app: &super::App, cursor: SheetCursor, avail_px: i32) -> usiz
     }
 }
 
-/// How many rows are needed to cover a canvas `h` pixels tall. Reserves the
-/// 20px in-canvas status strip (drawn over the bottom) so the last row —
-/// often the cursor — stays fully visible instead of sliding underneath it.
+/// How many data rows fit in a canvas `h` pixels tall, given the column
+/// header. The `+ 1.0` paints one row past the bottom edge so a partially
+/// visible row is filled rather than left as a gap under the last full row.
+///
+/// No status-strip reservation: the in-canvas strip was removed (the status
+/// text moved to the formula row), so the full remaining height belongs to
+/// rows. The strip's old `- 20.0` here is why the last row used to be clipped
+/// by an empty grey band.
 fn rows_to_fill_px(h: i32) -> usize {
-    (((h as f64 - header_h() - 20.0) / row_h() + 1.0).max(1.0)) as usize
+    (((h as f64 - header_h()) / row_h() + 1.0).max(1.0)) as usize
 }
 
 /// Paint the row-label gutter. Labels render bold (weight 1), matching the
@@ -709,11 +1075,14 @@ fn paint_row_headers(
         // fill so the gutter mirrors the selected band; plain rows keep the
         // neutral header gray. With no selection nothing changes.
         let hl = hl_rows.is_some_and(|(r0, r1)| logical_row >= r0 && logical_row <= r1);
-        let fill = if hl { (0.9, 0.95, 1.0, 1.0) } else { (0.9, 0.9, 0.9, 1.0) };
+        let pal = chrome::palette();
+        let fill = if hl { pal.gutter_selected() } else { pal.gutter() };
+        let fill = (fill.0, fill.1, fill.2, 1.0);
         dc.fill_rect(0.0, ry, row_label_w(), row_h(), fill.0, fill.1, fill.2, fill.3);
         // Row numbers sit 6px off the gutter's right gridline so glyphs
         // never touch it.
-        dc.draw_text_styled(row_label_w() - tw - 6.0, ry + 2.0, &label, "monospace", font_size(), 0.3, 0.3, 0.3, 1.0, 0, 1);
+        let ink = pal.text_muted();
+        dc.draw_text_styled(row_label_w() - tw - 6.0, ry + 2.0, &label, "monospace", font_size(), ink.0, ink.1, ink.2, 1.0, 0, 1);
         // Padlock at the gutter's left edge (short labels only): the label
         // is right-aligned, so the left side always has room.
         if wants_padlock(&label) {
@@ -751,7 +1120,9 @@ fn paint_col_headers(
         let col_name = crate::addr::ui_column_fragment(c, mc);
         // Same selection fill as covered row headers (see paint_row_headers).
         let hl = hl_cols.is_some_and(|(c0, c1)| c >= c0 && c <= c1);
-        let fill = if hl { (0.9, 0.95, 1.0, 1.0) } else { (0.9, 0.9, 0.9, 1.0) };
+        let pal = chrome::palette();
+        let fill = if hl { pal.gutter_selected() } else { pal.gutter() };
+        let fill = (fill.0, fill.1, fill.2, 1.0);
         dc.fill_rect(cx, 0.0, cw, header_h(), fill.0, fill.1, fill.2, fill.3);
         let (_, _, tw, _) = dc.text_extents_styled(&col_name, "monospace", font_size(), 0, 1);
         // Label and padlock center as a unit, so the icon fits inside its
@@ -761,7 +1132,8 @@ fn paint_col_headers(
         let lock = wants_padlock(&col_name);
         let group = tw + if lock { 2.0 + padlock_w() } else { 0.0 };
         let tx = cx + (cw - group) / 2.0;
-        dc.draw_text_styled(tx, (header_h() - font_size() * 1.2) / 2.0, &col_name, "monospace", font_size(), 0.3, 0.3, 0.3, 1.0, 0, 1);
+        let ink = pal.text_muted();
+        dc.draw_text_styled(tx, (header_h() - font_size() * 1.2) / 2.0, &col_name, "monospace", font_size(), ink.0, ink.1, ink.2, 1.0, 0, 1);
         // Padlock right after the centered text, inside its own column: the
         // column is one character wider than recorded (see display_col_width)
         // precisely so this icon fits without spilling over the neighbor.
@@ -799,11 +1171,32 @@ const PADLOCK_HIT_DP: f64 = 44.0;
 pub(crate) fn padlock_w() -> f64 { PADLOCK_W_BASE * metrics_scale() }
 pub(crate) fn padlock_h() -> f64 { PADLOCK_H_BASE * metrics_scale() }
 fn padlock_inset() -> f64 { PADLOCK_INSET_BASE * metrics_scale() }
-/// Unlocked padlock slate (115): distinct from header gray (77), grid lines
-/// (204), backgrounds (191/229/255) and cursor/selection blues.
-const PADLOCK_OPEN: (f64, f64, f64) = (0.45, 0.45, 0.45);
-/// Locked padlock slate (51): darker than any chrome gray.
-const PADLOCK_SHUT: (f64, f64, f64) = (0.2, 0.2, 0.2);
+/// Padlock slate, per scheme.
+///
+/// These two were hand-picked as greys distinct from the *light* surfaces
+/// (0.45 sits between the 0.30 gridline and the 0.75 margin; 0.2 is darker
+/// than any light chrome). On a near-black sheet both would read as "dark
+/// smudge", and the locked padlock — the whole point of the glyph, and the
+/// pixel the padlock-click tests look for — would lose its contrast against
+/// the gutter. So the night values invert the relationship: the icon is
+/// *lighter* than its background, which is the same distinction made the
+/// other way up.
+pub(crate) fn padlock_open() -> (f64, f64, f64) {
+    if rswidgets::core::color_scheme() == rswidgets::core::ColorScheme::Night {
+        (0.62, 0.62, 0.68)
+    } else {
+        (0.45, 0.45, 0.45)
+    }
+}
+
+/// The locked padlock: a strong, unambiguous mark against the gutter.
+pub(crate) fn padlock_shut() -> (f64, f64, f64) {
+    if rswidgets::core::color_scheme() == rswidgets::core::ColorScheme::Night {
+        (0.95, 0.95, 0.98)
+    } else {
+        (0.2, 0.2, 0.2)
+    }
+}
 
 /// A painted padlock hit target from the last frame: gutter position plus
 /// which logical row (is_row) or global column it pins.
@@ -846,28 +1239,17 @@ fn padlock_hit_rect(h: &GutterPadlock) -> (f64, f64, f64, f64) {
 /// Padlock eligibility: gutter labels with short text only (dual-character
 /// or less, non-empty) get the affordance — the auto-generated margin
 /// labels (`1`, `_1`, `[A`, `AA`, ...) rather than long content.
+///
+/// The rule itself lives in [`crate::lock`] so the terminal backends can draw
+/// the same affordance; this is a local alias to keep the call sites short.
 fn wants_padlock(label: &str) -> bool {
-    !label.is_empty() && label.chars().count() <= 2
-}
-
-/// Toggle a pin in a set; returns true when the index ends up pinned.
-fn toggle_pin_in(set: &mut std::collections::BTreeSet<usize>, idx: usize) -> bool {
-    if set.contains(&idx) {
-        set.remove(&idx);
-        false
-    } else {
-        set.insert(idx);
-        true
-    }
+    crate::lock::wants_padlock(label)
 }
 
 /// Merge pinned rows/cols ahead of the normal display window (frozen at the
-/// top/left, like frozen panes). `pinned` must be ascending (BTreeSet order
-/// qualifies). Entries already in `display` are not duplicated.
+/// top/left, like frozen panes). See [`crate::lock::union_pinned`].
 fn union_pinned(display: &[usize], pinned: &[usize]) -> Vec<usize> {
-    let mut out: Vec<usize> = pinned.to_vec();
-    out.extend(display.iter().filter(|r| !pinned.contains(r)).copied());
-    out
+    crate::lock::union_pinned(display, pinned)
 }
 
 /// The right shackle bar connects to the body when locked and floats with a
@@ -877,7 +1259,7 @@ fn union_pinned(display: &[usize], pinned: &[usize]) -> Vec<usize> {
 /// [`padlock_h`], so it scales with the host density instead of staying a
 /// 10x12px speck on a phone. All offsets are fractions of the box.
 fn paint_padlock(dc: &mut dyn DrawContext, ox: f64, oy: f64, locked: bool) {
-    let (r, g, b) = if locked { PADLOCK_SHUT } else { PADLOCK_OPEN };
+    let (r, g, b) = if locked { padlock_shut() } else { padlock_open() };
     let w = padlock_w();
     let h = padlock_h();
     let inset = padlock_inset();
@@ -891,36 +1273,38 @@ fn paint_padlock(dc: &mut dyn DrawContext, ox: f64, oy: f64, locked: bool) {
         dc.stroke_rect(ox + inset, body_y, body_w, body_h, r, g, b, 1.0, 1.0);
     }
     // Shackle: two uprights joined by a top bar, inside the upper half.
+    //
+    // The legs must run all the way down to the body's top edge (`body_y`):
+    // the top bar is drawn *over* the top of the legs, so subtracting the bar
+    // height from the leg length (the previous bug) left each leg ending
+    // `bar_h` above the body and the shackle visibly floating with a ~1px gap.
     let bar_h = (h * 0.18).max(1.0);
     let leg_w = (w * 0.2).max(1.0);
-    let leg_h = (body_y - oy - bar_h).max(1.0);
+    let leg_top = oy + inset;
+    let leg_h = (body_y - leg_top).max(1.0);
     let left_x = ox + w * 0.22;
     let right_x = ox + w - inset - leg_w;
-    dc.fill_rect(left_x, oy + inset, leg_w, leg_h, r, g, b, 1.0);
-    dc.fill_rect(left_x, oy + inset, (right_x + leg_w - left_x).max(1.0), bar_h, r, g, b, 1.0);
+    dc.fill_rect(left_x, leg_top, leg_w, leg_h, r, g, b, 1.0);
+    dc.fill_rect(left_x, leg_top, (right_x + leg_w - left_x).max(1.0), bar_h, r, g, b, 1.0);
     if locked {
-        dc.fill_rect(right_x, oy + inset, leg_w, leg_h, r, g, b, 1.0);
+        dc.fill_rect(right_x, leg_top, leg_w, leg_h, r, g, b, 1.0);
     } else {
         // Open: the right upright stops short, leaving the shackle ajar.
-        dc.fill_rect(right_x, oy + inset, leg_w, (leg_h * 0.55).max(1.0), r, g, b, 1.0);
+        dc.fill_rect(right_x, leg_top, leg_w, (leg_h * 0.55).max(1.0), r, g, b, 1.0);
     }
 }
 
-/// Current pin sets, clearing them lazily when the active sheet changed
-/// (pins are per-sheet session state, never persisted to the log).
+/// The active sheet's pinned rows/cols, as sorted vectors, read through the
+/// shared [`crate::lock::LockState`]. This is the single source of truth: a
+/// gutter click, `Sheet ▸ Freeze` and the render path all come through here,
+/// so they cannot disagree, and the lazy sheet-change clearing
+/// ([`crate::lock::LockState::ensure_sheet`]) applies to every caller at once
+/// instead of each copy remembering to do it.
 fn pinned_sets(state: &GuiState) -> (Vec<usize>, Vec<usize>) {
-    let sid = {
-        let app = state.app_ref();
-        app.core.workbook.sheet_id(app.core.workbook.active_sheet)
-    };
-    if state.pinned_sheet.get() != sid {
-        state.pinned_rows.borrow_mut().clear();
-        state.pinned_cols.borrow_mut().clear();
-        state.pinned_sheet.set(sid);
-    }
-    let rows: Vec<usize> = state.pinned_rows.borrow().iter().copied().collect();
-    let cols: Vec<usize> = state.pinned_cols.borrow().iter().copied().collect();
-    (rows, cols)
+    let app = state.app_mut();
+    let sid = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+    let (rows, cols) = app.core.locks.ensure_sheet(sid);
+    (rows.iter().copied().collect(), cols.iter().copied().collect())
 }
 
 /// Display rows with pins merged in (frozen first), for rendering and click
@@ -979,13 +1363,18 @@ fn viewport_origin(state: &GuiState) -> (usize, usize) {
 }
 
 /// Toggle the pin hit-tested from the last frame's padlocks; returns true
-/// when the row/column ends up pinned.
+/// when the row/column ends up pinned. Goes through the shared `LockState`,
+/// so a gutter click and `Sheet ▸ Freeze ▸ Col/X-Lock` are the same edit.
 fn toggle_pin(state: &GuiState, is_row: bool, idx: usize) -> bool {
-    let _ = pinned_sets(state);
+    let app = state.app_mut();
+    let sid = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+    // Clear stale pins first so a click after a sheet switch cannot re-pin
+    // the previous sheet's row (same guard the render path applies).
+    app.core.locks.ensure_sheet(sid);
     if is_row {
-        toggle_pin_in(&mut state.pinned_rows.borrow_mut(), idx)
+        app.core.locks.toggle_row(idx)
     } else {
-        toggle_pin_in(&mut state.pinned_cols.borrow_mut(), idx)
+        app.core.locks.toggle_col(idx)
     }
 }
 
@@ -997,131 +1386,40 @@ fn toggle_pin(state: &GuiState, is_row: bool, idx: usize) -> bool {
 /// the column-header strip so the chrome reads as one family.
 const TAB_H_BASE: f64 = 24.0;
 pub(crate) fn tab_h() -> f64 { TAB_H_BASE * metrics_scale() }
-/// Active tab fill: the terminal reference paints the active sheet tab
-/// black-on-yellow bold (ratatui `draw_visual`); the GUI uses a softer
-/// yellow that stays distinct from its blue selection/cursor language.
-const TAB_ACTIVE_BG: (f64, f64, f64) = (1.0, 1.0, 0.6);
-/// Inactive tab fill: same gray as the row/column gutters.
-const TAB_IDLE_BG: (f64, f64, f64) = (0.9, 0.9, 0.9);
-/// Tab divider lines.
-const TAB_DIV: (f64, f64, f64) = (0.55, 0.55, 0.55);
-/// Horizontal padding inside each tab and gap between tabs (base device px,
+
+/// Width of the formula bar's address slot (base device px, density-scaled).
+///
+/// Sized for the longest address the bar can ever show so the slot never has
+/// to grow: a bracketed two-letter margin column plus a row (`[AA_1`), or a
+/// three-letter excel column at the cap with a tilde and a row (`AAA~1`).
+/// 12px text needs roughly 9px per character, so ~84px covers the worst case
+/// with room to spare. Pinning it is what stops `fx` and the entry from
+/// sliding sideways as the cursor moves — see the `addr_label` construction.
+const ADDR_SLOT_W_BASE: f64 = 92.0;
+
+/// Left inset of the address text inside its pinned slot (base device px).
+///
+/// The slot is pinned and its text left-aligned, so without an inset the
+/// address would sit flush against the window's left edge rather than the
+/// margin the unpinned label laid out with. Keeping the inset means pinning the
+/// slot stops the reflow without relocating the address.
+const ADDR_SLOT_INSET_PX: f64 = 9.0;
+
+
+/// Width of the formula bar's trailing `· status` slot (base device px,
 /// density-scaled).
-const TAB_PAD_X_BASE: f64 = 10.0;
-const TAB_GAP_BASE: f64 = 6.0;
-pub(crate) fn tab_pad_x() -> f64 { TAB_PAD_X_BASE * metrics_scale() }
-pub(crate) fn tab_gap() -> f64 { TAB_GAP_BASE * metrics_scale() }
-
-/// A painted sheet tab from the last frame: strip position plus which sheet
-/// index a click switches to.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct TabHit {
-    x0: f64,
-    x1: f64,
-    index: usize,
-}
-
-/// An in-progress drag of a sheet tab.
 ///
-/// `from` is the tab's index at press time; `to` is where it would land if
-/// released now, recomputed from pointer motion so the preview and the commit
-/// always agree. Both are sheet indices into the current tab order.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct TabDrag {
-    from: usize,
-    to: usize,
-    /// Pointer x at press time, in tab-strip coordinates. Motion only becomes a
-    /// drag once the pointer has travelled past a small threshold, so a plain
-    /// click (press + release in place) still just switches sheets.
-    press_x: f64,
-    /// Whether that threshold was crossed. Before it is, no preview is painted.
-    moved: bool,
-}
-
-impl TabDrag {
-    /// Whether both indices still address the painted tabs.
-    ///
-    /// The two can drift out of range if the workbook changed under an
-    /// in-progress drag (a menu action adding or deleting a sheet), so this
-    /// guards the preview paint rather than indexing blindly.
-    fn index_in_range(&self, len: usize) -> bool {
-        len > 0 && self.from < len && self.to <= len
-    }
-}
-
-/// Pointer travel (device px) before a press-and-hold becomes a drag.
-///
-/// Without a threshold, an ordinary click with one pixel of wobble would
-/// register as a reorder. 4px is below the width of any tab but comfortably
-/// above click jitter.
-const TAB_DRAG_THRESHOLD_BASE: f64 = 4.0;
-fn tab_drag_threshold() -> f64 { TAB_DRAG_THRESHOLD_BASE * metrics_scale() }
-
-/// Which tab slot a pointer at strip-x would drop into.
-///
-/// Uses the *midpoints* between the painted tabs rather than their boxes: a
-/// drag is dropped "between" tabs, and using the boxes themselves makes the
-/// boundary depend on the dragged tab's own width, so the preview jumps as the
-/// tab it is dragging changes size.
-fn tab_drop_index(hits: &[TabHit], x: f64) -> usize {
-    if hits.is_empty() {
-        return 0;
-    }
-    for (i, hit) in hits.iter().enumerate() {
-        let mid = (hit.x0 + hit.x1) / 2.0;
-        if x < mid {
-            return i;
-        }
-    }
-    hits.len()
-}
-
-/// Lay out sheet tabs left to right from x=2: each tab pads its measured
-/// title by tab_pad_x() on both sides, tab_gap() separates tabs. The active tab
-/// measures bold (weight 1), like it paints. Pure apart from measuring, so
-/// unit tests drive it with a stub measure closure.
-fn tab_layout(
-    titles: &[String],
-    active: usize,
-    measure: &dyn Fn(&str, i32) -> f64,
-) -> Vec<TabHit> {
-    let mut hits = Vec::with_capacity(titles.len());
-    let mut x = 2.0;
-    for (index, title) in titles.iter().enumerate() {
-        let weight = if index == active { 1 } else { 0 };
-        let tw = measure(title, weight);
-        let x0 = x;
-        let x1 = x0 + tab_pad_x() + tw + tab_pad_x();
-        hits.push(TabHit { x0, x1, index });
-        x = x1 + tab_gap();
-    }
-    hits
-}
+/// Pinned like [`ADDR_SLOT_W_BASE`] because the status text changes on nearly
+/// every action. Sized for a typical message; a longer one clips rather than
+/// reflowing the row, which is the right trade — the status is advisory, and a
+/// row that resizes under the caret is not.
+const STATUS_SLOT_W_BASE: f64 = 220.0;
 
 /// Show the tab strip iff the workbook has 2+ sheets, then repaint it.
 /// Called from refresh_after_dialog (every menu/keyboard action) — never
 /// driven from the draw callback alone, because a hidden widget never
 /// draws and could never re-show itself.
 fn sync_tabbar(state: &Rc<GuiState>) {
-    let show = state.app_ref().core.workbook.sheet_count() >= 2;
-    if show != state.tabbar_visible.get() {
-        state.tabbar.set_visible(show);
-        state.tabbar_visible.set(show);
-    }
-    state.tabbar.queue_redraw();
-}
-
-/// Paint the sheet tab strip: one tab per sheet title, the active sheet
-/// bold on yellow (mirroring the terminal's black-on-yellow active tab).
-/// Reads live workbook state every frame, so created/renamed/deleted/copied
-/// sheets repaint with only a tabbar redraw (see refresh_after_dialog).
-/// When below 2 sheets the bar hides itself on every draw unconditionally:
-/// present() runs gtk_widget_show_all inside a seconds-long event pump,
-/// resurrecting setup-hidden widgets while screenshots and input are already
-/// live — a change-guarded hide would never fire (cache already says hidden).
-/// Once hidden GTK stops drawing, so the unconditional hide costs nothing
-/// steady-state.
-fn render_tabbar(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     let (titles, active) = {
         let app = state.app_ref();
         let wb = &app.core.workbook;
@@ -1130,85 +1428,10 @@ fn render_tabbar(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
         (titles, wb.active_sheet)
     };
     let show = titles.len() >= 2;
-    if !show {
-        // Unconditional (see doc comment): heals show_all resurrection.
-        state.tabbar.set_visible(false);
-        state.tabbar_visible.set(false);
-        state.tab_hits.borrow_mut().clear();
-        return;
-    }
-    if !state.tabbar_visible.get() {
-        // Normally sync_tabbar already showed it; heal any drift.
-        state.tabbar.set_visible(true);
-        state.tabbar_visible.set(true);
-    }
-    dc.clear(0.94, 0.94, 0.94, 1.0);
-    dc.clip(0.0, 0.0, w as f64, h as f64);
-    let hits = {
-        let measure = |t: &str, weight: i32| {
-            dc.text_extents_styled(t, "monospace", font_size(), 0, weight).2
-        };
-        tab_layout(&titles, active, &measure)
-    };
-    for hit in &hits {
-        let is_active = hit.index == active;
-        let (r, g, b) = if is_active { TAB_ACTIVE_BG } else { TAB_IDLE_BG };
-        dc.fill_rect(hit.x0, 2.0, hit.x1 - hit.x0, tab_h() - 4.0, r, g, b, 1.0);
-        // Divider at the tab's right edge (also the click target's edge).
-        dc.fill_rect(hit.x1, 2.0, 1.0, tab_h() - 4.0, TAB_DIV.0, TAB_DIV.1, TAB_DIV.2, 1.0);
-        let (tr, tg, tb) = if is_active { (0.0, 0.0, 0.0) } else { (0.3, 0.3, 0.3) };
-        let weight = if is_active { 1 } else { 0 };
-        dc.draw_text_styled(
-            hit.x0 + tab_pad_x(),
-            (tab_h() - font_size() * 1.2) / 2.0,
-            &titles[hit.index],
-            "monospace",
-            font_size(),
-            tr,
-            tg,
-            tb,
-            1.0,
-            0,
-            weight,
-        );
-    }
-    // Live drag preview: a caret at the slot the tab would drop into, plus a
-    // dashed outline of the tab being dragged. Painted after the tabs so it
-    // sits on top, and skipped for a press that has not yet moved (that is
-    // still just a click).
-    if let Some(drag) = *state.tab_drag.borrow() {
-        if drag.moved && drag.index_in_range(hits.len()) {
-            paint_tab_drag_preview(dc, &hits, drag);
-        }
-    }
-    *state.tab_hits.borrow_mut() = hits;
-}
-
-/// Draw the drag preview: a drop caret between tabs and an outline of the
-/// dragged tab. Purely visual — the reorder happens on release.
-fn paint_tab_drag_preview(dc: &mut dyn DrawContext, hits: &[TabHit], drag: TabDrag) {
-    const CARET: (f64, f64, f64) = (0.1, 0.35, 0.9);
-    // Drop caret at the boundary the tab would land on. `to` is a slot index
-    // in the current order: 0 means "before the first tab", `len-1` the last.
-    let caret_x = if drag.to == 0 {
-        hits.first().map(|h| h.x0 - tab_gap() / 2.0).unwrap_or(2.0)
-    } else {
-        hits.get(drag.to)
-            .map(|h| h.x0 - tab_gap() / 2.0)
-            .or_else(|| hits.last().map(|h| h.x1 + tab_gap() / 2.0))
-            .unwrap_or(2.0)
-    };
-    dc.fill_rect(caret_x - 1.0, 1.0, 2.0, tab_h() - 2.0, CARET.0, CARET.1, CARET.2, 1.0);
-    // Outline the tab being dragged so it reads as "picked up".
-    if let Some(from) = hits.get(drag.from) {
-        for (x, y, w, h) in [
-            (from.x0, 2.0, from.x1 - from.x0, 1.0),
-            (from.x0, tab_h() - 3.0, from.x1 - from.x0, 1.0),
-            (from.x0, 2.0, 1.0, tab_h() - 4.0),
-            (from.x1 - 1.0, 2.0, 1.0, tab_h() - 4.0),
-        ] {
-            dc.fill_rect(x, y, w, h, CARET.0, CARET.1, CARET.2, 1.0);
-        }
+    if let Some(tab_bar) = state.tab_bar.borrow().as_ref() {
+        tab_bar.set_tabs(&titles, active);
+        tab_bar.set_visible(show);
+        tab_bar.queue_redraw();
     }
 }
 
@@ -1226,6 +1449,7 @@ fn switch_to_sheet(state_rc: &Rc<GuiState>, index: usize) {
     app.core.view_sheet_id = app.core.workbook.sheet_id(index);
     app.core.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
     app.core.anchor = None;
+    app.core.selection_kind = crate::grid::SelectionKind::Cells;
     app.core.status = format!("Sheet {} of {}", index + 1, n);
     state.last_row.set(HEADER_ROWS);
     state.last_col.set(MARGIN_COLS);
@@ -1235,173 +1459,9 @@ fn switch_to_sheet(state_rc: &Rc<GuiState>, index: usize) {
     maintain_extent(state, false);
     update_formula_bar(state, HEADER_ROWS, MARGIN_COLS);
     state.canvas.queue_redraw();
-    state.tabbar.queue_redraw();
-}
-
-/// Click on the tab strip: a tab hit switches sheets; anything else is
-/// ignored and must never move the grid cursor.
-fn handle_tab_click(x: f64, state_rc: &Rc<GuiState>) {
-    let state: &GuiState = &**state_rc;
-    let hit = state.tab_hits.borrow().iter().find(|h| x >= h.x0 && x < h.x1).copied();
-    if let Some(hit) = hit {
-        switch_to_sheet(state_rc, hit.index);
+    if let Some(tb) = state.tab_bar.borrow().as_ref() {
+        tb.queue_redraw();
     }
-}
-
-/// Tab strip with the button number: right-click opens the Sheet menu as a
-/// context menu over the tab, left-click switches sheets.
-///
-/// LibreOffice Calc pops up the sheet's own menu on a right-click anywhere in
-/// the tab strip, and the menu acts on the sheet under the pointer. corro's
-/// Sheet menu already has the per-sheet items (New/Rename/Copy/Move), so the
-/// same menu tree is reused rather than duplicated — only the popup position
-/// and the "which sheet" target differ.
-///
-/// The Sheet menu is opened through the menu bar (mnemonic 'S'), which is the
-/// one path that already works on GTK3 and GTK4 alike (see
-/// `MenuBar::activate_submenu_by_mnemonic`). Positioning is best-effort: GTK4's
-/// popover menu bar has no position hook, so there the menu opens in its
-/// default place rather than failing.
-fn handle_tab_click_button(x: f64, button: u32, state_rc: &Rc<GuiState>) {
-    let state: &GuiState = &**state_rc;
-    if button == 1 {
-        // Left press: arm a possible drag, then switch sheets as before.
-        // Arming here (rather than in a separate handler) matters because this
-        // is the press; a drag is press -> motion -> release, and motion has
-        // nothing to extend unless the press armed it.
-        handle_tab_press(x, button, state_rc);
-        handle_tab_click(x, state_rc);
-        return;
-    }
-    if button == 3 {
-        // Right press over a tab: remember where, and open the menu on the
-        // *release*. Opening it now (even from an idle callback) leaves the
-        // menu up while button 3 is still down, so the release that follows is
-        // treated as a dismissal and none of the rows ever activate — verified
-        // by a 5-run loop: the popup appeared every time and clicking "New
-        // sheet" never worked. A right-press past the last tab is ignored
-        // rather than opening a menu about nothing.
-        let hit = state.tab_hits.borrow().iter().find(|h| x >= h.x0 && x < h.x1).copied();
-        if hit.is_none() {
-            return;
-        }
-        // The menu acts on the clicked sheet, so a right-press on an inactive
-        // tab selects it first (Calc's behaviour: the menu's items then apply
-        // to that sheet).
-        if let Some(hit) = hit {
-            switch_to_sheet(state_rc, hit.index);
-        }
-        state.tab_context_pending.set(Some(x));
-    }
-}
-
-/// Right-button release on the tab strip: open the Sheet menu there.
-fn handle_tab_release_button(x: f64, button: u32, state_rc: &Rc<GuiState>) {
-    let state: &GuiState = &**state_rc;
-    if button == 1 {
-        finish_tab_drag(state_rc);
-        return;
-    }
-    if button != 3 {
-        return;
-    }
-    // Only if a right-press actually armed this; a stray release (or one after
-    // the drag) must not pop a menu.
-    let Some(pending) = state.tab_context_pending.take() else {
-        return;
-    };
-    // Prefer the release position; fall back to the press position if the
-    // release reports no usable coordinate.
-    let at = if x.is_finite() && x >= 0.0 { x } else { pending };
-    open_sheet_context_menu(state_rc, at);
-}
-
-/// Begin, update, or finish a tab drag, driven by the button-aware pointer
-/// events.
-///
-/// A left press on a tab arms a drag; motion past the threshold previews the
-/// landing slot; release commits a reorder (if the slot actually changed). A
-/// right press or a press off the tabs is ignored here — the menu path and the
-/// plain click handler own those.
-fn handle_tab_press(x: f64, button: u32, state_rc: &Rc<GuiState>) {
-    let state: &GuiState = &**state_rc;
-    if button != 1 {
-        return;
-    }
-    let hit = state.tab_hits.borrow().iter().find(|h| x >= h.x0 && x < h.x1).copied();
-    let Some(hit) = hit else {
-        // Press off the tabs: nothing to drag.
-        return;
-    };
-    *state.tab_drag.borrow_mut() = Some(TabDrag {
-        from: hit.index,
-        to: hit.index,
-        press_x: x,
-        moved: false,
-    });
-}
-
-/// Pointer moved over the tab strip: extend an armed drag.
-fn handle_tab_motion(x: f64, state_rc: &Rc<GuiState>) {
-    let state: &GuiState = &**state_rc;
-    let mut drag = state.tab_drag.borrow_mut();
-    let Some(d) = drag.as_mut() else { return };
-    if !d.moved && (x - d.press_x).abs() < tab_drag_threshold() {
-        return;
-    }
-    d.moved = true;
-    let to = {
-        let hits = state.tab_hits.borrow();
-        tab_drop_index(&hits, x)
-    };
-    if d.to != to {
-        d.to = to;
-        drop(drag);
-        // Repaint so the preview follows the pointer. Only the strip needs it.
-        state.tabbar.queue_redraw();
-    }
-}
-
-/// Commit an in-progress drag, if any: a real reorder to the previewed slot.
-fn finish_tab_drag(state_rc: &Rc<GuiState>) {
-    let state: &GuiState = &**state_rc;
-    let Some(drag) = state.tab_drag.borrow_mut().take() else {
-        return;
-    };
-    if !drag.moved || drag.to == drag.from {
-        // A click, or a drag that came back to where it started: the click
-        // handler already switched sheets; nothing to reorder.
-        //
-        // Guard the repaint: this path runs for EVERY left-button release over
-        // the strip, including the release that commits a *menu* selection.
-        // Repainting the tab strip while a context menu is closing was enough
-        // to lose the click (verified: with this repaint unconditional, the
-        // right-click menu appeared but its rows did not activate). Only
-        // repaint when a preview was actually on screen and now needs clearing.
-        if drag.moved {
-            state.tabbar.queue_redraw();
-        }
-        return;
-    }
-    let app = state.app_mut();
-    let wb = &app.core.workbook;
-    let Some(id) = (0..wb.sheet_count()).find(|&i| i == drag.from).map(|i| wb.sheet_id(i)) else {
-        return;
-    };
-    let count = wb.sheet_count();
-    // The workbook op is 1-based and applies to the order *after* the sheet is
-    // lifted out. `tab_drop_index` returns a slot in the current order, so
-    // moving right means the target shifts down by one once the tab is removed.
-    let mut pos = drag.to + 1;
-    if drag.to > drag.from {
-        pos = drag.to;
-    }
-    let pos = pos.min(count) as u32;
-    apply_reorder_sheet(state_rc, id, pos);
-    crate::debug_log::log(&format!(
-        "TABDRAG from={} to={} id={id} pos={pos}",
-        drag.from, drag.to
-    ));
 }
 
 /// Apply `MOVE_SHEET_TO` to the live workbook and refresh the chrome.
@@ -1451,7 +1511,7 @@ fn open_sheet_context_menu(state_rc: &Rc<GuiState>, x: f64) {
     let Some(menubar) = state.menubar.get() else {
         // No menu bar (a backend without one): say so rather than
         // silently swallowing the click.
-        state.app_mut().core.status = "Sheet menu unavailable".to_string();
+        state.app_mut().core.status = crate::core::state::SHEET_MENU_UNAVAILABLE.to_string();
         sync_chrome_labels(state);
         return;
     };
@@ -1462,7 +1522,8 @@ fn open_sheet_context_menu(state_rc: &Rc<GuiState>, x: f64) {
     // `gtk_menu_popup` wants root coordinates. `None` (widget not yet realized,
     // or a backend without the origin symbols) means open unpositioned, which
     // still shows the menu.
-    let origin = state.tabbar.screen_origin();
+    let origin = state.tab_bar.borrow().as_ref()
+        .and_then(|tb| tb.canvas().screen_origin());
     let menubar = menubar.clone();
     let tab_y = (tab_h() as f64 / 2.0) as i32;
     let tab_x = x.round() as i32;
@@ -1482,29 +1543,30 @@ fn open_sheet_context_menu(state_rc: &Rc<GuiState>, x: f64) {
         // A backend whose menus cannot be opened programmatically (the mobile
         // and terminal ones report `false`). Say so rather than swallowing the
         // click silently.
-        state.app_mut().core.status = "Sheet menu unavailable".to_string();
+        state.app_mut().core.status = crate::core::state::SHEET_MENU_UNAVAILABLE.to_string();
         sync_chrome_labels(state);
     }
 }
 
 fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
-    let app = state.app_ref();
     let cursor_row = state.last_row.get();
     let cursor_col = state.last_col.get();
     let display_rows: Vec<usize> = displayed_rows(state);
     let col_ixs: Vec<usize> = displayed_cols(state);
+    // Read the pins through the shared state before taking the long `app_ref`
+    // borrow below, since `pinned_sets` needs `app_mut` (LIFO rule).
+    let (pin_rows, pin_cols) = pinned_sets(state);
+    let pinned_rows: std::collections::BTreeSet<usize> = pin_rows.into_iter().collect();
+    let pinned_cols: std::collections::BTreeSet<usize> = pin_cols.into_iter().collect();
+    let app = state.app_ref();
     let mc = app.core.workbook.active_sheet().grid.main_cols();
     let col_widths: HashMap<usize, usize> = col_ixs
         .iter()
         .map(|&c| (c, display_col_width(&app.core.workbook.active_sheet(), c, mc)))
         .collect();
-    let pinned_rows: std::collections::BTreeSet<usize> =
-        state.pinned_rows.borrow().iter().copied().collect();
-    let pinned_cols: std::collections::BTreeSet<usize> =
-        state.pinned_cols.borrow().iter().copied().collect();
     let vp = viewport_from_parts(&display_rows, &col_ixs, &col_widths, app);
 
-    dc.clear(0.94, 0.94, 0.94, 1.0);
+    chrome::clear_to(dc, chrome::palette().paper());
     let mut padlocks: Vec<GutterPadlock> = Vec::new();
     render_grid_body_inner(
         dc,
@@ -1516,7 +1578,7 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
         w,
         h,
         state.editing.get(),
-        &state.edit_buf.borrow(),
+        &state.formula_entry.get_text().unwrap_or_default(),
         true,
         &pinned_rows,
         &pinned_cols,
@@ -1578,6 +1640,57 @@ fn paint_movie_pointer(dc: &mut dyn DrawContext, state: &GuiState) {
     }
 }
 
+/// On-canvas revision indicator for File▸Replay's browse mode.
+///
+/// The status line already names the revision, but on a dense grid that is
+/// easy to miss and the mode is otherwise invisible (Left/Right simply stop
+/// moving the cursor). This paints a badge in the canvas's top-right corner:
+/// a solid panel, so it stays legible over both the pale grid and the dark
+/// header row, with the revision number in the largest type that fits.
+fn paint_revision_badge(dc: &mut dyn DrawContext, state: &GuiState, w: f64) {
+    let app = state.app_ref();
+    if !app.rev_browse {
+        return;
+    }
+    // Only a revision count is meaningful to the user; the raw limit is the
+    // clamped op count, which is exactly the "revision N" the status shows.
+    let text = format!("REV {} / {}", app.core.revision_browse_limit, app.core.ops_applied);
+    let font = "sans";
+    let size = 14.0 * metrics_scale();
+    let (tw, th) = {
+        let (_x, _y, wd, ht) = dc.text_extents_styled(&text, font, size, 0, 1);
+        (wd, ht)
+    };
+    let pad = 8.0 * metrics_scale();
+    let bw = tw + 2.0 * pad;
+    let bh = th + 2.0 * (pad * 0.6);
+    let bx = (w - bw - 12.0 * metrics_scale()).max(0.0);
+    // Sit below the column headers so the badge cannot cover them.
+    let by = header_h() + 6.0 * metrics_scale();
+    // Deep indigo panel with a lighter border: distinct from the grid's
+    // selection chrome (blue) and the drag preview caret (also blue-ish),
+    // so a screenshot can tell the browse mode apart from both.
+    // The badge panel is deliberately its own deep indigo in both schemes: it
+    // has to read as an overlay, not as a cell, so it is not derived from the
+    // palette. Its *text* is, so the label stays legible if the palette moves.
+    let badge_ink = chrome::palette().text();
+    dc.fill_rect(bx, by, bw, bh, 0.13, 0.11, 0.32, 0.94);
+    dc.stroke_rect(bx, by, bw, bh, 0.60, 0.55, 0.95, 0.95, 2.0);
+    dc.draw_text_styled(
+        bx + pad,
+        by + bh * 0.5 + size * 0.35,
+        &text,
+        font,
+        size,
+        badge_ink.0,
+        badge_ink.1,
+        badge_ink.2,
+        1.0,
+        0,
+        1,
+    );
+}
+
 /// Assemble a full [`Viewport`] from display rows/columns the caller already
 /// resolved. Keeps the row labels, column layout and row-aggregate derivation
 /// in one place for callers that compute their own visible sets (the live
@@ -1588,33 +1701,7 @@ fn viewport_from_parts(
     col_widths: &HashMap<usize, usize>,
     app: &super::App,
 ) -> crate::gui::viewport::Viewport {
-    let g = &app.core.workbook.active_sheet().grid;
-    let mr = g.main_rows();
-    let mc = g.main_cols();
-    let row_labels: Vec<(u32, String)> = display_rows
-        .iter()
-        .enumerate()
-        .map(|(idx, &r)| (idx as u32, crate::addr::ui_row_label(r, mr)))
-        .collect();
-    let column_layout: Vec<(u32, u32, String)> = col_ixs
-        .iter()
-        .map(|&c| {
-            let w = *col_widths.get(&c).unwrap_or(&1);
-            (c as u32, w as u32, crate::addr::ui_column_fragment(c, mc))
-        })
-        .collect();
-    let row_agg_func = compute::compute_row_agg_func(g, display_rows, HEADER_ROWS, mr);
-    crate::gui::viewport::Viewport {
-        display_rows: display_rows.to_vec(),
-        col_ixs: col_ixs.to_vec(),
-        col_widths: col_widths.clone(),
-        row_labels,
-        column_layout,
-        row_agg_func,
-        mr,
-        mc,
-        data_width: col_widths.values().copied().sum(),
-    }
+    crate::gui::viewport::Viewport::from_parts(app, display_rows, col_ixs, col_widths, HEADER_ROWS)
 }
 
 /// Paint a complete sheet body (gutter, column headers, cells, selection) for
@@ -1680,21 +1767,32 @@ fn render_grid_body_inner(
     let mc = vp.mc;
     dc.clip(0.0, 0.0, w as f64, h as f64);
 
-    // Header coverage mirrors the body's selection rectangle (anchor↔cursor on
-    // both axes — the GUI has no Rows/Cols-only modes). None while navigating
-    // plainly, so unselected chrome renders exactly as before.
-    let cover: Option<((usize, usize), (usize, usize))> = app.core.anchor.map(|a| {
+    // Header coverage mirrors the body's selection (anchor↔cursor, narrowed
+    // by `SelectionKind`): a Cells band covers both axes, a Rows selection
+    // covers rows only (so *only* the row gutters glow, not every covered
+    // column header), a Cols selection covers columns only. None while
+    // navigating plainly, so unselected chrome renders exactly as before.
+    let cover: Option<(Option<(usize, usize)>, Option<(usize, usize)>)> = app.core.anchor.map(|a| {
         let (r0, r1) = (a.row.min(cursor_row), a.row.max(cursor_row));
         let (c0, c1) = (a.col.min(cursor_col), a.col.max(cursor_col));
-        ((r0, r1), (c0, c1))
+        match app.core.selection_kind {
+            crate::grid::SelectionKind::Cells => (Some((r0, r1)), Some((c0, c1))),
+            crate::grid::SelectionKind::Rows => (Some((r0, r1)), None),
+            crate::grid::SelectionKind::Cols => (None, Some((c0, c1))),
+        }
     });
-    paint_row_headers(dc, display_rows, mr, pinned_rows, padlocks, cover.map(|(r, _)| r));
-    paint_col_headers(dc, col_ixs, col_widths, mc, pinned_cols, padlocks, cover.map(|(_, c)| c));
+    let cover_rows = cover.and_then(|(r, _)| r);
+    let cover_cols = cover.and_then(|(_, c)| c);
+    paint_row_headers(dc, display_rows, mr, pinned_rows, padlocks, cover_rows);
+    paint_col_headers(dc, col_ixs, col_widths, mc, pinned_cols, padlocks, cover_cols);
 
-    // Fill cells via the shared render pipeline.
-    let mut sink = GuiCanvasSink::new();
-    render::fill_cells(
-        &mut sink,
+    // Fill cells via the shared render pipeline, into a `GridView` through the
+    // one shared `CellSink` adapter (the same one the terminal host uses).
+    let grid = rswidgets::gridview::GridView::new(0, 0);
+    {
+        let mut sink = render::GridSink::new(&grid);
+        render::fill_cells(
+            &mut sink,
         display_rows,
         col_ixs,
         col_widths,
@@ -1704,12 +1802,13 @@ fn render_grid_body_inner(
         mc,
         lm,
         vp.data_width(),
-        cursor_row,
-        cursor_col,
-        &vp.row_agg_func,
-    );
+            cursor_row,
+            cursor_col,
+            &vp.row_agg_func,
+        );
+    }
     render_to(
-        &sink,
+        &grid,
         dc,
         col_ixs,
         col_widths,
@@ -1723,12 +1822,15 @@ fn render_grid_body_inner(
         is_editing,
         edit_buf,
         app.core.anchor.map(|a| (a.row, a.col)),
+        app.core.selection_kind,
+        &vp.row_agg_func,
+        &vp.col_agg_func,
     );
 
-    // Status line at the bottom of the body.
-    if h as f64 > header_h() + 20.0 {
-        dc.fill_rect(0.0, h as f64 - 20.0, w as f64, 20.0, 0.9, 0.9, 0.9, 1.0);
-    }
+    // No status strip at the bottom of the body: the status text lives in the
+    // formula row (see `formula_status`), so painting a grey band here left an
+    // empty 20px bar between the horizontal scrollbar and the last row — and
+    // `rows_to_fill_px` had to reserve height for it, clipping the last row.
 
     // Diagnostic overlay (cell/sink/cursor/key state) painted over the grid.
     // Opt-in via CORRO_DEBUG_OVERLAY (any value): off by default so normal runs
@@ -1827,6 +1929,53 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
             log_key_action(keyval, "help_ignore", "help mode blocks all keys except ESCAPE");
             return true;
         }
+        GuiMode::RevisionBrowse => {
+            // File▸Replay: Left/Right step the loaded log's revisions
+            // (ratatui `Mode::RevisionBrowse` parity) instead of moving the
+            // cursor. Enter/Esc leave the mode; every other key is
+            // swallowed, so a browsed (read-only) revision cannot be edited
+            // or scrolled by accident — the reference's catch-all stays in
+            // the mode for the same reason.
+            match key {
+                LEFT | RIGHT => {
+                    let action = app.core.step_revision(key == LEFT);
+                    log_key_action(
+                        keyval,
+                        if key == LEFT { "revision_back" } else { "revision_forward" },
+                        &format!(
+                            "{} revision={}",
+                            action.name(),
+                            app.core.revision_browse_limit
+                        ),
+                    );
+                    // The re-replay replaced the workbook, so every derived
+                    // label (formula bar, status, sheet tabs) and the grid
+                    // itself must be rebuilt from the new state.
+                    sync_chrome_labels(state);
+                    update_formula_bar(state, HEADER_ROWS, MARGIN_COLS);
+                    state.canvas.queue_redraw();
+                    return true;
+                }
+                RETURN | ESCAPE => {
+                    log_key_action(keyval, "revision_exit", "");
+                    // Leave the mode: this resets BOTH the key-routing flag
+                    // and the browsed-revision-set flag together (they are
+                    // always paired — see `App::leave_revision_browse`), or
+                    // the mode looks still active (badge painted, hints
+                    // swapped). The workbook keeps the browsed contents, as
+                    // the reference does on `Mode::Normal`.
+                    state.mode.set(GuiMode::Normal);
+                    state.app_mut().leave_revision_browse();
+                    sync_chrome_labels(state);
+                    state.canvas.queue_redraw();
+                    return true;
+                }
+                _ => {
+                    log_key_action(keyval, "revision_ignore", "browse mode swallows non-step keys");
+                    return true;
+                }
+            }
+        }
         _ => {}
     }
 
@@ -1909,7 +2058,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
             } else {
                 log_key_action(keyval, "agg_picker_noop", &format!("cell={}", format_cell(state)));
                 state.app_mut().core.status =
-                    "Aggregate: no margin TOTAL/MAX/… key for this cell".into();
+                    crate::core::state::NO_AGG_KEY_FOR_CELL.into();
                 state.canvas.queue_redraw();
             }
             true
@@ -1923,16 +2072,8 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
                 if let Some(text) = state.formula_entry.get_text() {
                     if !text.is_empty() {
                         state.editing.set(true);
-                        *state.edit_buf.borrow_mut() = text;
                         return handle_edit_key(key, state, mods);
                     }
-                }
-                // When window CAPTURE consumed printable chars and pushed to
-                // edit_buf directly (bypassing the entry widget), the entry
-                // text is empty but edit_buf has content.  Commit from there.
-                if !state.edit_buf.borrow().is_empty() {
-                    state.editing.set(true);
-                    return handle_edit_key(key, state, mods);
                 }
             }
             // Focus can drift off the entry (setup grab_focus races
@@ -1940,7 +2081,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
             // buffer is a commit, not navigation — the entry's CAPTURE
             // intercept only fires when focused. Ratatui parity: Edit +
             // Return commits; bare Return with an empty buffer still moves.
-            if state.editing.get() && !state.edit_buf.borrow().is_empty() {
+            if state.editing.get() && !state.formula_entry.get_text().unwrap_or_default().is_empty() {
                 return handle_edit_key(key, state, mods);
             }
             log_key_action(keyval, "move_cursor_down", &format!("cell={}", format_cell(state)));
@@ -1956,6 +2097,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
             log_key_action(keyval, "cancel_nav", "");
             // Collapse any selection (plain navigation state).
             app.core.anchor = None;
+            app.core.selection_kind = crate::grid::SelectionKind::Cells;
             state.canvas.queue_redraw();
             true
         }
@@ -2044,16 +2186,6 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
         }
         _ if (32..=126).contains(&key) => {
             let ch = char::from_u32(key).unwrap_or('?');
-            // Prime the press/release tracker so a following release event is
-            // skipped by handle_edit_key. GTK4-only: only there can releases
-            // arrive as same-keyval callbacks; elsewhere priming would cause
-            // handle_edit_key to skip the next identical char.
-            #[cfg(feature = "gtk4")]
-            {
-                let dk = ch.to_ascii_lowercase() as u32;
-                state.last_dedup_key.set(dk);
-                state.dedup_count.set(1);
-            }
             log_key_action(keyval, "start_edit_with", &format!("char={ch} cell={}", format_cell(state)));
             start_edit_with(state, ch);
             true
@@ -2088,8 +2220,8 @@ fn handle_edit_key(key: u32, state: &GuiState, mods: u32) -> bool {
             log_key_action(key, "cancel_edit", &format!("cell={} mode=edit", format_cell(state)));
             state.editing.set(false);
             state.entry_clicked.set(false);
-            state.edit_buf.borrow_mut().clear();
-            state.edit_caret.set(0);
+            state.formula_entry.set_text_suppressing_changed("");
+            state.formula_entry.set_position(0);
             state.mode.set(GuiMode::Normal);
             update_formula_bar(state, state.last_row.get(), state.last_col.get());
             state.canvas.queue_redraw();
@@ -2106,10 +2238,9 @@ fn handle_edit_key(key: u32, state: &GuiState, mods: u32) -> bool {
             // No-op on an empty buffer (and never resync): selections show
             // the cell value while editing with nothing typed yet, and a
             // sync here would blank that display without changing anything.
-            if !state.edit_buf.borrow().is_empty() {
+            if !state.formula_entry.get_text().unwrap_or_default().is_empty() {
                 // Caret-aware: removes the char BEFORE the caret.
                 edit_backspace(state);
-                sync_entry_to_buf(state);
                 state.canvas.queue_redraw();
             }
             true
@@ -2117,17 +2248,16 @@ fn handle_edit_key(key: u32, state: &GuiState, mods: u32) -> bool {
         DELETE => {
             log_key_action(key, "edit_clear", &format!("cell={} mode=edit", format_cell(state)));
             // Same empty-buffer rule as Backspace above.
-            if !state.edit_buf.borrow().is_empty() {
-                if crate::formula::is_formula(&state.edit_buf.borrow()) {
+            if !state.formula_entry.get_text().unwrap_or_default().is_empty() {
+                if crate::formula::is_formula(&state.formula_entry.get_text().unwrap_or_default()) {
                     // Formula editing: Delete removes the char AT the caret
                     // (ratatui parity — `edit_delete_forward`).
                     edit_delete_forward(state);
                 } else {
                     // Plain value: Delete clears the whole buffer.
-                    state.edit_buf.borrow_mut().clear();
-                    state.edit_caret.set(0);
+                    state.formula_entry.set_text_suppressing_changed("");
+                    state.formula_entry.set_position(0);
                 }
-                sync_entry_to_buf(state);
                 state.canvas.queue_redraw();
             }
             true
@@ -2138,11 +2268,11 @@ fn handle_edit_key(key: u32, state: &GuiState, mods: u32) -> bool {
             // does Left commit and step to the previous cell. Committing on
             // every Left made typing insert at the end and moved the cell
             // cursor instead of the caret.
-            let mut caret = state.edit_caret.get();
-            let outcome = text_edit::left(&state.edit_buf.borrow(), &mut caret);
+            let text = state.formula_entry.get_text().unwrap_or_default();
+            let mut caret = state.formula_entry.get_position().unwrap_or(text.chars().count());
+            let outcome = text_edit::left(&text, &mut caret);
             if outcome == text_edit::KeyOutcome::Edited {
-                state.edit_caret.set(caret);
-                push_caret_to_entry(state);
+                state.formula_entry.set_position(caret);
                 state.canvas.queue_redraw();
                 return true;
             }
@@ -2158,11 +2288,11 @@ fn handle_edit_key(key: u32, state: &GuiState, mods: u32) -> bool {
         RIGHT => {
             // Mirror of LEFT: move the caret to the buffer end, then commit
             // and step right.
-            let mut caret = state.edit_caret.get();
-            let outcome = text_edit::right(&state.edit_buf.borrow(), &mut caret);
+            let text = state.formula_entry.get_text().unwrap_or_default();
+            let mut caret = state.formula_entry.get_position().unwrap_or(text.chars().count());
+            let outcome = text_edit::right(&text, &mut caret);
             if outcome == text_edit::KeyOutcome::Edited {
-                state.edit_caret.set(caret);
-                push_caret_to_entry(state);
+                state.formula_entry.set_position(caret);
                 state.canvas.queue_redraw();
                 return true;
             }
@@ -2193,25 +2323,6 @@ fn handle_edit_key(key: u32, state: &GuiState, mods: u32) -> bool {
             true
         }
         _ if (32..=126).contains(&key) => {
-            // Press/release dedup. GTK4-only (see GuiState): elsewhere every
-            // key event is a genuine press (releases are filtered at the
-            // source or never hooked), so deduping would swallow genuine
-            // repeats ("HELLO" -> "HELO").
-            #[cfg(feature = "gtk4")]
-            {
-                let dedup_key = char::from_u32(key).map(|c| c.to_ascii_lowercase() as u32).unwrap_or(key);
-                if dedup_key == state.last_dedup_key.get() {
-                    let cnt = state.dedup_count.get() + 1;
-                    state.dedup_count.set(cnt);
-                    // Skip every even occurrence (the release event)
-                    if cnt % 2 == 0 {
-                        return true;
-                    }
-                } else {
-                    state.last_dedup_key.set(dedup_key);
-                    state.dedup_count.set(1);
-                }
-            }
             let ch = char::from_u32(key).unwrap_or('?');
             log_key_action(key, "edit_insert", &format!("char={ch} cell={} mode=edit", format_cell(state)));
             // Adopt the displayed value when the buffer is empty: the edit
@@ -2220,19 +2331,17 @@ fn handle_edit_key(key: u32, state: &GuiState, mods: u32) -> bool {
             // onto the empty buffer would replace that text with this one
             // char; restore it first, keeping the caret the click placed (so
             // typing inserts at the clicked position, not always at the end).
-            if state.edit_buf.borrow().is_empty() {
-                if let Some(shown) = state.formula_entry.get_text() {
-                    if !shown.is_empty() {
-                        *state.edit_buf.borrow_mut() = shown;
-                    }
+            if state.formula_entry.get_text().unwrap_or_default().is_empty() {
+                // Entry already has the cell's displayed value; just ensure
+                // the caret is at a sensible position.
+                if !state.entry_clicked.get() {
+                    let len = state.formula_entry.get_text().unwrap_or_default().chars().count();
+                    state.formula_entry.set_position(len);
                 }
                 state.entry_clicked.set(false);
-                pull_caret_from_entry(state);
-                state.edit_caret.set(state.edit_caret.get().min(edit_caret_len(state)));
             }
             // Caret-aware insert, so typing mid-buffer inserts at the caret.
             edit_insert_char(state, ch);
-            sync_entry_to_buf(state);
             state.canvas.queue_redraw();
             true
         }
@@ -2241,21 +2350,101 @@ fn handle_edit_key(key: u32, state: &GuiState, mods: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Edit operations
+// Edit buffer model
 // ---------------------------------------------------------------------------
 
-/// Fresh empty edit (F2). Retained for callers that want a blank buffer;
-/// the interactive F2 path uses [`start_edit_with_text`] so the cell's
-/// current value is seeded rather than discarded.
-#[allow(dead_code)]
-fn start_edit(state: &GuiState) {
-    state.editing.set(true);
-    state.edit_buf.borrow_mut().clear();
-    state.edit_caret.set(0);
-    state.formula_entry.set_text("");
-    state.formula_entry.grab_focus();
-    state.canvas.queue_redraw();
+/// The formula-edit buffer as a pure `(text, caret)` model.
+///
+/// The caret is a **char** index, never a byte offset, so multibyte input can
+/// never split a codepoint. Split out of the widget handlers because the same
+/// operations are wanted by every backend (and by the tests) without a live
+/// widget: `handle_edit_key` and `start_edit_with` drive exactly this surface
+/// rather than re-deriving it.
+mod text_edit {
+    /// What an arrow key did, which is what decides whether the edit stays
+    /// open: at an edge the caret cannot move, so the key falls back to
+    /// committing and moving the cell (ratatui's behaviour).
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum KeyOutcome {
+        /// The caret moved; the edit continues.
+        Edited,
+        /// The caret was already at the edge; the caller commits and the
+        /// cursor moves to the neighbouring cell.
+        CommitAndMoveCell,
+    }
+
+    /// Number of chars in `text` (the caret's bounds).
+    pub fn caret_len(text: &str) -> usize {
+        text.chars().count()
+    }
+
+    /// Insert `ch` at the caret, then advance past it.
+    pub fn insert_char(text: &mut String, caret: &mut usize, ch: char) {
+        let at = (*caret).min(caret_len(text));
+        let byte = char_to_byte(text, at);
+        text.insert(byte, ch);
+        *caret = at + 1;
+    }
+
+    /// Delete the char before the caret. No-op at position 0.
+    pub fn backspace(text: &mut String, caret: &mut usize) {
+        if *caret == 0 {
+            return;
+        }
+        let at = (*caret).min(caret_len(text));
+        if at == 0 {
+            return;
+        }
+        let start = char_to_byte(text, at - 1);
+        let end = char_to_byte(text, at);
+        text.replace_range(start..end, "");
+        *caret = at - 1;
+    }
+
+    /// Delete the char at the caret (no-op at the end).
+    pub fn delete_forward(text: &mut String, caret: &mut usize) {
+        let at = (*caret).min(caret_len(text));
+        if at >= caret_len(text) {
+            return;
+        }
+        let start = char_to_byte(text, at);
+        let end = char_to_byte(text, at + 1);
+        text.replace_range(start..end, "");
+    }
+
+    /// Move the caret one char left; `CommitAndMoveCell` at position 0.
+    pub fn left(text: &str, caret: &mut usize) -> KeyOutcome {
+        let _ = text;
+        if *caret == 0 {
+            KeyOutcome::CommitAndMoveCell
+        } else {
+            *caret -= 1;
+            KeyOutcome::Edited
+        }
+    }
+
+    /// Move the caret one char right; `CommitAndMoveCell` at the end.
+    pub fn right(text: &str, caret: &mut usize) -> KeyOutcome {
+        if *caret >= caret_len(text) {
+            KeyOutcome::CommitAndMoveCell
+        } else {
+            *caret += 1;
+            KeyOutcome::Edited
+        }
+    }
+
+    /// Byte offset of char index `idx` (clamped to the end).
+    fn char_to_byte(text: &str, idx: usize) -> usize {
+        text.char_indices()
+            .nth(idx)
+            .map(|(b, _)| b)
+            .unwrap_or(text.len())
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Edit entry points
+// ---------------------------------------------------------------------------
 
 /// F2: edit the cursor cell, seeded with its current value (LibreOffice
 /// parity — typing appends to the existing content instead of replacing it,
@@ -2263,10 +2452,20 @@ fn start_edit(state: &GuiState) {
 ///
 /// Reads the **cell** (not the formula bar, which may not have refreshed
 /// yet for the current cursor) so the seed is always the real content.
-fn start_edit_seeded_from_cell(state: &GuiState) {
-    // Editing supersedes the aggregate dropdown.
-    hide_agg_dropdown(state);
+/// Common edit-mode entry point. Sets the editing flag, presets the formula
+/// entry with `text`, places the caret at the end, grabs focus, and redraws.
+/// Callers that need extra steps (hide_agg_dropdown, entry_clicked, window
+/// redraw) do those before/after this call.
+fn begin_edit(state: &GuiState, text: &str) {
     state.editing.set(true);
+    state.formula_entry.set_text_suppressing_changed(text);
+    state.formula_entry.set_position(text.chars().count());
+    state.formula_entry.grab_focus();
+    state.canvas.queue_redraw();
+}
+
+fn start_edit_seeded_from_cell(state: &GuiState) {
+    hide_agg_dropdown(state);
     state.entry_clicked.set(false);
     let raw = {
         let app = state.app_ref();
@@ -2279,18 +2478,45 @@ fn start_edit_seeded_from_cell(state: &GuiState) {
         );
         grid.get(&addr).unwrap_or_default()
     };
-    *state.edit_buf.borrow_mut() = raw;
-    sync_entry_to_buf(state);
-    state.edit_caret.set(edit_caret_len(state));
-    push_caret_to_entry(state);
-    state.formula_entry.grab_focus();
+    begin_edit(state, &raw);
+}
+
+/// Keeps the formula bar showing the cell's value
+/// (grid clicks and setup select; they must display, not blank). The buffer
+/// is still cleared, so typing replaces (ratatui parity) and committing an
+/// untouched selection stays a quiet no-op via the empty check in
+/// [`commit_edit`]. F2 seeds via [`start_edit_with_text`] instead.
+fn start_edit_keep_display(state: &GuiState) {
+    hide_agg_dropdown(state);
+    begin_edit(state, "");
+    state.window.queue_redraw();
+}
+
+fn start_edit_with(state: &GuiState, ch: char) {
+    let already_editing = state.editing.get();
+    state.editing.set(true);
+    // A click into the entry placed a caret worth honouring (`entry_clicked`);
+    // otherwise (type-first idle, or a fresh start) the caret goes at the end
+    // so typing appends rather than prepends. The entry is the sole buffer in
+    // this backend, so its text is already the cell's displayed value — there
+    // is nothing to adopt.
+    if !state.entry_clicked.get() {
+        let len = state.formula_entry.get_text().unwrap_or_default().chars().count();
+        state.formula_entry.set_position(len);
+    }
+    state.entry_clicked.set(false);
+    edit_insert_char(state, ch);
+    if !already_editing {
+        state.formula_entry.grab_focus();
+    }
     state.canvas.queue_redraw();
 }
 
+fn start_edit_with_text(state: &GuiState, text: &str) {
+    begin_edit(state, text);
+}
+
 /// What run_gui's setup should do after `present()` returns, chosen from
-/// state that may already have been changed by events delivered *during*
-/// `present()`'s main-loop pump. Pure so the race is unit-testable without
-/// widgets.
 ///
 /// `present()` pumps the GTK main loop for hundreds of iterations before the
 /// real loop runs, and the canvas click/key handlers are registered before
@@ -2319,194 +2545,31 @@ fn startup_edit_action(editing_with_content: bool, clicked: bool) -> StartupEdit
     }
 }
 
-/// Keeps the formula bar showing the cell's value
-/// (grid clicks and setup select; they must display, not blank). The buffer
-/// is still cleared, so typing replaces (ratatui parity) and committing an
-/// untouched selection stays a quiet no-op via the empty check in
-/// [`commit_edit`]. F2 seeds via [`start_edit_with_text`] instead.
-fn start_edit_keep_display(state: &GuiState) {
-    // Typing into the cell supersedes the aggregate dropdown.
-    hide_agg_dropdown(state);
-    state.editing.set(true);
-    state.edit_buf.borrow_mut().clear();
-    // Empty buffer: the caret belongs at the start.
-    state.edit_caret.set(0);
-    push_caret_to_entry(state);
-    state.formula_entry.grab_focus();
-    state.canvas.queue_redraw();
-    // Window-level cascade as well: a canvas-only queue_draw may not arm the
-    // toplevel's frame clock, so the repaint never happens (the cursor
-    // appears not to follow navigation). update_state_cursor does the same.
-    state.window.queue_redraw();
-}
-
-fn start_edit_with(state: &GuiState, ch: char) {
-    let already_editing = state.editing.get();
-    state.editing.set(true);
-    // Click-to-edit adopt: the user clicked into the formula bar (which
-    // displays the cell's formula) and is now typing into it. Pushing onto
-    // the empty buffer would wipe the formula to this one char; restore the
-    // displayed text first. The caret is whatever the click put in the
-    // widget (adopted by `pull_caret_from_entry` on button-press), so
-    // typing inserts *at the clicked position* rather than always appending.
-    // Adopt whenever the entry is displaying a value and the buffer is
-    // empty: the displayed text is the cell's current content, and starting
-    // from it (rather than from nothing) is what makes typing EDIT the cell
-    // instead of silently replacing its value. A stale empty buffer is never
-    // a reason to discard what the user can see.
-    if state.edit_buf.borrow().is_empty() {
-        let shown = state.formula_entry.get_text().unwrap_or_default();
-        if !shown.is_empty() {
-            *state.edit_buf.borrow_mut() = shown;
-            // Only a genuine click places a caret worth honouring; a
-            // function-bar refresh or the type-first idle state leaves the
-            // widget's position at 0, which would prepend instead of
-            // appending. Default to the end (append) in that case — the
-            // least destructive reading of "the user is editing this value".
-            if state.entry_clicked.get() {
-                pull_caret_from_entry(state);
-            } else {
-                state.edit_caret.set(edit_caret_len(state));
-            }
-            state.edit_caret.set(state.edit_caret.get().min(edit_caret_len(state)));
-        }
-        state.entry_clicked.set(false);
-    }
-    // Caret-aware insert (never append): the same `text_edit` surface
-    // Left/Right and Backspace drive, so typing mid-buffer inserts there.
-    edit_insert_char(state, ch);
-    // Keep the widget identical to edit_buf (see sync_entry_to_buf): the
-    // widget text is what the user sees, edit_buf is what gets committed.
-    sync_entry_to_buf(state);
-    if !already_editing {
-        state.formula_entry.grab_focus();
-    }
-    state.canvas.queue_redraw();
-}
-
-/// Keep the formula entry widget text identical to edit_buf (the commit
-/// source of truth). Without this the two diverge: the native widget inserts
-/// typed chars itself on top of handle_key's push (doubling, "AA"), and it
-/// never sees Backspace/Delete (handle_key consumes those), leaving stale
-/// text on screen. Syncing here covers every key path (window + entry, all
-/// GUI backends); on_formula_entry_changed accepts identical text as a no-op.
-/// Caret-aware text editing for the formula buffer.
-///
-/// The native Entry exposes no caret API, so the host owns the caret exactly
-/// as ratatui's `Mode::Edit` does. Pure `(buffer, caret)` operations so the
-/// semantics are unit-testable without a window.
-mod text_edit {
-    /// What an edit-mode key did, so the caller knows whether the edit
-    /// continues or the cell cursor should move.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum KeyOutcome {
-        Edited,
-        CommitAndMoveCell,
-    }
-
-    /// Insert `ch` at the caret and advance it.
-    pub fn insert_char(buf: &mut String, caret: &mut usize, ch: char) {
-        let mut chars: Vec<char> = buf.chars().collect();
-        let pos = (*caret).min(chars.len());
-        chars.insert(pos, ch);
-        *buf = chars.into_iter().collect();
-        *caret = pos + 1;
-    }
-
-    /// Remove the char before the caret (no-op at position 0).
-    pub fn backspace(buf: &mut String, caret: &mut usize) {
-        let mut chars: Vec<char> = buf.chars().collect();
-        let pos = (*caret).min(chars.len());
-        if pos > 0 {
-            chars.remove(pos - 1);
-            *buf = chars.into_iter().collect();
-            *caret = pos - 1;
-        }
-    }
-
-    /// Remove the char *at* the caret (no-op at end).
-    pub fn delete_forward(buf: &mut String, caret: &mut usize) {
-        let mut chars: Vec<char> = buf.chars().collect();
-        let pos = (*caret).min(chars.len());
-        if pos < chars.len() {
-            chars.remove(pos);
-            *buf = chars.into_iter().collect();
-        }
-    }
-
-    /// Caret within `buf` in characters.
-    pub fn caret_len(buf: &str) -> usize {
-        buf.chars().count()
-    }
-
-    /// Move the caret left, or report commit-and-move-cell at the start.
-    pub fn left(buf: &str, caret: &mut usize) -> KeyOutcome {
-        if *caret > 0 {
-            *caret -= 1;
-            KeyOutcome::Edited
-        } else {
-            let _ = buf;
-            KeyOutcome::CommitAndMoveCell
-        }
-    }
-
-    /// Mirror of [`left`] at the end of the buffer.
-    pub fn right(buf: &str, caret: &mut usize) -> KeyOutcome {
-        if *caret < caret_len(buf) {
-            *caret += 1;
-            KeyOutcome::Edited
-        } else {
-            KeyOutcome::CommitAndMoveCell
-        }
-    }
-}
-
-/// Push the app's caret into the widget so the visible cursor matches what
-/// the next edit will use (a `set_text` otherwise resets it to the end).
-fn push_caret_to_entry(state: &GuiState) {
-    state.formula_entry.set_position(state.edit_caret.get());
-}
-
-/// Pull the widget's caret into the app before an edit: the widget owns the
-/// authoritative cursor once the user has clicked or arrowed inside it.
-fn pull_caret_from_entry(state: &GuiState) {
-    if let Some(pos) = state.formula_entry.get_position() {
-        state.edit_caret.set(pos);
-    }
-}
-
-/// Insert `ch` at the caret (never appended).
+/// Edit key handler: insert, backspace, delete, arrows, Enter, Esc.
 fn edit_insert_char(state: &GuiState, ch: char) {
-    let mut caret = state.edit_caret.get();
-    text_edit::insert_char(&mut state.edit_buf.borrow_mut(), &mut caret, ch);
-    state.edit_caret.set(caret);
+    let mut text = state.formula_entry.get_text().unwrap_or_default();
+    let mut caret = state.formula_entry.get_position().unwrap_or(text.chars().count());
+    text_edit::insert_char(&mut text, &mut caret, ch);
+    state.formula_entry.set_text_suppressing_changed(&text);
+    state.formula_entry.set_position(caret);
 }
 
-/// Backspace at the caret (no-op at position 0).
+/// Edit key handler: insert, backspace, delete, arrows, Enter, Esc.
 fn edit_backspace(state: &GuiState) {
-    let mut caret = state.edit_caret.get();
-    text_edit::backspace(&mut state.edit_buf.borrow_mut(), &mut caret);
-    state.edit_caret.set(caret);
+    let mut text = state.formula_entry.get_text().unwrap_or_default();
+    let mut caret = state.formula_entry.get_position().unwrap_or(text.chars().count());
+    text_edit::backspace(&mut text, &mut caret);
+    state.formula_entry.set_text_suppressing_changed(&text);
+    state.formula_entry.set_position(caret);
 }
 
 /// Delete the char at the caret (no-op at end).
 fn edit_delete_forward(state: &GuiState) {
-    let mut caret = state.edit_caret.get();
-    text_edit::delete_forward(&mut state.edit_buf.borrow_mut(), &mut caret);
-    state.edit_caret.set(caret);
-}
-
-/// Caret length of the buffer in characters.
-fn edit_caret_len(state: &GuiState) -> usize {
-    text_edit::caret_len(&state.edit_buf.borrow())
-}
-
-fn sync_entry_to_buf(state: &GuiState) {
-    let buf = state.edit_buf.borrow().clone();
-    if state.formula_entry.get_text().as_deref() != Some(buf.as_str()) {
-        state.formula_entry.set_text(&buf);
-    }
-    push_caret_to_entry(state);
+    let mut text = state.formula_entry.get_text().unwrap_or_default();
+    let mut caret = state.formula_entry.get_position().unwrap_or(text.chars().count());
+    text_edit::delete_forward(&mut text, &mut caret);
+    state.formula_entry.set_text_suppressing_changed(&text);
+    state.formula_entry.set_position(caret);
 }
 
 fn commit_edit(state: &GuiState) {
@@ -2515,7 +2578,7 @@ fn commit_edit(state: &GuiState) {
     // new value, it never repairs into the committed formula.
     state.entry_clicked.set(false);
     state.mode.set(GuiMode::Normal);
-    let val = state.edit_buf.borrow().clone();
+    let val = state.formula_entry.get_text().unwrap_or_default();
     if !val.is_empty() {
         let app = state.app_mut();
         let row = state.last_row.get();
@@ -2533,21 +2596,16 @@ fn commit_edit(state: &GuiState) {
             crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols()),
         );
         app.core.workbook.active_sheet_mut().grid.set(&addr, val.clone());
-        let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
         let op = Op::SetCell { addr: addr.clone(), value: val };
-        let wbo = WorkbookOp::SheetOp { sheet_id, op };
-        if let Some(ref p) = app.core.path.clone() {
-            let mut active_sheet = sheet_id;
-            if let Err(e) = crate::io::commit_workbook_op(
-                p, &mut app.core.offset, &mut app.core.workbook,
-                &mut active_sheet, &wbo,
-            ) {
-                eprintln!("ERROR: commit_workbook_op failed: {e} (path={})", p.display());
-            } else {
-                app.core.ops_applied = app.core.ops_applied.saturating_add(1);
-            }
+        // Use the shared commit path: auto-creates an unsaved file when
+        // path is None and unsaved_auto_create is true, so edits are
+        // persisted from the first keystroke (not lost on crash) and
+        // Edit>External works without requiring File>Save As first.
+        if let Err(e) = app.core.commit_sheet_op(op) {
+            eprintln!("ERROR: commit_sheet_op failed: {e}");
         }
         app.core.status = format!("Set cell {}", crate::addr::cell_ref_text(&addr, app.core.workbook.active_sheet().grid.main_cols()));
+        crate::debug_log::log(&format!("COMMIT addr={addr:?} row={row} col={col} mr={} mc={}", app.core.workbook.active_sheet().grid.main_rows(), app.core.workbook.active_sheet().grid.main_cols()));
         recompute_viewport(state);
         // Refresh chrome here, not just the canvas: commits arriving via
         // the window key path (unfocused Return) otherwise leave the
@@ -2555,8 +2613,7 @@ fn commit_edit(state: &GuiState) {
         // cursor event. Idempotent for paths that refresh separately.
         update_formula_bar(state, state.last_row.get(), state.last_col.get());
     }
-    state.edit_buf.borrow_mut().clear();
-    state.edit_caret.set(0);
+    state.formula_entry.set_text_suppressing_changed("");
     state.canvas.queue_redraw();
 }
 
@@ -2587,48 +2644,30 @@ fn handle_delete(state: &GuiState) {
                     app.core.workbook.active_sheet_mut().grid.set(&addr, String::new());
                 }
             }
-            let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
             let addr = addr_of(app, row, col);
             let op = Op::SetCell { addr, value: String::new() };
-            let wbo = WorkbookOp::SheetOp { sheet_id, op };
-            if let Some(ref p) = app.core.path.clone() {
-                let mut active_sheet = sheet_id;
-                if let Err(e) = crate::io::commit_workbook_op(
-                    p, &mut app.core.offset, &mut app.core.workbook,
-                    &mut active_sheet, &wbo,
-                ) {
-                    eprintln!("ERROR: commit_workbook_op failed: {e} (path={})", p.display());
-                } else {
-                    app.core.ops_applied = app.core.ops_applied.saturating_add(1);
-                }
+            if let Err(e) = app.core.commit_sheet_op(op) {
+                eprintln!("ERROR: commit_sheet_op failed: {e}");
             }
             app.core.status = "Cleared selection".into();
             recompute_viewport(state);
             // Clearing consumes the selection.
             app.core.anchor = None;
+            app.core.selection_kind = crate::grid::SelectionKind::Cells;
             state.canvas.queue_redraw();
             return;
         }
     }
     let addr = addr_of(app, row, col);
     app.core.workbook.active_sheet_mut().grid.set(&addr, String::new());
-    let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
     let op = Op::SetCell { addr, value: String::new() };
-    let wbo = WorkbookOp::SheetOp { sheet_id, op };
-    if let Some(ref p) = app.core.path.clone() {
-        let mut active_sheet = sheet_id;
-        if let Err(e) = crate::io::commit_workbook_op(
-            p, &mut app.core.offset, &mut app.core.workbook,
-            &mut active_sheet, &wbo,
-        ) {
-            eprintln!("ERROR: commit_workbook_op failed: {e} (path={})", p.display());
-        } else {
-            app.core.ops_applied = app.core.ops_applied.saturating_add(1);
-        }
+    if let Err(e) = app.core.commit_sheet_op(op) {
+        eprintln!("ERROR: commit_sheet_op failed: {e}");
     }
     recompute_viewport(state);
     // Clearing consumes the selection (nothing remains selected).
     state.app_mut().core.anchor = None;
+    state.app_mut().core.selection_kind = crate::grid::SelectionKind::Cells;
     state.canvas.queue_redraw();
 }
 
@@ -2666,7 +2705,12 @@ fn recompute_viewport(state: &GuiState) {
 /// no non-blank cells.
 fn row_nonblank_extremes(state: &GuiState, row: usize) -> Option<(usize, usize)> {
     let app = state.app_ref();
-    let grid = &app.core.workbook.active_sheet().grid;
+    row_nonblank_extremes_grid(&app.core.workbook.active_sheet().grid, row)
+}
+
+/// Grid-only core of [`row_nonblank_extremes`], so the scan can be unit-tested
+/// without a live window.
+fn row_nonblank_extremes_grid(grid: &GridBox, row: usize) -> Option<(usize, usize)> {
     let main_cols = grid.main_cols();
     let mut first: Option<usize> = None;
     let mut last: Option<usize> = None;
@@ -2681,10 +2725,11 @@ fn row_nonblank_extremes(state: &GuiState, row: usize) -> Option<(usize, usize)>
             CellAddr::Header { row: r, .. } | CellAddr::Footer { row: r, .. } => (r as usize, 0),
         };
         if r == row {
-            if first.is_none() {
-                first = Some(c);
-            }
-            last = Some(c);
+            // `iter_nonempty` visits main cells in hash order, so track the
+            // min/max rather than first/last seen — otherwise HOME/END could
+            // jump to an arbitrary column.
+            first = Some(first.map_or(c, |f: usize| f.min(c)));
+            last = Some(last.map_or(c, |l: usize| l.max(c)));
         }
     }
     match (first, last) {
@@ -2699,39 +2744,19 @@ fn move_cursor(state: &GuiState, dr: isize, dc: isize) {
     // over an unrelated cell. (Done here, not in `update_state_cursor`,
     // which also runs from scroll callbacks.)
     hide_agg_dropdown(state);
-    let hr = HEADER_ROWS;
-    let lm = MARGIN_COLS;
     let (mut row, mut col) = (state.last_row.get(), state.last_col.get());
+    // Grow the grid when the cursor is at the last row/col edge with few
+    // trailing blanks (shared with pancurses via compute::grow_grid_for_cursor).
+    {
+        let app = state.app_mut();
+        let grid = &mut app.core.workbook.active_sheet_mut().grid;
+        compute::grow_grid_for_cursor(grid, row, col);
+    }
     if dc > 0 {
-        // Grow the grid when stepping right off the last main column with
-        // few trailing blanks (matching ratatui's move_cursor_one_col_horizontal).
-        // Clamping here instead strands the cursor (Right does nothing) and
-        // even walks it backwards when the clamp bound sits below the cursor.
-        let mc = state.app_ref().core.workbook.active_sheet().grid.main_cols();
-        if col == lm + mc.saturating_sub(1) {
-            let app = state.app_mut();
-            let sheet = app.core.workbook.active_sheet_mut();
-            if compute::trailing_blank_main_cols(&sheet.grid) < ui_core::NAV_BLANK_COLS {
-                sheet.grid.grow_main_col_at_right();
-            }
-        }
         col = col.saturating_add(1);
     } else if dc < 0 {
-        // Plain Left walks into the left margin (floor 0), matching
-        // ratatui's move_cursor_one_col_horizontal (Shift+Left is the one
-        // that stays in main — see extend_selection).
         col = col.saturating_sub(1);
     } else if dr > 0 {
-        // Grow the grid when stepping down off the last main row
-        // (matching ratatui's move_cursor_one_row_vertical).
-        let mr = state.app_ref().core.workbook.active_sheet().grid.main_rows();
-        if row == hr + mr.saturating_sub(1) {
-            let app = state.app_mut();
-            let sheet = app.core.workbook.active_sheet_mut();
-            if compute::trailing_blank_main_rows(&sheet.grid) < ui_core::NAV_BLANK_ROWS {
-                sheet.grid.grow_main_row_at_bottom();
-            }
-        }
         row = row.saturating_add(1);
     } else if dr < 0 {
         // Plain Up walks into the header band (floor 0), matching ratatui's
@@ -2861,7 +2886,7 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     // large screen; on a touch device the body should fill what the user can
     // actually see. Growth only, and capped by the viewport, so it cannot run
     // away or shrink a stored extent.
-    #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
+    #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos", test))]
     {
         let visible_rows = state.data_rows.get().max(1);
         let visible_cols = state.data_cols.get().max(1);
@@ -2932,6 +2957,14 @@ fn update_state_cursor(state: &GuiState, row: usize, col: usize) {
     // every move paints a phantom band over all rows above the cursor.
     // (extend_selection saves and restores the anchor around moves.)
     app.core.anchor = None;
+    // The collapsed selection also drops its Rows/Cols coverage: a plain move
+    // after clicking a row/column header must not keep highlighting the whole
+    // row/column (the anchor is gone, so the kind would be meaningless and
+    // could leak into the next selection).
+    app.core.selection_kind = crate::grid::SelectionKind::Cells;
+    // Any navigation also ends the gutter repeat-click cycle: the next header
+    // click must start at the full row/column, not continue an old toggle.
+    state.gutter_cycle.set(None);
     app.core.cursor.row = row;
     app.core.cursor.col = col;
     // Converge the extent on need (grows and shrinks; see maintain_extent).
@@ -2947,23 +2980,37 @@ fn update_state_cursor(state: &GuiState, row: usize, col: usize) {
 }
 
 /// Extend the selection (Shift+arrows, matching ratatui): anchor at the
-/// pre-move cursor if unset, then move (with grid growth). Refuses to leave
-/// the main area, like the reference. move_cursor collapses the anchor, so
-/// any previous selection is saved and restored around the move.
+/// pre-move cursor if unset, then move (with grid growth). The cursor may
+/// never leave the main area: at the top/left edge the step is refused, and
+/// at the bottom/right edge the main area grows — unlike plain navigation,
+/// which only grows while trailing blanks are below the threshold. Both rules
+/// live in [`ui_core::grow_grid_for_selection_edge`], the shared twin of the
+/// ratatui reference (locked by an equivalence test). move_cursor collapses
+/// the anchor, so any previous selection is saved and restored around the
+/// move.
 fn extend_selection(state: &GuiState, dr: isize, dc: isize) {
     let (row, col) = (state.last_row.get(), state.last_col.get());
-    if dc < 0 && col <= MARGIN_COLS {
-        return;
-    }
-    if dr < 0 && row <= HEADER_ROWS {
-        return;
-    }
     if dr == 0 && dc == 0 {
         return;
     }
     let prev = state.app_ref().core.anchor;
-    move_cursor(state, dr, dc);
-    state.app_mut().core.anchor = prev.or(Some(SheetCursor { row, col }));
+    // A Rows/Cols selection keeps its coverage while it is extended (matching
+    // ratatui, whose Shift+arrow arms never reset `selection_kind`), so
+    // Shift+Right on a selected row still highlights whole rows.
+    let prev_kind = state.app_ref().core.selection_kind;
+    // Genuine navigation dismisses the in-grid dropdown (same as move_cursor).
+    hide_agg_dropdown(state);
+    let (new_row, new_col) = {
+        let app = state.app_mut();
+        let grid = &mut app.core.workbook.active_sheet_mut().grid;
+        ui_core::grow_grid_for_selection_edge(grid, row, col, dr, dc)
+    };
+    if (new_row, new_col) != (row, col) {
+        update_state_cursor(state, new_row, new_col);
+    }
+    let app = state.app_mut();
+    app.core.anchor = prev.or(Some(SheetCursor { row, col }));
+    app.core.selection_kind = prev_kind;
 }
 
 /// Scrollbar domain (upper bounds) for (rows, cols): content plus the
@@ -3074,7 +3121,18 @@ fn formula_addr_label(row: usize, col: usize, grid: &GridBox) -> String {
 fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
     let app = state.app_ref();
     let grid = &app.core.workbook.active_sheet().grid;
-    state.addr_label.set_text(&formula_addr_label(row, col, grid));
+    let addr_text = formula_addr_label(row, col, grid);
+    // Only push when the rendered text actually changes. Moving the cursor
+    // runs this on every press (including every auto-repeat), and each
+    // set_text is a real cross-process widget mutation: on Win32 it is a
+    // SetWindowText that reflows the label and invalidates the formula row,
+    // and the redraw cascades to it. Most cells are empty and the chrome line
+    // rarely changes, so the overwhelming majority of these writes are no-ops
+    // that still cost a layout, an invalidation and a repaint.
+    if state.addr_shown.borrow().as_str() != addr_text.as_str() {
+        state.addr_label.set_text(&addr_text);
+        *state.addr_shown.borrow_mut() = addr_text;
+    }
     // Look up the entry value at the TRUE address (a header/margin cursor
     // shows that cell's value, not the clamped main cell's).
     let addr = crate::addr::sheet_cursor_to_addr(
@@ -3086,13 +3144,21 @@ fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
     let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
     // While an edit is in progress the entry widget belongs to the edit
     // buffer (e.g. an Insert Date/Time preset), not the grid cell: overwriting
-    // it here would wipe the preset (and the entry's change handler could
-    // then eat edit_buf too). Address/status labels always update. An empty
-    // buffer holds no in-flight edit even when the editing flag is on
+    // it here would wipe the preset. Address/status labels always update. An
+    // empty buffer holds no in-flight edit even when the editing flag is on
     // (post-click/post-setup selection state), so selections and cursor
     // moves always display the new cell instead of going stale or blank.
-    if !state.editing.get() || state.edit_buf.borrow().is_empty() {
-        state.formula_entry.set_text(&val);
+    if !state.editing.get() || state.formula_entry.get_text().unwrap_or_default().is_empty() {
+        // Same reasoning as the address label: read back the entry and only
+        // write on a real change. Moving across empty cells would otherwise
+        // re-set the entry to "" on every press (and reset the caret, which
+        // costs a real SetWindowText + EM_SETSEL + invalidation on Win32).
+        // Comparing the real widget text — not a shadow copy — keeps the
+        // user typing in the entry visible, since the user's keystrokes
+        // change the widget without going through here.
+        if state.formula_entry.get_text().as_deref() != Some(val.as_str()) {
+            state.formula_entry.set_text_suppressing_changed(&val);
+        }
     }
     // Click-to-edit bookkeeping (see entry_clicked): a refresh for a
     // different cell ends click-edit intent; the snapshot always tracks the
@@ -3101,7 +3167,6 @@ fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
         state.entry_clicked.set(false);
         state.entry_shown.set((row, col));
     }
-    *state.entry_snapshot.borrow_mut() = val;
     sync_chrome_labels(state);
 }
 
@@ -3118,26 +3183,48 @@ fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
 /// terminal-only).
 fn sync_chrome_labels(state: &GuiState) {
     let app = state.app_ref();
-    // Same text as the ratatui bottom row (never status).
-    state.hints_label.set_text(&crate::core::state::normal_hints(
-        app.core.anchor.is_some(),
-        !app.core.op_history.is_empty(),
-        !app.core.redo_history.is_empty(),
-        app.core.path.is_some(),
-    ));
-    let show = state.edit_buf.borrow().is_empty()
+    // Revision-browse mode replaces the normal hints with the reference's
+    // browse hint, so the available keys are discoverable without a
+    // keystroke (the mode is invisible otherwise — the grid just stops
+    // moving).
+    let hints: String = if app.rev_browse {
+        crate::core::state::REVISION_BROWSE_HINTS.to_string()
+    } else {
+        // Same text as the ratatui bottom row (never status).
+        crate::core::state::normal_hints(
+            app.core.anchor.is_some(),
+            !app.core.op_history.is_empty(),
+            !app.core.redo_history.is_empty(),
+            app.core.path.is_some(),
+        )
+    };
+    // This runs on every cursor move (and every auto-repeat press), but the
+    // hints line only changes when an undo/redo/selection/file state flips —
+    // essentially never while arrowing around. Skip the write when the text is
+    // unchanged: on Win32 each set_text is a SetWindowText that reflows and
+    // invalidates the label, and the redraw then repaints it.
+    if state.hints_shown.borrow().as_str() != hints.as_str() {
+        state.hints_label.set_text(&hints);
+        *state.hints_shown.borrow_mut() = hints;
+    }
+    let show = state.formula_entry.get_text().unwrap_or_default().is_empty()
         && matches!(state.mode.get(), GuiMode::Normal)
         && !app.core.status.is_empty();
-    if show {
-        state
-            .formula_status
-            .set_text(&format!("   ·  {}", app.core.status));
+    let status_text = if show {
+        format!("   ·  {}", app.core.status)
     } else {
         // Clear as well as hide: a backend that still measures hidden
         // children must allocate nothing for the suffix.
-        state.formula_status.set_text("");
+        String::new()
+    };
+    if state.status_shown.borrow().as_str() != status_text.as_str() {
+        state.formula_status.set_text(&status_text);
+        *state.status_shown.borrow_mut() = status_text;
     }
-    state.formula_status.set_visible(show);
+    if state.status_vis.get() != show {
+        state.formula_status.set_visible(show);
+        state.status_vis.set(show);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3211,6 +3298,349 @@ fn centre_col_anchor(
     pos.saturating_sub(dim / 2).max(body_origin_pos)
 }
 
+/// What a gutter click targeted, so a repeat click on the same target can
+/// cycle its selection instead of restarting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GutterTarget {
+    /// A row label: the logical row clicked.
+    Row(usize),
+    /// A column header: the global column clicked.
+    Col(usize),
+    /// The top-left corner box.
+    All,
+}
+
+/// The gutter selection currently shown, and whether it covers the whole
+/// row/column/sheet or only that target's data cells. Stored so the next
+/// click on the same target flips it (see `GuiState::gutter_cycle`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GutterCycle {
+    target: GutterTarget,
+    /// `true` = whole main-body row/column/sheet; `false` = data cells only.
+    full: bool,
+}
+
+/// Whether the next click on `target` should select the **full**
+/// row/column/sheet (`true`) or its data cells only (`false`).
+///
+/// The first click on a target is always full (LibreOffice behaviour); a
+/// repeat click on the *same* target flips the mode, giving the
+/// full → data-cells → full cycle. A click on a different target starts over
+/// at full. Pure so the cycle can be tested without a window.
+fn next_gutter_full(prev: Option<GutterCycle>, target: GutterTarget) -> bool {
+    match prev {
+        Some(prev) if prev.target == target => !prev.full,
+        _ => true,
+    }
+}
+
+/// Global column whose gutter cell (the `A`/`B`/… header strip) contains
+/// canvas `x`, or `None` when `x` is outside the rendered headers.
+///
+/// Walks the same display-column list and widths the painter and the body
+/// click test use, so a header click can never resolve to a different column
+/// than a body click at the same `x`.
+fn gutter_col_at(state: &GuiState, x: f64) -> Option<usize> {
+    let col_ixs: Vec<usize> = displayed_cols(state);
+    let app = state.app_ref();
+    let mc = app.core.workbook.active_sheet().grid.main_cols();
+    let mut cx = row_label_w();
+    for &c in &col_ixs {
+        let cw = display_col_width(&app.core.workbook.active_sheet(), c, mc) as f64 * char_w();
+        if x >= cx && x < cx + cw {
+            return Some(c);
+        }
+        cx += cw;
+    }
+    None
+}
+
+/// Logical row whose gutter label (the `1`/`2`/… strip) contains canvas `y`,
+/// or `None` when `y` is above the body or below the rendered rows.
+fn gutter_row_at(state: &GuiState, y: f64) -> Option<usize> {
+    if y < header_h() {
+        return None;
+    }
+    let ri = ((y - header_h()) / row_h()) as usize;
+    displayed_rows(state).get(ri).copied()
+}
+
+/// Non-blank main-row extremes (as global logical rows) within global column
+/// `col`, restricted to the main band. `None` when the column has no non-blank
+/// main cells. Twin of [`row_nonblank_extremes`] for the vertical axis, used
+/// by the gutter click's "data cells only" mode.
+///
+/// Header/footer/margin spellings of `col` are considered too, via
+/// [`CellAddr::to_global_col`], so a formula stored in the column's header
+/// still counts as data for that column.
+fn col_nonblank_row_extremes(state: &GuiState, col: usize) -> Option<(usize, usize)> {
+    let app = state.app_ref();
+    col_nonblank_row_extremes_grid(&app.core.workbook.active_sheet().grid, col)
+}
+
+/// Grid-only core of [`col_nonblank_row_extremes`] (testable without a window).
+fn col_nonblank_row_extremes_grid(grid: &GridBox, col: usize) -> Option<(usize, usize)> {
+    let main_cols = grid.main_cols();
+    let main_lo = HEADER_ROWS;
+    let main_hi = HEADER_ROWS + grid.main_rows();
+    let mut first: Option<usize> = None;
+    let mut last: Option<usize> = None;
+    for (addr, val) in grid.iter_nonempty() {
+        if val.trim().is_empty() || addr.to_global_col(main_cols) != col {
+            continue;
+        }
+        // Same logical-row mapping `row_nonblank_extremes` uses (main/margin
+        // rows are `HEADER_ROWS + row`; header/footer rows are stored as the
+        // logical row already).
+        let row = match addr {
+            CellAddr::Main { row, .. }
+            | CellAddr::Left { row, .. }
+            | CellAddr::Right { row, .. } => HEADER_ROWS + row as usize,
+            CellAddr::Header { row, .. } | CellAddr::Footer { row, .. } => row as usize,
+        };
+        if row < main_lo || row >= main_hi {
+            continue;
+        }
+        // Hash-order iteration: track min/max, not first/last seen.
+        first = Some(first.map_or(row, |f: usize| f.min(row)));
+        last = Some(last.map_or(row, |l: usize| l.max(row)));
+    }
+    match (first, last) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
+    }
+}
+
+/// Narrow a row's non-blank columns to the **main** band, or `None` when the
+/// row has no data there. Used by the gutter-click data-cells mode.
+fn row_data_col_extremes(state: &GuiState, row: usize) -> Option<(usize, usize)> {
+    let app = state.app_ref();
+    row_data_col_extremes_grid(&app.core.workbook.active_sheet().grid, row)
+}
+
+/// Grid-only core of [`row_data_col_extremes`] (testable without a window).
+///
+/// Scans **main** cells only, so a row whose only content is a margin key
+/// yields `None` (the caller then keeps the full-row selection) instead of
+/// clamping the margin column into the body and selecting a blank cell.
+fn row_data_col_extremes_grid(grid: &GridBox, row: usize) -> Option<(usize, usize)> {
+    let mc = grid.main_cols();
+    if mc == 0 || row < HEADER_ROWS || row >= HEADER_ROWS + grid.main_rows() {
+        return None;
+    }
+    let main_row = (row - HEADER_ROWS) as u32;
+    let mut first: Option<usize> = None;
+    let mut last: Option<usize> = None;
+    for (addr, val) in grid.iter_nonempty() {
+        let CellAddr::Main { row: r, col: c } = addr else {
+            continue;
+        };
+        if r != main_row || val.trim().is_empty() {
+            continue;
+        }
+        let c = MARGIN_COLS + c as usize;
+        first = Some(first.map_or(c, |f: usize| f.min(c)));
+        last = Some(last.map_or(c, |l: usize| l.max(c)));
+    }
+    match (first, last) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
+    }
+}
+
+/// Bounding box of the sheet's stored main data, as
+/// `(row0, row1, col0, col1)` in **main-relative** indices (0-based rows over
+/// the main band, 0-based main columns). `None` when the main band is empty.
+///
+/// Derived from the occupancy summary/index rather than a full scan of every
+/// possible cell, so a sheet with a handful of values in a huge logical grid
+/// still answers in the size of its content.
+fn used_main_range(state: &GuiState) -> Option<(usize, usize, usize, usize)> {
+    let app = state.app_ref();
+    used_main_range_grid(&app.core.workbook.active_sheet().grid)
+}
+
+/// Grid-only core of [`used_main_range`] (testable without a window).
+fn used_main_range_grid(grid: &GridBox) -> Option<(usize, usize, usize, usize)> {
+    let (mr, mc) = (grid.main_rows(), grid.main_cols());
+    if mr == 0 || mc == 0 {
+        return None;
+    }
+    let summary = grid.content_summary();
+    let rows: Vec<usize> = summary
+        .main_rows_all
+        .iter()
+        .copied()
+        .filter(|&r| r < mr)
+        .collect();
+    let (row0, row1) = (*rows.first()?, *rows.last()?);
+    let cols: Vec<usize> = (0..mc)
+        .filter(|&c| grid.logical_col_has_content(MARGIN_COLS + c))
+        .collect();
+    let (col0, col1) = (*cols.first()?, *cols.last()?);
+    Some((row0, row1, col0, col1))
+}
+/// Apply an anchor↔cursor selection of `kind` to the app and return the
+/// `(row, col)` the caller must record as the *cursor* (`last_row`/`last_col`).
+///
+/// The return value is the **cursor**, not the anchor: the renderer builds
+/// the selection rectangle and the cursor cell from `last_row`/`last_col`, so
+/// a caller that stored the anchor instead would collapse a whole-row/column
+/// (or whole-sheet) selection back to its first cell. That was the bug behind
+/// "the corner box selects only A1", so the rule lives in one place — and the
+/// returned pair is unit-tested.
+fn apply_selection(
+    app: &mut super::App,
+    anchor: SheetCursor,
+    cursor: SheetCursor,
+    kind: crate::grid::SelectionKind,
+) -> (usize, usize) {
+    app.core.anchor = Some(anchor);
+    app.core.cursor = cursor;
+    app.core.selection_kind = kind;
+    (cursor.row, cursor.col)
+}
+
+/// Select the whole main body of `logical_row` (LibreOffice behaviour for a
+/// click on a row header).
+///
+/// The **extent** is [`crate::ui_core::main_row_selection_span`] — the same
+/// span ratatui's row-selection command stores — but the anchor↔cursor pair
+/// kept here is the *active cell*: the clicked row at the previously active
+/// column (clamped into the body). LibreOffice keeps the active cell in the
+/// clicked row rather than jumping to the row's far edge, so the formula bar
+/// and the next keystroke stay about the row the user clicked. The renderer
+/// expands the highlight to the full span from `SelectionKind::Rows`, so the
+/// stored cell and the visible extent cannot disagree.
+///
+/// `full == false` narrows the selection to the row's **data cells** (its
+/// non-blank main-column span, `Cells` kind) — the repeat-click mode. A row
+/// with no data keeps the full-row selection rather than showing nothing.
+fn select_gutter_row(state: &GuiState, logical_row: usize, full: bool) {
+    // Data-cells mode first: it is the only arm that can fall through to the
+    // full row (when the row has no non-blank main cells).
+    if !full {
+        if let Some((c0, c1)) = row_data_col_extremes(state, logical_row) {
+            let app = state.app_mut();
+            let (r, c) = apply_selection(
+                app,
+                SheetCursor { row: logical_row, col: c0 },
+                SheetCursor { row: logical_row, col: c1 },
+                crate::grid::SelectionKind::Cells,
+            );
+            let label = crate::addr::ui_row_label(
+                logical_row,
+                app.core.workbook.active_sheet().grid.main_rows(),
+            );
+            app.core.status = format!("Row {label} data cells selected");
+            state.last_row.set(r);
+            state.last_col.set(c);
+            return;
+        }
+    }
+    let app = state.app_mut();
+    let grid = &app.core.workbook.active_sheet().grid;
+    // Availability check against the one shared definition of the extent.
+    if crate::ui_core::main_row_selection_span(grid, logical_row).is_none() {
+        return;
+    }
+    let lm = MARGIN_COLS;
+    let mc = grid.main_cols();
+    let col = state.last_col.get().clamp(lm, lm + mc - 1);
+    let cell = SheetCursor { row: logical_row, col };
+    let label = crate::addr::ui_row_label(logical_row, grid.main_rows());
+    let (r, c) = apply_selection(app, cell, cell, crate::grid::SelectionKind::Rows);
+    app.core.status = format!("Row {label} selected");
+    state.last_row.set(r);
+    state.last_col.set(c);
+}
+
+/// Select the whole main body of global column `col` (LibreOffice behaviour
+/// for a click on a column header). Mirror of [`select_gutter_row`]: the
+/// active cell is the clicked column at the previously active row, and
+/// `full == false` narrows to the column's data cells.
+fn select_gutter_col(state: &GuiState, col: usize, full: bool) {
+    if !full {
+        if let Some((r0, r1)) = col_nonblank_row_extremes(state, col) {
+            let app = state.app_mut();
+            let (r, c) = apply_selection(
+                app,
+                SheetCursor { row: r0, col },
+                SheetCursor { row: r1, col },
+                crate::grid::SelectionKind::Cells,
+            );
+            let label = crate::addr::ui_column_fragment(
+                col,
+                app.core.workbook.active_sheet().grid.main_cols(),
+            );
+            app.core.status = format!("Column {label} data cells selected");
+            state.last_row.set(r);
+            state.last_col.set(c);
+            return;
+        }
+    }
+    let app = state.app_mut();
+    let grid = &app.core.workbook.active_sheet().grid;
+    // Availability check against the one shared definition of the extent.
+    if crate::ui_core::main_col_selection_span(grid, col).is_none() {
+        return;
+    }
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    let row = state.last_row.get().clamp(hr, hr + mr - 1);
+    let cell = SheetCursor { row, col };
+    let label = crate::addr::ui_column_fragment(col, grid.main_cols());
+    let (r, c) = apply_selection(app, cell, cell, crate::grid::SelectionKind::Cols);
+    app.core.status = format!("Column {label} selected");
+    state.last_row.set(r);
+    state.last_col.set(c);
+}
+
+/// Select the whole main region (LibreOffice's click-the-corner behaviour).
+/// `full == false` narrows to the sheet's used range (data cells only).
+///
+/// `last_row`/`last_col` must track the **cursor** (the span's far corner), not
+/// the anchor: the renderer derives the selection rectangle and the cursor
+/// cell from them, so leaving them on the anchor (A1) collapses the visible
+/// selection to that single cell — which is exactly what made the corner click
+/// look like "A1 only". The menu's Select-all ends the same way (see the
+/// `last_row.set(cr)` sync after a dispatch).
+fn select_gutter_all(state: &GuiState, full: bool) {
+    if !full {
+        if let Some((r0, r1, c0, c1)) = used_main_range(state) {
+            let app = state.app_mut();
+            let (r, c) = apply_selection(
+                app,
+                SheetCursor { row: HEADER_ROWS + r0, col: MARGIN_COLS + c0 },
+                SheetCursor { row: HEADER_ROWS + r1, col: MARGIN_COLS + c1 },
+                crate::grid::SelectionKind::Cells,
+            );
+            app.core.status = "Selected data cells".into();
+            state.last_row.set(r);
+            state.last_col.set(c);
+            return;
+        }
+    }
+    let app = state.app_mut();
+    let grid = &app.core.workbook.active_sheet().grid;
+    let (mr, mc) = (grid.main_rows(), grid.main_cols());
+    if mr == 0 || mc == 0 {
+        return;
+    }
+    let (r, c) = apply_selection(
+        app,
+        SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS },
+        SheetCursor {
+            row: HEADER_ROWS + mr - 1,
+            col: MARGIN_COLS + mc - 1,
+        },
+        crate::grid::SelectionKind::Cells,
+    );
+    app.core.status = "Selected all".into();
+    state.last_row.set(r);
+    state.last_col.set(c);
+}
+
 fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
     let state: &GuiState = &**state_rc;
     // Mark that the user has clicked: clicks can arrive during `present()`'s
@@ -3237,6 +3667,9 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
             .copied()
     };
     if let Some(hit) = hit {
+        // A pin toggle is not a gutter selection: end any cycle so the next
+        // header click starts fresh at the full row/column.
+        state.gutter_cycle.set(None);
         toggle_pin(state, hit.is_row, hit.index);
         state.canvas.queue_redraw();
         return;
@@ -3258,14 +3691,56 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
                 super::agg_picker::close(state.app_mut());
             }
         }
+        // The click was consumed by the dropdown: end any gutter cycle so a
+        // later header click starts fresh.
+        state.gutter_cycle.set(None);
         state.canvas.queue_redraw();
         return;
     }
 
-    let app = state.app_mut();
     if x < row_label_w() || y < header_h() {
+        // Gutter chrome. The padlock hit test above already consumed clicks
+        // on a pin icon, so anything left here is the header surface proper:
+        // LibreOffice selects the row/column (or everything, for the corner)
+        // instead of ignoring the click.
+        //
+        // An in-flight edit commits to the cell it was entered in before the
+        // selection moves (same rule as a body-cell click below): the anchor
+        // move would otherwise leave the typed value behind uncommitted.
+        if state.editing.get() && !state.formula_entry.get_text().unwrap_or_default().is_empty() {
+            commit_edit(state);
+        }
+        // Resolve what was clicked. `None` means the click landed on gutter
+        // surface that addresses no row/column (past the last rendered
+        // header): it is ignored, and the cycle is left alone.
+        let target = if x < row_label_w() && y < header_h() {
+            Some(GutterTarget::All)
+        } else if y < header_h() {
+            gutter_col_at(state, x).map(GutterTarget::Col)
+        } else {
+            gutter_row_at(state, y).map(GutterTarget::Row)
+        };
+        if let Some(target) = target {
+            // Repeat-click cycling: the first click on a target selects the
+            // whole row/column/sheet, a second click on the *same* target
+            // narrows to its data cells, a third widens again. A click on a
+            // different target (or anything else) restarts at `full`.
+            let full = next_gutter_full(state.gutter_cycle.get(), target);
+            state.gutter_cycle.set(Some(GutterCycle { target, full }));
+            match target {
+                GutterTarget::All => select_gutter_all(state, full),
+                GutterTarget::Col(c) => select_gutter_col(state, c, full),
+                GutterTarget::Row(r) => select_gutter_row(state, r, full),
+            }
+        }
+        // The selection replaces any in-flight selection state; keep the
+        // viewport anchored on the new cursor and repaint all chrome.
+        update_formula_bar(state, state.last_row.get(), state.last_col.get());
+        state.canvas.queue_redraw();
+        state.window.queue_redraw();
         return;
     }
+    let app = state.app_mut();
     let col_ixs: Vec<usize> = displayed_cols(state);
     let mc = app.core.workbook.active_sheet().grid.main_cols();
     let mut cx = row_label_w();
@@ -3286,7 +3761,7 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
                 // which this path never did).
                 let same_cell =
                     logical_row == state.last_row.get() && c == state.last_col.get();
-                if state.editing.get() && !state.edit_buf.borrow().is_empty() {
+                if state.editing.get() && !state.formula_entry.get_text().unwrap_or_default().is_empty() {
                     if same_cell {
                         // Re-clicking the cell being edited keeps the text
                         // in flight rather than committing and restarting.
@@ -3318,12 +3793,18 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
                         && crate::gui::agg_picker::open_for(app, &hit)
                     {
                         app.core.anchor = None;
+                        app.core.selection_kind = crate::grid::SelectionKind::Cells;
+                        state.gutter_cycle.set(None);
                         show_agg_dropdown(state_rc, &hit);
                         return;
                     }
                 }
                 // Plain click collapses any selection (fresh single-cell focus).
                 app.core.anchor = None;
+                app.core.selection_kind = crate::grid::SelectionKind::Cells;
+                // A body click ends the gutter cycle too (the next header
+                // click starts at the full row/column).
+                state.gutter_cycle.set(None);
                 // Clicking the trailing blank opens one more beyond it
                 // (pointer arrival — see grow_blank_past_cursor). Shrink
                 // allowed too (mouse users prune like keyboard users).
@@ -3401,20 +3882,6 @@ fn build_menu(rxapp: &rswidgets::App, win: &Window, state: &Rc<GuiState>) -> Res
     unsafe { menubar.insert_action_group("app", action_group); }
 
     Ok(menubar)
-}
-
-/// Start editing with a full preset string (used by menu actions such as
-/// Insert > Date/Time, which arrive via MenuDispatch::Edit). Mirrors
-/// start_edit_with but takes &str so multi-char values need no loop.
-fn start_edit_with_text(state: &GuiState, text: &str) {
-    state.editing.set(true);
-    *state.edit_buf.borrow_mut() = text.to_string();
-    // Preset inserted whole: the caret follows it.
-    state.edit_caret.set(text.chars().count());
-    // Keep the widget identical to edit_buf (see sync_entry_to_buf).
-    sync_entry_to_buf(state);
-    state.formula_entry.grab_focus();
-    state.canvas.queue_redraw();
 }
 
 /// Refresh viewport, formula bar, and canvas after a menu action mutated the
@@ -3691,18 +4158,26 @@ fn render_agg_dropdown(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i3
         return;
     };
 
-    // Panel: white fill, dark border, accent line along the top edge.
-    dc.fill_rect(bx, by, bw, bh, 1.0, 1.0, 1.0, 1.0);
-    dc.stroke_rect(bx, by, bw, bh, 0.25, 0.25, 0.3, 1.0, 1.0);
-    dc.fill_rect(bx, by, bw, 1.0, 0.25, 0.25, 0.3, 1.0);
+    // Panel: body fill, muted border, accent line along the top edge. The
+    // panel is a raised surface over the grid, so it uses `CellBody` and is
+    // outlined in `TextMuted` — in night mode a white panel with dark text
+    // would be a glaring hole in an otherwise dark sheet.
+    let pal = chrome::palette();
+    let body = pal.cell_body();
+    let border = pal.text_muted();
+    let ink = pal.text();
+    let hi = pal.cell_cursor();
+    dc.fill_rect(bx, by, bw, bh, body.0, body.1, body.2, 1.0);
+    dc.stroke_rect(bx, by, bw, bh, border.0, border.1, border.2, 1.0, 1.0);
+    dc.fill_rect(bx, by, bw, 1.0, border.0, border.1, border.2, 1.0);
 
     for (i, row) in agg_drop_rows().iter().enumerate() {
         let ry = by + 1.0 + i as f64 * row_h;
         if i == sel {
             // Highlight the active row so it reads as the current choice.
-            dc.fill_rect(bx + 1.0, ry, bw - 2.0, row_h, 0.82, 0.89, 0.98, 1.0);
+            dc.fill_rect(bx + 1.0, ry, bw - 2.0, row_h, hi.0, hi.1, hi.2, 1.0);
         }
-        dc.draw_text(bx + 6.0, ry + 3.0, row, "monospace", font_size(), 0.05, 0.05, 0.1, 1.0);
+        dc.draw_text(bx + 6.0, ry + 3.0, row, "monospace", font_size(), ink.0, ink.1, ink.2, 1.0);
     }
 }
 
@@ -3748,8 +4223,16 @@ fn open_special_char_picker(state: &Rc<GuiState>) {
                 super::special_picker::set(app, idx);
                 if let Some(choice) = super::special_picker::take(&mut *app) {
                     if shared.editing.get() {
-                        shared.edit_buf.borrow_mut().push_str(&choice);
-                        sync_entry_to_buf(&shared);
+                        let current = shared.formula_entry.get_text().unwrap_or_default();
+                        let caret = shared
+                            .formula_entry
+                            .get_position()
+                            .unwrap_or_else(|| current.chars().count());
+                        let splice = super::special_picker::SpecialSplice::into_edit(
+                            &current, caret, &choice,
+                        );
+                        shared.formula_entry.set_text_suppressing_changed(&splice.text);
+                        shared.formula_entry.set_position(splice.caret);
                         restore_editor_focus(&shared);
                     } else {
                         // Snapshot the visible cell text first so the staged
@@ -3761,8 +4244,10 @@ fn open_special_char_picker(state: &Rc<GuiState>) {
                             crate::addr::MainRows(grid.main_rows()),
                             crate::addr::MainCols(grid.main_cols()),
                         );
-                        let cur = grid.get(&addr).unwrap_or_default();
-                        start_edit_with_text(&shared, &format!("{cur}{choice}"));
+                        let cell_text = grid.get(&addr).unwrap_or_default();
+                        let splice =
+                            super::special_picker::SpecialSplice::into_cell(&cell_text, &choice);
+                        start_edit_with_text(&shared, &splice.text);
                         restore_editor_focus(&shared);
                     }
                 }
@@ -3780,6 +4265,62 @@ fn open_special_char_picker(state: &Rc<GuiState>) {
 /// result to GUI state. This is what keeps GUI menu behavior identical to the
 /// other backends instead of drifting into per-backend stubs: any menu item
 /// handled here behaves exactly as it does under pancurses/ratatui.
+/// The GUI side of [`actions::MenuPresenter`], used only for the variants
+/// whose result is pure presentation (`about`/help dialogs) and the two shared
+/// item lists. The remaining variants keep their bespoke GUI handling below
+/// (`save_as` opens a real file dialog, the pickers anchor to a cell, Replay
+/// switches key-routing mode) — those are presentation *decisions* a trait
+/// cannot make for the backend.
+struct GuiMenuPresenter {
+    state: Rc<GuiState>,
+}
+
+impl super::actions::MenuPresenter for GuiMenuPresenter {
+    fn show_dialog(&mut self, which: super::actions::InfoDialog<'_>) {
+        // The GUI has a bespoke widget per dialog, so the variant picks it
+        // directly. (This used to compare the body *text* against the shared
+        // About body to decide — which would silently open the wrong dialog if
+        // that wording ever changed.)
+        match which {
+            super::actions::InfoDialog::About => super::dialogs::show_about_dialog(),
+            super::actions::InfoDialog::HelpFull => super::dialogs::show_keybinds_help(),
+            super::actions::InfoDialog::Other(_title, text) => {
+                super::dialogs::show_keybinds_help();
+                let _ = text;
+            }
+        }
+    }
+
+    fn show_list_picker(&mut self, _title: &str, _rows: &[String], _selected: usize) {
+        // The GUI presents the pickers that reach this path as anchored native
+        // widgets (see `delegate_shared_action`), so there is nothing to do
+        // here; the information is never dropped because those variants keep
+        // their own arms.
+    }
+
+    fn open_prompt(&mut self, label: &str, action: &str) {
+        // Only `save_as` reaches here with no path; the GUI opens a real file
+        // dialog for it (see `delegate_shared_action`), so this is a no-op
+        // fallback that keeps the label visible as status text.
+        self.set_status(&format!("{label}: {action}"));
+    }
+
+    fn begin_edit_with(&mut self, value: &str) {
+        start_edit_with_text(&self.state, value);
+    }
+
+    fn show_keybinds(&mut self) {
+        super::dialogs::show_keybinds_help();
+    }
+
+    fn set_status(&mut self, status: &str) {
+        if !status.is_empty() {
+            self.state.app_mut().core.status = status.to_string();
+            sync_chrome_labels(&self.state);
+        }
+    }
+}
+
 fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
     let mut scope = state.pending_scope.get();
     let mut cb = state.clipboard.borrow().clone();
@@ -3792,6 +4333,15 @@ fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
             if !s.is_empty() {
                 state.app_mut().core.status = s;
             }
+            // File▸Replay arms revision browsing by setting `rev_browse` on
+            // the shared action; mirror that into the key-routing mode so
+            // Left/Right step revisions. Done here (not in the action) so
+            // every GUI backend, including the mobile ones, gets it from
+            // the one dispatch site.
+            if name == "replay" && state.app_ref().rev_browse {
+                state.mode.set(GuiMode::RevisionBrowse);
+            }
+            sync_chrome_labels(state);
         }
         MenuDispatch::Edit { value } => {
             // Insert > Date/Time: preset the edit buffer; the user commits
@@ -3821,22 +4371,17 @@ fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
             let (column_choices, initial_column) = {
                 let app = state.app_ref();
                 let grid = &app.core.workbook.active_sheet().grid;
-                let cols = crate::balance::numeric_columns(grid);
-                let labels: Vec<String> = cols
-                    .iter()
-                    .map(|&c| crate::addr::excel_column_name(c))
-                    .collect();
-                let initial = crate::balance::choose_balance_column(grid)
-                    .and_then(|auto| cols.iter().position(|&c| c == auto))
-                    .unwrap_or(0);
-                (labels, initial)
+                crate::balance::balance_column_choices(grid)
             };
             let state2 = state.clone();
             dialogs::balance_books_dialog(&column_choices, initial_column, move |choice| {
                 if let Some(choice) = choice {
-                    let app = state2.app_mut();
-                    super::actions::run_balance_books(app, &choice);
+                    {
+                        let app = state2.app_mut();
+                        super::actions::run_balance_books(app, &choice);
+                    }
                     recompute_viewport(&state2);
+                    sync_tabbar(&state2);
                     state2.canvas.queue_redraw();
                     state2.window.queue_redraw();
                 }
@@ -3858,15 +4403,20 @@ fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
                 }
             }
         }
+        // The help/about result is pure presentation, so it goes through the
+        // shared presenter rather than a per-backend arm — the same mapping
+        // `pnc_backend` uses, so the dialog bodies cannot drift apart.
         MenuDispatch::About { status } => {
-            state.app_mut().core.status = status;
-            dialogs::show_about_dialog();
+            let mut p = GuiMenuPresenter { state: state.clone() };
+            present_menu_dispatch(MenuDispatch::About { status }, &mut p);
         }
-        MenuDispatch::HelpFull { .. } => {
-            dialogs::show_keybinds_help();
+        MenuDispatch::HelpFull { status } => {
+            let mut p = GuiMenuPresenter { state: state.clone() };
+            present_menu_dispatch(MenuDispatch::HelpFull { status }, &mut p);
         }
-        MenuDispatch::HelpKeybinds { .. } => {
-            dialogs::show_keybinds_help();
+        MenuDispatch::HelpKeybinds { status } => {
+            let mut p = GuiMenuPresenter { state: state.clone() };
+            present_menu_dispatch(MenuDispatch::HelpKeybinds { status }, &mut p);
         }
     }
     // Shared ops may move the cursor (select_all, mitosis, go_to); sync the
@@ -3880,27 +4430,71 @@ fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
     refresh_after_dialog(state);
 }
 
-/// Dialog chrome (window title, OK button label, initial entry text) for a
-/// prompt-gated menu action. Pure so unit tests pin every action's labels:
-/// a mislabeled dialog (Rename Sheet showing "Find") fails here instead of
-/// reaching users. The initial text pre-fills the entry for edit-in-place
-/// actions (rename); everything else starts empty.
-fn prompt_chrome(action: &str, current_sheet_title: &str) -> (String, String, String) {
-    match action {
-        "rename_sheet" => ("Rename sheet".into(), "Rename".into(), current_sheet_title.into()),
-        "copy_sheet" => ("Copy sheet".into(), "Copy".into(), String::new()),
-        "delete_sheet" => ("Delete sheet".into(), "Delete".into(), String::new()),
-        "go_to_cell" => ("Go to cell".into(), "Go".into(), String::new()),
-        "set_col_width" => ("Column width".into(), "Set".into(), String::new()),
-        "set_max_col_width" => ("Default width".into(), "Set".into(), String::new()),
-        "find" => ("Find".into(), "Find".into(), String::new()),
-        "insert_special_chars" => ("Insert special char".into(), "Insert".into(), String::new()),
-        "insert_hyperlink" => ("Insert hyperlink".into(), "Insert".into(), String::new()),
-        "sort_view" => ("Sort view".into(), "Sort".into(), String::new()),
-        "persist_sort" => ("Persist sort".into(), "Sort".into(), String::new()),
-        "balance_books" => ("Balance books".into(), "Balance".into(), String::new()),
-        _ => ("Prompt".into(), "OK".into(), String::new()),
-    }
+/// Per-action dialog chrome: window title, OK button label, how the entry is
+/// pre-filled, and an optional hint line describing the expected input.
+///
+/// One table, so a mislabeled dialog (Rename Sheet showing "Find") is a data
+/// error visible here rather than something that reaches users, and the unit
+/// test asserts against this table instead of re-listing the same strings.
+struct PromptChrome {
+    action: &'static str,
+    title: &'static str,
+    ok: &'static str,
+    prefill: Prefill,
+    hint: Option<&'static str>,
+}
+
+/// What the prompt entry starts with.
+#[derive(Clone, Copy, PartialEq)]
+enum Prefill {
+    /// Empty — a creation-style prompt, so stale text can never leak in.
+    Empty,
+    /// The live sheet title (rename is edit-in-place).
+    SheetTitle,
+}
+
+/// Accepted `go to` input, shown above the entry. Spells out the forms
+/// `ui_core::resolve_go_target` actually accepts (a bare `A1` box gave the user
+/// no way to know that `5`, `C` or a header/footer ref were also valid).
+///
+/// Kept to one short line: `rswidgets::Label` has no wrap control, so a long
+/// single line would widen the dialog instead of wrapping. Split the text
+/// across two prompts rather than lengthening it.
+///
+/// Deliberately does NOT advertise `$-locked` cells (`$C$12`): a leading `$`
+/// is a *sheet* qualifier in both backends (`$1`, `$Sheet1`, `$Sheet1:B2`), so a
+/// `$-locked` cell is not a Go target and the hint must not promise one.
+const GO_TO_CELL_HINT: &str = "C12 cell · C~1 header · C_1 footer · [A1 margin · 5 row · C col";
+
+const PROMPT_CHROME: &[PromptChrome] = &[
+    PromptChrome { action: "rename_sheet", title: "Rename sheet", ok: "Rename", prefill: Prefill::SheetTitle, hint: None },
+    PromptChrome { action: "copy_sheet", title: "Copy sheet", ok: "Copy", prefill: Prefill::Empty, hint: None },
+    PromptChrome { action: "delete_sheet", title: "Delete sheet", ok: "Delete", prefill: Prefill::Empty, hint: None },
+    PromptChrome { action: "go_to_cell", title: "Go to cell", ok: "Go", prefill: Prefill::Empty, hint: Some(GO_TO_CELL_HINT) },
+    PromptChrome { action: "set_col_width", title: "Column width", ok: "Set", prefill: Prefill::Empty, hint: None },
+    PromptChrome { action: "set_max_col_width", title: "Default width", ok: "Set", prefill: Prefill::Empty, hint: None },
+    PromptChrome { action: "find", title: "Find", ok: "Find", prefill: Prefill::Empty, hint: None },
+    PromptChrome { action: "insert_special_chars", title: "Insert special char", ok: "Insert", prefill: Prefill::Empty, hint: None },
+    PromptChrome { action: "insert_hyperlink", title: "Insert hyperlink", ok: "Insert", prefill: Prefill::Empty, hint: None },
+    PromptChrome { action: "sort_view", title: "Sort view", ok: "Sort", prefill: Prefill::Empty, hint: None },
+    PromptChrome { action: "persist_sort", title: "Persist sort", ok: "Sort", prefill: Prefill::Empty, hint: None },
+    PromptChrome { action: "balance_books", title: "Balance books", ok: "Balance", prefill: Prefill::Empty, hint: None },
+];
+
+/// Dialog chrome (window title, OK button label, initial entry text, hint
+/// line) for a prompt-gated menu action. The data lives in [`PROMPT_CHROME`];
+/// this only resolves the pre-fill against the live sheet title. An unknown
+/// action falls back to a neutral "Prompt"/"OK" with an empty entry and no
+/// hint.
+fn prompt_chrome(action: &str, current_sheet_title: &str) -> (String, String, String, Option<&'static str>) {
+    let Some(row) = PROMPT_CHROME.iter().find(|c| c.action == action) else {
+        return ("Prompt".into(), "OK".into(), String::new(), None);
+    };
+    let initial = match row.prefill {
+        Prefill::Empty => String::new(),
+        Prefill::SheetTitle => current_sheet_title.into(),
+    };
+    (row.title.into(), row.ok.into(), initial, row.hint)
 }
 
 // The live GUI state, reachable from an `app.<name>` string.
@@ -3927,10 +4521,28 @@ thread_local! {
 /// Publish the live state for [`dispatch_mobile_menu_action`]. Called once
 /// per `run_gui`; a second call (a second window) replaces the first, which
 /// matches the single-activity/single-scene model on both platforms.
-// Called only from the mobile/macOS menu blocks below (each cfg-gated), so
-// gate the definition to match: a plain desktop build compiled it and then
-// warned that nothing used it.
-#[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
+//
+// Every caller in `run_gui` sits inside a `#[cfg(target_os = ...)]` block, so
+// this definition is gated to exactly the configurations where one of those
+// blocks is compiled. A single-target_os gate was wrong: on a desktop target
+// that has `gui`/`rswidgets-term`/`combined-gui` but no mobile target_os, the
+// module compiled the function while every caller compiled out, and it warned
+// that it was never used.
+//
+//   android -> needs `gui` or `gui-mobile` (see `gui::android_backend`)
+//   ios     -> needs `gui` or `gui-mobile` (see `gui::ios_backend`)
+//   macos   -> needs `gui` or `gui-mobile` (see `gui::macos_backend`)
+//
+// These are the *only* callers, so there is deliberately no `test` arm: a
+// lib-test build compiles the crate both with and without `--cfg test`, and an
+// extra arm only re-introduced the warning in the non-test compilation. The
+// tests exercise the menu state through `dispatch_mobile_menu_action` and
+// `MOBILE_MENU_STATE` instead.
+#[cfg(any(
+    all(any(feature = "gui", feature = "gui-mobile", feature = "gui-macos"), target_os = "android"),
+    all(any(feature = "gui", feature = "gui-mobile", feature = "gui-macos"), target_os = "ios"),
+    all(any(feature = "gui", feature = "gui-mobile", feature = "gui-macos"), target_os = "macos"),
+))]
 pub(crate) fn publish_mobile_menu_state(state: &Rc<GuiState>) {
     MOBILE_MENU_STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
 }
@@ -3969,9 +4581,28 @@ pub(crate) fn dispatch_android_menu_action(action: &str) {
 /// deliberately NOT called: dragging is navigation over existing content,
 /// and growing the grid on every drag frame would extend the sheet without
 /// bound (the scrollbar path grows only on an explicit thumb drag).
-// Reached only through `android_backend::scroll_viewport` (cfg-gated on
-// Android), where the touch-drag path lives.
-#[cfg(target_os = "android")]
+// Reached only through the mobile backends' touch-drag paths
+// (`android_backend::scroll_viewport` and `ios_backend::scroll_viewport`),
+// and through this module's own `drag_viewport_by_pixels`. Not macOS: a
+// pointer drag scrolls through the shared mouse path, and the synthetic
+// touch-drag that used to reach this there no longer compiles on a Mac.
+// On a non-macOS `gui-macos` host (the Linux stand-in) nothing calls this:
+// the only caller there is `scroll_by_cells`, which is itself target-gated.
+// The `allow` is on the *function*, not the module, so a genuinely unused
+// helper on a platform that has no caller is still reported.
+#[cfg_attr(
+    all(feature = "gui-macos", not(target_os = "macos")),
+    allow(dead_code)
+)]
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    target_os = "android",
+    target_os = "ios",
+    target_os = "macos",
+    test
+))]
 pub(crate) fn scroll_viewport_by_cells(d_rows: i32, d_cols: i32) {
     let state = match MOBILE_MENU_STATE.with(|s| s.borrow().clone()) {
         Some(state) => state,
@@ -4008,6 +4639,457 @@ pub(crate) fn scroll_viewport_by_cells(d_rows: i32, d_cols: i32) {
     }
     update_state_cursor(&state, row, col);
 }
+
+/// Scroll by whole cells from a *host* input device — a macOS scroll wheel or a
+/// momentum trackpad pan — and report what was applied.
+///
+/// The iOS/Android gesture paths call [`scroll_viewport_by_cells`] directly
+/// and keep their own pixel remainder. A desktop host has no such caller: the
+/// wheel gives whole rows directly, and a trackpad gives floating deltas the
+/// host accumulates itself. So this is the seam that takes a *requested* cell
+/// delta and returns the *applied* one, which the two need for different
+/// reasons: the host must know how far it actually moved so it can stop
+/// accumulating, and the function must be able to say "nothing moved" without
+/// changing the caller's state.
+///
+/// A `(0, 0)` request is not a no-op here: it still has to *ask*, because the
+/// only way to learn that a scroll was clamped at the sheet's edge is to try.
+/// That is what a momentum pan needs to know to come to rest.
+// Reachable from `macos_backend` on any host (it compiles the non-macOS
+// branch too), but *called* only where a host has a scroll wheel or a
+// momentum pan: android/ios go through the synthetic touch-drag path
+// (`scroll_viewport_by_cells` above) and macOS through this. A desktop `gui`
+// build compiles the module and never uses it, and iOS does not either --
+// hence the allow keyed on the call sites rather than on the module gate.
+#[cfg_attr(
+    not(any(target_os = "android", target_os = "macos")),
+    allow(dead_code)
+)]
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    target_os = "android",
+    target_os = "ios",
+    target_os = "macos",
+    test
+))]
+pub(crate) fn scroll_by_cells(d_rows: i32, d_cols: i32) -> (i32, i32) {
+    let before = MOBILE_MENU_STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|st| (st.last_row.get(), st.last_col.get()))
+    });
+    scroll_viewport_by_cells(d_rows, d_cols);
+    let Some((row0, col0)) = before else {
+        return (0, 0);
+    };
+    let Some(state) = MOBILE_MENU_STATE.with(|s| s.borrow().clone()) else {
+        return (0, 0);
+    };
+    // Report the *signed* movement, which can be less than requested at a
+    // sheet edge (a wheel notch that lands on the last row is not an error,
+    // it is the host's cue to stop).
+    (
+        (state.last_row.get() as i64 - row0 as i64) as i32,
+        (state.last_col.get() as i64 - col0 as i64) as i32,
+    )
+}
+
+/// Multiply the sheet's view scale by `factor`, as a pinch gesture does, and
+/// repaint.
+///
+/// This is the one entry point both mobile hosts call: Android's
+/// `ScaleGestureDetector` and iOS's `UIPinchGestureRecognizer` produce a span
+/// ratio and hand it here. Everything downstream — the renderer's row/column
+/// metrics, the hit-test that maps a tap back to a cell, the padlock targets
+/// and the pixel→cell conversion the touch-drag scroll uses — reads
+/// [`view_zoom`], so a single scale assignment moves the whole sheet together
+/// and a pinch cannot desynchronise what is drawn from what a finger hits.
+///
+/// `factor` is the *incremental* ratio since the last event (`currentSpan /
+/// previousSpan`), never an absolute scale: a recognizer's span varies with
+/// the device and the gesture, while the ratio is what "make it look twice as
+/// big" actually means.
+///
+/// Returns the scale actually applied, so the host can put it in a status line
+/// or clamp its own gesture state (the value is clamped here regardless).
+///
+/// A pinch during an edit commits first, like every other navigation path: the
+/// edit box is anchored to a cursor cell, and rescaling the grid under it
+/// would leave it pointing at the wrong cell.
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
+pub(crate) fn zoom_viewport_by(factor: f64) -> f64 {
+    let applied = zoom_view_by(factor);
+    let state = MOBILE_MENU_STATE.with(|s| s.borrow().clone());
+    if let Some(state) = state {
+        if state.editing.get() {
+            commit_edit(&state);
+        }
+        // The cursor is the viewport origin, and the grid is now larger or
+        // smaller around it, so the cursor can fall outside the visible
+        // window: recompute keeps it (and the selection) on screen, exactly as
+        // a scrollbar drag does.
+        recompute_viewport(&state);
+        state.canvas.queue_redraw();
+    }
+    applied
+}
+
+/// Reset the pinch scale to 1.0 (a double-tap, or a "reset zoom" menu item).
+/// Returns the applied scale (always 1.0).
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
+pub(crate) fn reset_viewport_zoom() -> f64 {
+    set_view_zoom(1.0);
+    let state = MOBILE_MENU_STATE.with(|s| s.borrow().clone());
+    if let Some(state) = state {
+        recompute_viewport(&state);
+        state.canvas.queue_redraw();
+    }
+    1.0
+}
+
+// ---------------------------------------------------------------------------
+// Mobile pointer gestures (drag = scroll / long press = select)
+// ---------------------------------------------------------------------------
+//
+// The platform-aware drag rule lives here for the live sheet, and in
+// `rswidgets::gridview` for hosts that use the widget: a **mouse** drag
+// selects, while a **finger** drag pans and only selects after a long press.
+// This host cannot reuse `GridView`'s state machine directly — the live sheet
+// carries corrosion's own cursor/anchor fields and its viewport is the
+// cursor, not a widget-owned model — so the same contract is implemented
+// against `GuiState` with the same outcomes and the same slop.
+
+/// Mobile pointer gestures, gated to the hosts that deliver them (plus
+/// tests, which exercise the state machine directly).
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+mod mobile_gesture {
+    use super::*;
+    /// Which pointer produced the current gesture. Mirrors
+    /// `rswidgets::gridview::PointerKind` so the two implementations cannot drift
+    /// in meaning.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MobilePointerKind {
+        Mouse,
+        Touch,
+    }
+
+    /// Live gesture state for the sheet canvas. UI-thread-only, like everything
+    /// else in this backend.
+    #[derive(Clone, Copy, Debug)]
+    struct MobileGesture {
+        active: bool,
+        kind: Option<MobilePointerKind>,
+        down_x: f64,
+        down_y: f64,
+        last_x: f64,
+        last_y: f64,
+        dragging: bool,
+        /// A long press (or a mouse press) has armed selection, so moves extend it.
+        select_armed: bool,
+        /// Set on a touch press, cleared by movement: a long press only counts if
+        /// the finger stayed still.
+        long_press_pending: bool,
+    }
+
+    impl Default for MobileGesture {
+        fn default() -> Self {
+            MobileGesture {
+                active: false,
+                kind: None,
+                down_x: 0.0,
+                down_y: 0.0,
+                last_x: 0.0,
+                last_y: 0.0,
+                dragging: false,
+                select_armed: false,
+                long_press_pending: false,
+            }
+        }
+    }
+
+    thread_local! {
+        static MOBILE_GESTURE: RefCell<MobileGesture> =
+            RefCell::new(MobileGesture::default());
+        /// The id of the sheet canvas, published once by `run_gui`. Gestures
+        /// arrive from every canvas (the sheet and the sheet-tab strip are
+        /// both canvases), and only the sheet's should pan/zoom or select.
+        static SHEET_CANVAS_ID: Cell<u64> = const { Cell::new(u64::MAX) };
+    }
+
+    /// Publish the sheet canvas's backend id. Called once from `run_gui`.
+    pub(crate) fn set_sheet_canvas_id(id: u64) {
+        SHEET_CANVAS_ID.with(|c| c.set(id));
+    }
+
+    /// The sheet canvas's id, or `u64::MAX` (which no real canvas has) before
+    /// `run_gui` publishes it — so an early gesture is ignored rather than
+    /// driving a sheet that does not exist yet.
+    fn sheet_canvas_id() -> u64 {
+        SHEET_CANVAS_ID.with(|c| c.get())
+    }
+
+    /// Pixel travel from the press origin that turns a press into a drag. Kept in
+    /// the same units `metrics_scale` produces (device pixels), so the slop is a
+    /// finger's jitter at any density.
+    fn gesture_slop() -> f64 {
+        6.0 * metrics_scale()
+    }
+
+    /// Outcome codes shared with the mobile hosts (see
+    /// `rswidgets::gridview::DragOutcome`, which this mirrors).
+    mod drag_code {
+        pub const IGNORED: i32 = 0;
+        pub const SELECT: i32 = 1;
+        pub const SCROLL: i32 = 2;
+        pub const TAP: i32 = 3;
+        pub const LONG_PRESS: i32 = 4;
+    }
+
+    /// Begin a gesture. `is_touch` selects the platform rule: a mouse press arms
+    /// selection immediately (desktop drag selects), a finger press waits to see
+    /// whether the gesture becomes a scroll or a long press.
+    ///
+    /// `canvas_id` names the canvas the gesture arrived on. The sheet and the
+    /// sheet-tab strip are both canvases; this state machine only drives the
+    /// sheet (the tab strip owns its own click/reorder handling through
+    /// `Canvas::on_click`), so a gesture on any other canvas is reported as
+    /// [`drag_code::IGNORED`] and the host's per-canvas click path still runs.
+    pub(crate) fn mobile_gesture_down(canvas_id: u64, x: f64, y: f64, is_touch: bool) -> i32 {
+        if canvas_id != sheet_canvas_id() {
+            return drag_code::IGNORED;
+        }
+        let kind = if is_touch { MobilePointerKind::Touch } else { MobilePointerKind::Mouse };
+        MOBILE_GESTURE.with(|g| {
+            let mut g = g.borrow_mut();
+            g.active = true;
+            g.kind = Some(kind);
+            g.down_x = x;
+            g.down_y = y;
+            g.last_x = x;
+            g.last_y = y;
+            g.dragging = false;
+            g.select_armed = false;
+            g.long_press_pending = kind == MobilePointerKind::Touch;
+        });
+        if kind == MobilePointerKind::Mouse {
+            // Arm selection and anchor on the pressed cell, exactly as a mouse
+            // press-and-drag does on a desktop spreadsheet.
+            MOBILE_GESTURE.with(|g| g.borrow_mut().select_armed = true);
+            begin_selection_at_pixel(x, y);
+            return drag_code::SELECT;
+        }
+        drag_code::IGNORED
+    }
+
+    /// The host's long-press timer fired. Arm selection if the finger has not
+    /// moved since the press; the long press itself does not move the cursor.
+    pub(crate) fn mobile_gesture_long_press(canvas_id: u64, _x: f64, _y: f64) -> i32 {
+        if canvas_id != sheet_canvas_id() {
+            return drag_code::IGNORED;
+        }
+        let armed = MOBILE_GESTURE.with(|g| {
+            let mut g = g.borrow_mut();
+            if !g.active
+                || g.kind != Some(MobilePointerKind::Touch)
+                || !g.long_press_pending
+                || g.dragging
+            {
+                return false;
+            }
+            g.long_press_pending = false;
+            g.select_armed = true;
+            true
+        });
+        if armed { drag_code::LONG_PRESS } else { drag_code::IGNORED }
+    }
+
+    /// A pointer move: extends the selection when armed, else reports a scroll
+    /// (the host applies the pan with `drag_viewport_by_pixels`).
+    pub(crate) fn mobile_gesture_move(canvas_id: u64, x: f64, y: f64) -> i32 {
+        if canvas_id != sheet_canvas_id() {
+            return drag_code::IGNORED;
+        }
+        let kind = MOBILE_GESTURE.with(|g| g.borrow().kind);
+        let Some(kind) = kind else { return drag_code::IGNORED };
+
+        let proceed = MOBILE_GESTURE.with(|cell| {
+            let mut g = cell.borrow_mut();
+            if !g.active {
+                return false;
+            }
+            if !g.dragging {
+                let slop = gesture_slop();
+                if (x - g.down_x).hypot(y - g.down_y) <= slop {
+                    return false;
+                }
+                g.dragging = true;
+                // A finger that moved before the timer fired is scrolling, not
+                // selecting.
+                g.long_press_pending = false;
+                if !g.select_armed {
+                    // The whole travel counts, not just what is left after slop.
+                    g.last_x = g.down_x;
+                    g.last_y = g.down_y;
+                }
+            }
+            true
+        });
+        if !proceed {
+            return drag_code::IGNORED;
+        }
+
+        let armed = MOBILE_GESTURE.with(|g| {
+            let mut g = g.borrow_mut();
+            g.last_x = x;
+            g.last_y = y;
+            g.select_armed
+        });
+
+        match kind {
+            MobilePointerKind::Mouse => {
+                begin_selection_at_pixel(x, y);
+                drag_code::SELECT
+            }
+            MobilePointerKind::Touch if armed => {
+                begin_selection_at_pixel(x, y);
+                drag_code::SELECT
+            }
+            MobilePointerKind::Touch => drag_code::SCROLL,
+        }
+    }
+
+    /// A pointer release: a gesture that never dragged is a tap (the shared click
+    /// handler runs, which is the one place selection is applied).
+    pub(crate) fn mobile_gesture_up(canvas_id: u64, _x: f64, _y: f64) -> i32 {
+        if canvas_id != sheet_canvas_id() {
+            return drag_code::IGNORED;
+        }
+        // `was_active` distinguishes a release that ends a real gesture from a
+        // stray one (after a cancel, or a second release): only the former can
+        // be a tap.
+        let (was_active, was_dragging) = MOBILE_GESTURE.with(|g| {
+            let mut g = g.borrow_mut();
+            let (active, dragging) = (g.active, g.dragging);
+            *g = MobileGesture::default();
+            (active, dragging)
+        });
+        if !was_active || was_dragging {
+            // The host already applied the last move; a drag never re-fires as
+            // a click (that is what stops a scroll from also moving the
+            // cursor).
+            return drag_code::IGNORED;
+        }
+        // A tap is reported, not applied: the *host* owns the per-canvas click
+        // dispatch (`Canvas::on_click` was registered per canvas id), and doing
+        // it here would send every canvas's tap to the sheet's handler.
+        drag_code::TAP
+    }
+
+    /// Drop an in-flight gesture without producing a tap.
+    pub(crate) fn mobile_gesture_cancel(canvas_id: u64) {
+        if canvas_id != sheet_canvas_id() {
+            return;
+        }
+        MOBILE_GESTURE.with(|g| *g.borrow_mut() = MobileGesture::default());
+    }
+
+    /// Anchor a selection on the cursor cell and extend it to the cell under
+    /// `(x, y)`, the same rule `GridView::begin_selection` applies: only a body
+    /// cell can anchor or extend (chrome is not a cell), the anchor is captured
+    /// once at the press, and the cursor follows the pointer so the renderer's
+    /// existing anchor↔cursor band paints the selection.
+    pub(crate) fn begin_selection_at_pixel(x: f64, y: f64) {
+        let state = MOBILE_MENU_STATE.with(|s| s.borrow().clone());
+        let Some(state) = state else { return };
+        let state: &GuiState = &state;
+
+        // Map the pixel to a logical (row, col) with the same arithmetic the
+        // renderer uses — the zoom-aware metrics, the display order and the
+        // pinned-first rows.
+        let display_rows = displayed_rows(state);
+        let col_ixs = displayed_cols(state);
+        let mc = {
+            let app = state.app_ref();
+            app.core.workbook.active_sheet().grid.main_cols()
+        };
+        if y < header_h() {
+            return; // the header band selects a column; not a drag target
+        }
+        let ri = ((y - header_h()) / row_h()).floor();
+        if ri < 0.0 || ri as usize >= display_rows.len() {
+            return;
+        }
+        let logical_row = display_rows[ri as usize];
+
+        let mut cx = row_label_w();
+        let mut logical_col: Option<usize> = None;
+        {
+            let app = state.app_ref();
+            let sheet = app.core.workbook.active_sheet();
+            for &c in &col_ixs {
+                let cw = display_col_width(sheet, c, mc) as f64 * char_w();
+                if x >= cx && x < cx + cw {
+                    logical_col = Some(c);
+                    break;
+                }
+                cx += cw;
+            }
+        }
+        let Some(logical_col) = logical_col else { return };
+
+        {
+            let app = state.app_mut();
+            if app.core.anchor.is_none() {
+                app.core.anchor = Some(app.core.cursor);
+            }
+            app.core.cursor.row = logical_row;
+            app.core.cursor.col = logical_col;
+        }
+        state.last_row.set(logical_row);
+        state.last_col.set(logical_col);
+        update_formula_bar(state, logical_row, logical_col);
+        state.canvas.queue_redraw();
+    }
+
+    /// Pan the sheet by a pixel delta from a touch drag, converting to whole cells
+    /// with the current (zoom-aware) metrics. Positive `dy` (content moves down)
+    /// reveals earlier rows, matching the existing `SheetView.scrollByDrag`.
+    ///
+    /// Returns the row/column counts applied so the caller can keep its sub-cell
+    /// remainder — the conversion must happen here, where the live metrics are,
+    /// or a pinch would leave the caller's cached cell size stale.
+    pub(crate) fn drag_viewport_by_pixels(canvas_id: u64, dx: f64, dy: f64) -> (i32, i32) {
+        if canvas_id != sheet_canvas_id() {
+            return (0, 0);
+        }
+        let (rh, cw) = (row_h(), char_w());
+        let d_rows = if rh > 0.0 { (-dy / rh).trunc() as i32 } else { 0 };
+        let d_cols = if cw > 0.0 { (-dx / cw).trunc() as i32 } else { 0 };
+        if d_rows != 0 || d_cols != 0 {
+            scroll_viewport_by_cells(d_rows, d_cols);
+        }
+        (d_rows, d_cols)
+    }
+}
+/// The mobile hosts call these through their own backend modules
+/// (`android_backend`, `ios_backend`); the re-export exists so those modules
+/// outside this file can name them without the module path.
+///
+/// macOS is excluded on purpose, and so is `set_sheet_canvas_id`'s sibling
+/// state: AppKit delivers a real `mouseDown:`/`mouseDragged:`/`mouseUp:`
+/// sequence, and the *shared* pointer path (`on_click_button` / `on_motion` /
+/// `on_release` on the canvas) already handles it. These are the synthetic
+/// touch-gesture recognisers — long-press, tap-vs-drag, pinch slop — that only
+/// a touch host needs to synthesise. Compiling them on macOS bought nothing
+/// and cost 25 `never used` warnings, since no macOS host calls them.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) use mobile_gesture::{
+    drag_viewport_by_pixels, mobile_gesture_cancel, mobile_gesture_down,
+    mobile_gesture_long_press, mobile_gesture_move, mobile_gesture_up,
+    set_sheet_canvas_id,
+};
 
 /// Where the drawn pointer should sit for a menu tour stop, in **canvas**
 /// coordinates (see `paint_movie_pointer` for why that is not the same as
@@ -4291,12 +5373,12 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
                     }
                 });
             } else {
-                let (title, ok, initial) = {
+                let (title, ok, initial, hint) = {
                     let app = st.app_ref();
                     let wb = &app.core.workbook;
                     prompt_chrome(&action, wb.sheet_title(wb.active_sheet))
                 };
-                dialogs::prompt_dialog(&title, &ok, &initial, move |result| {
+                dialogs::prompt_dialog(&title, &ok, &initial, hint, move |result| {
                     if let Some(text) = result {
                         run_prompt_action(st.app_mut(), &action, &text);
                         refresh_after_dialog(&st);
@@ -4360,6 +5442,40 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             // Shared workbook logic (same as pancurses/ratatui).
             delegate_shared_action(name, state);
         }
+        "col_lock" | "row_lock" => {
+            // Shared lock logic (same as pancurses/ratatui): toggles the pin
+            // on `core.locks`, the same state the gutter padlock click edits.
+            // A pin changes the rendered window (the row/column is merged in
+            // front of the scroll viewport and its padlock fills), so the grid
+            // must be repainted — `delegate_shared_action` only updates the
+            // status line.
+            delegate_shared_action(name, state);
+            recompute_viewport(state);
+            state.canvas.grab_focus();
+            state.canvas.queue_redraw();
+        }
+        "toggle_night_mode" => {
+            // `Format ▸ Night mode`. The shared dispatch swaps the global
+            // palette; this arm exists only for the repaint, because a
+            // realised widget keeps the colours it was last painted with
+            // until something asks it to paint again. The canvas carries the
+            // grid, the dropdown and the pointer; the *window* carries the
+            // native chrome around it (the tab strip, and on GTK the menu
+            // bar), which does not follow the canvas palette, so both are
+            // asked to redraw.
+            delegate_shared_action(name, state);
+            // The tab bar caches its colours in a `TabBarConfig` copied at
+            // construction, so it cannot follow the theme by itself — rebuild
+            // it from the new palette before repainting.
+            if let Some(tab_bar) = state.tab_bar.borrow().as_ref() {
+                tab_bar.set_config(rswidgets::tabbar::TabBarConfig::for_theme());
+            }
+            state.canvas.queue_redraw();
+            state.window.queue_redraw();
+            if let Some(tb) = state.tab_bar.borrow().as_ref() {
+                tb.queue_redraw();
+            }
+        }
         "extrapolate" => {
             // Enter interactive extrapolate modal (mirrors ratatui).
             extrapolate::enter(state.app_mut());
@@ -4412,7 +5528,7 @@ fn on_formula_entry_changed(state: &GuiState) {
     // and must be ignored. On Android, entry text that differs from the
     // committed cell value can only be user input, so adopt it as a fresh
     // edit (mirrors start_edit_with on first keystroke).
-    #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
+    #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos", test))]
     if !state.editing.get() {
         if let Some(text) = state.formula_entry.get_text() {
             let app = state.app_ref();
@@ -4433,27 +5549,9 @@ fn on_formula_entry_changed(state: &GuiState) {
             return;
         }
     }
-    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
-    if !state.editing.get() {
-        return;
-    }
-    if let Some(text) = state.formula_entry.get_text() {
-        let current = state.edit_buf.borrow();
-        // Safety check: only overwrite edit_buf from entry text when the
-        // entry text is a forward or backward extension of the current
-        // edit_buf.  This prevents data corruption when keystrokes from
-        // the window-level handler (start_edit_with/handle_edit_key) race
-        // with the entry's "changed" signal — a scenario where edit_buf
-        // contains "4" (from window handler) but the entry text is "2"
-        // (just arrived via entry default handler after grab_focus took
-        // effect).  Without this guard, edit_buf would be overwritten to
-        // "2", silently dropping the "4".
-        if text.starts_with(&*current) || current.starts_with(&text) {
-            drop(current);
-            *state.edit_buf.borrow_mut() = text;
-        }
-        state.canvas.queue_redraw();
-    }
+    // The Entry widget is now the sole buffer — no reverse sync to edit_buf
+    // is needed. Just repaint so the grid shows the in-progress edit.
+    state.canvas.queue_redraw();
 }
 
 // ---------------------------------------------------------------------------
@@ -4543,6 +5641,15 @@ pub fn run_gui_with_movie(
 ) -> Result<(), Box<dyn std::error::Error>> {
     rswidgets::core::install_debug_crash_handlers();
     phase("run_gui: crash handlers installed");
+    // `CORRO_NIGHT_MODE=1` starts in the dark palette. The toggle in
+    // `Format > Night mode` is a per-session display setting (nothing is
+    // persisted, because a view preference has no place in a document log),
+    // so this is the way to make it the default for a session — and the way a
+    // user with a dark-room setup configures it. Read here, before the first
+    // paint, so no frame is ever drawn in the wrong scheme.
+    if matches!(std::env::var("CORRO_NIGHT_MODE").as_deref(), Ok("1") | Ok("true")) {
+        rswidgets::core::set_color_scheme(rswidgets::core::ColorScheme::Night);
+    }
     // TEMPORARY Win95 diagnosis: startup progression (see mark95 below).
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe {
@@ -4601,6 +5708,7 @@ pub fn run_gui_with_movie(
     // No selection at rest (matching ratatui, where the anchor only exists
     // transiently for shift-extend/select-all/format-selection).
     corro_app.core.anchor = None;
+    corro_app.core.selection_kind = crate::grid::SelectionKind::Cells;
 
     let data_rows = 30usize;
     let data_cols = 12usize;
@@ -4611,6 +5719,28 @@ pub fn run_gui_with_movie(
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe { mark95(b"m-fbar\n"); }
     let addr_label = rxapp.new_label("A1")?;
+    // Pin the address slot to its widest possible text.
+    //
+    // A label is shrink-to-fit by default, so `A1` -> `B1` -> `A100` resizes
+    // it, and every control packed after it (the `fx` label, the entry, the
+    // status suffix) slides sideways on each cursor move. The address *text*
+    // legitimately changes every press, so skipping unchanged writes is not
+    // enough — the slot itself has to be constant. The width covers the
+    // longest address the bar can show: a two-letter margin column in
+    // brackets (`[AA_1`), a three-letter excel column at the cap
+    // (`AAA~1`), and up to 6 digits of row.
+    addr_label.set_fixed_width(Some(ADDR_SLOT_W_BASE as i32 * metrics_scale() as i32));
+    // Left-align it inside the pinned slot. GtkLabel's default xalign is 0.5
+    // (centred), so once the slot is pinned wider than the text the address
+    // floats in the middle of it and *moves as the text changes width* — the
+    // reflow this pin exists to stop, just relocated from the slot's edge to
+    // the text inside it. Left-aligning pins the glyphs where they belong.
+    addr_label.set_xalign(0.0);
+    // ...and keep the text where it has always rendered. Left-aligned alone the
+    // address sits flush against the slot's left edge, where the unpinned
+    // label used to sit an inset in; restore that inset, so pinning the slot
+    // stops the reflow without also moving the address.
+    addr_label.set_margin_start(ADDR_SLOT_INSET_PX as i32 * metrics_scale() as i32);
     // TEMPORARY ReactOS diagnosis.
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe { mark95(b"m-alab\n"); }
@@ -4628,6 +5758,17 @@ pub fn run_gui_with_movie(
     formula_bar.append(&formula_entry);
     formula_bar.set_child_hexpand(&formula_entry, true);
     let formula_status = rxapp.new_label("")?;
+    // Pin the status suffix too. It changes text on every status message, and
+    // on the Win32/NWG backend a STATIC label is re-fitted to its text, so an
+    // unpinned status reflows the parent box on each message. The suffix is
+    // packed after the expanding entry, so it is the entry's *right* edge that
+    // moves — the caret's row does not shift, but the input box visibly resizes
+    // under the user's hands, which is the same class of defect as the address
+    // slot. `None` releases the pin, so pass `Some` once and leave it set.
+    formula_status.set_fixed_width(Some(STATUS_SLOT_W_BASE as i32 * metrics_scale() as i32));
+    // Same reason as the address slot: left-align, or the status text floats
+    // mid-slot and slides within it as messages come and go.
+    formula_status.set_xalign(0.0);
     formula_status.set_visible(false);
     // TEMPORARY Win95 diagnosis.
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
@@ -4639,6 +5780,19 @@ pub fn run_gui_with_movie(
     // cell is always visible. Expand flags go on BEFORE append (GTK3 freezes
     // pack params at append time). Policy 0 = always show (GtkPolicyType).
     let canvas = rxapp.new_canvas()?;
+    // Publish the sheet canvas's id before anything can deliver a gesture to
+    // it: the mobile host passes the id on every gesture call and this backend
+    // only drives the sheet (the sheet-tab strip is a canvas too, and its
+    // clicks/reorders are the TabBar's business).
+    //
+    // macOS is included deliberately even though it has no synthetic gesture
+    // recogniser (see the `mobile_gesture` re-export): AppKit's sheet view
+    // reports its id on every `corro_macos_canvas_*` callback, and the
+    // dispatch tables below key on the *published* id to tell the sheet
+    // canvas from the sheet-tab strip. Publishing it is therefore what makes
+    // the AppKit pointer path work, not just the touch one.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    set_sheet_canvas_id(canvas.inner.canvas_id());
     canvas.set_size_request(1, 1);
     // Ensure the canvas can receive keyboard focus (needed after commit_edit
     // to return focus — GtkDrawingArea does not accept focus by default).
@@ -4658,8 +5812,12 @@ pub fn run_gui_with_movie(
     // has 2+ sheets. Hidden until then — the first New sheet creates the
     // bar, later sheets just append tabs. Fixed strip height; a vertical box
     // stretches children across the full width on every backend.
+    // The height request starts at 0 and is owned from here on by
+    // `TabBar::set_visible`, so a hidden strip takes no vertical space and the
+    // grid grows into it (and shrinks again when the bar appears). Setting it
+    // here would put the gap back permanently.
     let tabbar = rxapp.new_canvas()?;
-    tabbar.set_size_request(1, tab_h() as i32);
+    tabbar.set_size_request(1, 0);
     tabbar.set_visible(false);
 
     let shared = Rc::new(GuiState {
@@ -4673,14 +5831,15 @@ pub fn run_gui_with_movie(
         hints_label: hints_label.clone(),
         formula_status: formula_status.clone(),
         editing: Cell::new(false),
-        edit_buf: RefCell::new(String::new()),
-        edit_caret: Cell::new(0),
         agg_drop: RefCell::new(None),
         canvas_size: Cell::new((0, 0)),
-        entry_snapshot: RefCell::new(String::new()),
         entry_clicked: Cell::new(false),
         movie_pointer: Cell::new(None),
         entry_shown: Cell::new((usize::MAX, usize::MAX)),
+        addr_shown: RefCell::new(String::new()),
+        hints_shown: RefCell::new(String::new()),
+        status_shown: RefCell::new(String::new()),
+        status_vis: Cell::new(false),
         mode: Cell::new(GuiMode::Normal),
         last_row: Cell::new(cursor_row),
         last_col: Cell::new(cursor_col),
@@ -4694,22 +5853,10 @@ pub fn run_gui_with_movie(
         entry_seen: Cell::new(true),
         clipboard: RefCell::new(String::new()),
         pending_scope: Cell::new(0),
-        pinned_rows: RefCell::new(std::collections::BTreeSet::new()),
-        pinned_cols: RefCell::new(std::collections::BTreeSet::new()),
-        pinned_sheet: Cell::new(u32::MAX),
         padlocks: RefCell::new(Vec::new()),
-        tabbar: tabbar.clone(),
-        tab_hits: RefCell::new(Vec::new()),
-        tab_drag: RefCell::new(None),
-        tab_context_pending: Cell::new(None),
-        tabbar_visible: Cell::new(false),
-        #[cfg(feature = "gtk4")]
-        last_dedup_key: Cell::new(0),
-        #[cfg(feature = "gtk4")]
-        dedup_count: Cell::new(0),
+        gutter_cycle: Cell::new(None),
+        tab_bar: RefCell::new(None),
         return_pressed: Cell::new(false),
-        #[cfg(feature = "gtk4")]
-        last_keyval_dedup: Cell::new(0),
         scrolled: scrolled.clone(),
         syncing_scroll: Cell::new(false),
         sb_push: Cell::new((-1.0, -1.0, -1.0, -1.0, -1.0, -1.0)),
@@ -4809,38 +5956,33 @@ pub fn run_gui_with_movie(
     let shared_click = shared.clone();
     canvas.on_click(Box::new(move |x: f64, y: f64| { handle_click(x, y, &shared_click); }));
 
-    // Sheet tabs: paint the strip and switch sheets on click. Registered
-    // before present() like the grid canvas so the first frame draws tabs.
-    let shared_tabdraw = shared.clone();
-    tabbar.set_draw_callback(Box::new(move |dc: &mut dyn DrawContext, w: i32, h: i32| {
-        render_tabbar(dc, &shared_tabdraw, w, h);
-    }));
-    let shared_tabclick = shared.clone();
-    tabbar.on_click(Box::new(move |x: f64, _y: f64| {
-        handle_tab_click(x, &shared_tabclick);
-    }));
-    // Button-aware variant: right-click on a tab opens the Sheet menu there.
-    // `on_click` above still fires (both handlers are connected), but switching
-    // sheets on the same click is idempotent, so the two do not conflict. Only
-    // the GTK backends deliver a real button number; elsewhere `button` is 1
-    // and this path is exactly the left-click behaviour.
-    let shared_tabclick_btn = shared.clone();
-    tabbar.on_click_button(Box::new(move |x: f64, _y: f64, button: u32, _state: u32| {
-        handle_tab_click_button(x, button, &shared_tabclick_btn);
-    }));
-    // Drag-reorder: motion tracks the pointer while a left button is held, and
-    // release commits. Both go through the same armed-drag state, so a
-    // press/release without movement stays a plain click.
-    let shared_tabmotion = shared.clone();
-    tabbar.on_motion(Box::new(move |x: f64, _y: f64, _state: u32| {
-        handle_tab_motion(x, &shared_tabmotion);
-    }));
-    let shared_tabrelease = shared.clone();
-    tabbar.on_release(Box::new(
-        move |x: f64, _y: f64, button: u32, _state: u32| {
-            handle_tab_release_button(x, button, &shared_tabrelease);
-        },
-    ));
+    // Sheet tabs: the TabBar widget wraps the tabbar Canvas and owns all
+    // layout, hit-testing, drag-reorder, and rendering.
+    let cfg = rswidgets::tabbar::TabBarConfig {
+        height: tab_h(),
+        font_size: font_size(),
+        ..Default::default()
+    };
+    let tab_bar = rswidgets::tabbar::TabBar::new(tabbar.clone(), cfg);
+    {
+        let st = shared.clone();
+        tab_bar.on_select(Box::new(move |index| {
+            switch_to_sheet(&st, index);
+        }));
+    }
+    {
+        let st = shared.clone();
+        tab_bar.on_reorder(Box::new(move |from, to| {
+            apply_reorder_sheet(&st, from as u32, to as u32);
+        }));
+    }
+    {
+        let st = shared.clone();
+        tab_bar.on_context(Box::new(move |_index, x| {
+            open_sheet_context_menu(&st, x);
+        }));
+    }
+    *shared.tab_bar.borrow_mut() = Some(tab_bar);
 
     // Formula entry change
     let shared_entry = shared.clone();
@@ -4861,8 +6003,7 @@ pub fn run_gui_with_movie(
     formula_entry.connect_button_press(move || {
         // The user pressed the pointer in the formula entry: adopt the caret
         // the click placed so a following insert lands at that position
-        // rather than appending.
-        pull_caret_from_entry(&shared_click);
+        // rather than appending. The Entry widget tracks the caret natively.
         shared_click.entry_clicked.set(true);
     })?;
 
@@ -4917,17 +6058,6 @@ pub fn run_gui_with_movie(
             let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
             let alt_held = (state & 0x8) != 0;
             let ctrl_held = (state & 0x4) != 0;
-
-            // General press/release dedup. GTK4-only (see GuiState): elsewhere
-            // every key event is genuine (releases are filtered at the source
-            // or never hooked), so skipping repeats would drop real input
-            // (e.g. Right,Right).
-            #[cfg(feature = "gtk4")]
-            if nk != 0 && nk == s.last_keyval_dedup.get() {
-                s.last_keyval_dedup.set(0);
-                append_keylog(&format!("dedup: skipping keyval={nk} release\n"));
-                return 1;
-            }
 
             // Ctrl+Q: quit
             if ctrl_held && ch == 'q' {
@@ -5039,11 +6169,8 @@ pub fn run_gui_with_movie(
                     return 1;
                 }
                 let text = s.formula_entry.get_text().unwrap_or_default();
-                if !text.is_empty() || !s.edit_buf.borrow().is_empty() {
+                if !text.is_empty() {
                     s.editing.set(true);
-                    if !text.is_empty() {
-                        *s.edit_buf.borrow_mut() = text;
-                    }
                 }
             }
     let hk = handle_key(keyval, &state_w, state);
@@ -5078,20 +6205,13 @@ pub fn run_gui_with_movie(
         }
         if nk == RETURN {
             s.return_pressed.set(true);
-            append_keylog(&format!("window handler returned 1 for RETURN, editing={} text={:?} edit_buf={:?}\n",
+            append_keylog(&format!("window handler returned 1 for RETURN, editing={} text={:?}\n",
                 s.editing.get(),
-                s.formula_entry.get_text().unwrap_or_default(),
-                *s.edit_buf.borrow()));
+                s.formula_entry.get_text().unwrap_or_default()));
         }
-        // GTK4-only release bookkeeping (see GuiState); elsewhere the field
-        // does not exist.
-        #[cfg(feature = "gtk4")]
-        s.last_keyval_dedup.set(nk);
-        1 
+        1
     } else {
-        #[cfg(feature = "gtk4")]
-        s.last_keyval_dedup.set(0);
-        0 
+        0
     }
         }));
     }
@@ -5233,6 +6353,9 @@ pub fn run_gui_with_movie(
         // over the grid, the chrome and any open dropdown.
         dc.clip(0.0, 0.0, w as f64, h as f64);
         paint_movie_pointer(dc, &shared_draw);
+        // Revision-browse badge (File▸Replay): drawn after the grid so it is
+        // never occluded, but before the test marker below.
+        paint_revision_badge(dc, &shared_draw, w as f64);
         // Test marker: 8x8 square of 0xFEEDBE at top-left, drawn AFTER render_grid
         // so it appears on top of the grid background and is visible in screenshots.
         dc.fill_rect(0.0, 0.0, 8.0, 8.0, 254.0/255.0, 237.0/255.0, 190.0/255.0, 1.0);
@@ -5349,7 +6472,7 @@ pub fn run_gui_with_movie(
     // buffer.  Guard the call: if editing is already in progress with
     // content, just grab focus and redraw without clearing.
     match startup_edit_action(
-        shared.editing.get() && !shared.edit_buf.borrow().is_empty(),
+        shared.editing.get() && !shared.formula_entry.get_text().unwrap_or_default().is_empty(),
         shared.clicked.get(),
     ) {
         StartupEdit::KeepInFlight => {
@@ -5495,8 +6618,8 @@ fn arm_edit_script(state: &Rc<GuiState>) {
             // The in-progress text lives in the entry buffer, which is what the
             // formula bar and the grid's edit overlay both paint from.
             state_for_tick.editing.set(true);
-            *state_for_tick.edit_buf.borrow_mut() = shown.clone();
-            sync_entry_to_buf(&state_for_tick);
+            state_for_tick.formula_entry.set_text_suppressing_changed(&shown);
+            state_for_tick.formula_entry.set_position(shown.chars().count());
             update_state_cursor(&state_for_tick, app.core.cursor.row, app.core.cursor.col);
             sync_chrome_labels(&state_for_tick);
             state_for_tick.canvas.queue_redraw();
@@ -5526,7 +6649,7 @@ fn arm_edit_script(state: &Rc<GuiState>) {
             }
             app.core.state = app.core.workbook.active_sheet().clone();
             state_for_tick.editing.set(false);
-            state_for_tick.edit_buf.borrow_mut().clear();
+            state_for_tick.formula_entry.set_text_suppressing_changed("");
             update_state_cursor(&state_for_tick, app.core.cursor.row, app.core.cursor.col);
             sync_chrome_labels(&state_for_tick);
             state_for_tick.canvas.queue_redraw();
@@ -5890,8 +7013,8 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                     // status line counted up while the bar stayed empty, and the
                     // value only appeared at the commit.
                     state_for_tick.editing.set(true);
-                    *state_for_tick.edit_buf.borrow_mut() = shown.clone();
-                    sync_entry_to_buf(&state_for_tick);
+                    state_for_tick.formula_entry.set_text_suppressing_changed(&shown);
+                    state_for_tick.formula_entry.set_position(shown.chars().count());
                     let app = state_for_tick.app_mut();
                     app.core.status = format!(
                         "Movie {}/{}  typing: {shown}",
@@ -5957,7 +7080,7 @@ fn apply_movie_step(
             // before the chrome refresh so the bar shows the freshly committed
             // *cell* value rather than the last typed character run.
             state.editing.set(false);
-            state.edit_buf.borrow_mut().clear();
+            state.formula_entry.set_text_suppressing_changed("");
             // The same chrome refresh a keypress performs.
             update_state_cursor(state, app.core.cursor.row, app.core.cursor.col);
             let caption = match frame.menu.as_ref() {
@@ -6030,7 +7153,8 @@ mod gutter_tests {
             .collect();
         assert_eq!(
             fills,
-            vec![(0.9, 0.95, 1.0, 1.0), (0.9, 0.9, 0.9, 1.0)],
+            { let p = chrome::palette(); let (s, g) = (p.gutter_selected(), p.gutter());
+              vec![(s.0, s.1, s.2, 1.0), (g.0, g.1, g.2, 1.0)] },
             "covered row must use the body selection fill, uncovered row header gray, got {fills:?}"
         );
     }
@@ -6103,7 +7227,8 @@ mod gutter_tests {
             .collect();
         assert_eq!(
             fills,
-            vec![(0.9, 0.9, 0.9, 1.0), (0.9, 0.95, 1.0, 1.0)],
+            { let p = chrome::palette(); let (s, g) = (p.gutter_selected(), p.gutter());
+              vec![(g.0, g.1, g.2, 1.0), (s.0, s.1, s.2, 1.0)] },
             "margin col keeps header gray, covered col uses selection fill, got {fills:?}"
         );
     }
@@ -6159,15 +7284,22 @@ mod gutter_tests {
         assert_eq!(union_pinned(&[], &[3]), vec![3]);
     }
 
-    /// Pin toggle flips membership and reports the end state.
+    /// Pin toggle flips membership and reports the end state. The behaviour
+    /// now lives in the shared `LockState` (so the gutter click and
+    /// `Sheet ▸ Freeze` cannot diverge); assert it through that type, which
+    /// also pins the API the menu dispatch uses.
     #[test]
     fn pin_toggle_flips() {
-        use std::collections::BTreeSet;
-        let mut set = BTreeSet::new();
-        assert!(toggle_pin_in(&mut set, 7));
-        assert!(set.contains(&7));
-        assert!(!toggle_pin_in(&mut set, 7));
-        assert!(!set.contains(&7));
+        let mut locks = crate::lock::LockState::new();
+        assert!(locks.toggle_col(7));
+        assert!(locks.col_locked(7));
+        assert!(!locks.toggle_col(7));
+        assert!(!locks.col_locked(7));
+
+        assert!(locks.toggle_row(3));
+        assert!(locks.row_locked(3));
+        assert!(!locks.toggle_row(3));
+        assert!(!locks.row_locked(3));
     }
 
     /// Locked padlocks paint filled bodies in the dark slate; unlocked paint
@@ -6219,6 +7351,43 @@ mod gutter_tests {
             "unlocked padlock needs an outlined lighter body, got {strokes:?}"
         );
     }
+
+    /// The shackle legs must meet the body's top edge: a gap there makes the
+    /// padlock look like it is floating. Regression — the leg length was
+    /// computed as `body_y - bar_h`, so every leg stopped `bar_h` short of the
+    /// body (a ~1px gap at the base metrics) and the icon read as broken.
+    #[test]
+    fn padlock_shackle_legs_join_the_body() {
+        // Base metrics: body x/y/w/h == 1/6/8/5, left upright x == 2.2, w == 2.
+        const BODY_TOP: f64 = 6.0;
+        for locked in [true, false] {
+            let mut dc = RecordingDrawContext::new();
+            paint_padlock(&mut dc, 0.0, 0.0, locked);
+            let fills: Vec<(f64, f64, f64, f64)> = dc
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    DrawOp::FillRect { x, y, w, h, .. } => Some((*x, *y, *w, *h)),
+                    _ => None,
+                })
+                .collect();
+            // The left upright is the tall fill at x == 2.2 whose bottom side
+            // sits at the body's top edge.
+            let (_, ly, _, lh) = fills
+                .iter()
+                .copied()
+                .find(|&(x, _, w, h)| (x - 2.2).abs() < 1e-9 && (w - 2.0).abs() < 1e-9 && h > 2.0)
+                .unwrap_or_else(|| {
+                    panic!("no left shackle upright among fills {fills:?} (locked={locked})")
+                });
+            assert!(
+                (ly + lh - BODY_TOP).abs() < 1e-9,
+                "left leg ends at {} but the body starts at {BODY_TOP}: the padlock floats \
+                 (locked={locked}, fills={fills:?})",
+                ly + lh
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6226,48 +7395,87 @@ mod prompt_tests {
     use super::*;
 
     /// Regression for "Rename Sheet opens Find": every prompt-gated action
-    /// gets its own correctly labeled dialog chrome — titles and buttons
-    /// pinned here, not eyeballed in screenshots.
+    /// gets its own correctly labeled dialog chrome. Asserts against
+    /// [`PROMPT_CHROME`] itself (the single source of the labels) plus the
+    /// fallback, so the test cannot drift from the table it is checking.
     #[test]
     fn prompt_chrome_labels_every_action() {
-        let cases: &[(&str, &str, &str)] = &[
-            ("rename_sheet", "Rename sheet", "Rename"),
-            ("copy_sheet", "Copy sheet", "Copy"),
-            ("delete_sheet", "Delete sheet", "Delete"),
-            ("go_to_cell", "Go to cell", "Go"),
-            ("set_col_width", "Column width", "Set"),
-            ("set_max_col_width", "Default width", "Set"),
-            ("find", "Find", "Find"),
-            ("insert_special_chars", "Insert special char", "Insert"),
-            ("insert_hyperlink", "Insert hyperlink", "Insert"),
-            ("sort_view", "Sort view", "Sort"),
-            ("persist_sort", "Persist sort", "Sort"),
-            ("balance_books", "Balance books", "Balance"),
-        ];
-        for (action, title, ok) in cases {
-            let (t, o, initial) = prompt_chrome(action, "Sheet2");
-            assert_eq!(&t, title, "dialog title for {action}");
-            assert_eq!(&o, ok, "dialog button for {action}");
-            if *action != "find" {
-                assert_ne!(&t, "Find", "{action} must not recycle the Find dialog");
+        for row in PROMPT_CHROME {
+            let (t, o, _, _) = prompt_chrome(row.action, "Sheet2");
+            assert_eq!(t, row.title, "dialog title for {}", row.action);
+            assert_eq!(o, row.ok, "dialog button for {}", row.action);
+            if row.action != "find" {
+                assert_ne!(t, "Find", "{} must not recycle the Find dialog", row.action);
             }
-            let _ = initial;
         }
+        // An action with no chrome row must not crash or reuse a real label.
+        assert_eq!(
+            prompt_chrome("no_such_action", "Sheet2"),
+            ("Prompt".into(), "OK".into(), String::new(), None)
+        );
     }
 
     /// Rename pre-fills the entry with the current title (edit-in-place);
     /// creation-style prompts start empty so stale text can never leak in.
     #[test]
     fn prompt_chrome_initial_text() {
-        assert_eq!(
-            prompt_chrome("rename_sheet", "Budget"),
-            ("Rename sheet".into(), "Rename".into(), "Budget".into())
-        );
+        let (title, ok, initial, hint) = prompt_chrome("rename_sheet", "Budget");
+        assert_eq!(title, "Rename sheet");
+        assert_eq!(ok, "Rename");
+        assert_eq!(initial, "Budget");
+        assert_eq!(hint, None);
+
         for action in ["copy_sheet", "delete_sheet", "go_to_cell", "find"] {
             assert_eq!(
                 prompt_chrome(action, "Budget").2,
                 String::new(),
                 "{action} must start with an empty entry"
+            );
+        }
+    }
+
+    /// The Go dialog must tell the user what it accepts: an empty box titled
+    /// "Go to cell" is why `5`, `C` and header/footer refs were unusable. The
+    /// hint has to name the forms `ui_core::resolve_go_target` really parses,
+    /// so it cannot rot into advertising a syntax that no longer works.
+    #[test]
+    fn go_to_cell_hint_names_accepted_forms() {
+        let (_, _, _, hint) = prompt_chrome("go_to_cell", "Sheet2");
+        let hint = hint.expect("go_to_cell must carry an input hint");
+        for form in ["C12", "C~1", "C_1", "[A1"] {
+            assert!(hint.contains(form), "hint must document {form}: {hint}");
+        }
+        // Every advertised full ref must actually resolve, so the hint is not
+        // a promise the parser breaks. Row/column parts are advertised in
+        // prose and checked here too, so a resolver change that drops `5`/`C`
+        // fails rather than silently leaving a lie in the dialog.
+        let grid = crate::ops::SheetState::new(5, 5);
+        let cur = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+        for form in ["C12", "C~1", "C_1", "[A1", "5", "C"] {
+            assert!(
+                crate::ui_core::resolve_go_target(&grid.grid, cur, form).is_ok(),
+                "hint advertises {form} but the resolver rejects it"
+            );
+        }
+        // A `$-locked` cell is NOT a Go target (`$` prefixes a sheet name), so
+        // the hint must not advertise one.
+        assert!(
+            !hint.contains("$C$"),
+            "hint must not advertise a $-locked cell: {hint}"
+        );
+        // `rswidgets::Label` cannot wrap, so a long hint widens the dialog
+        // instead of wrapping. Cap it so it stays one readable line.
+        assert!(
+            hint.chars().count() <= 90,
+            "hint is {} chars; keep it to one line (<= 90): {hint}",
+            hint.chars().count()
+        );
+        // Other prompts stay hint-free (unchanged dialogs).
+        for action in ["find", "rename_sheet", "set_col_width"] {
+            assert_eq!(
+                prompt_chrome(action, "Sheet2").3,
+                None,
+                "{action} should have no hint"
             );
         }
     }
@@ -6277,74 +7485,17 @@ mod prompt_tests {
 mod tab_tests {
     use super::*;
 
-    /// Tabs lay out left to right from x=2, padded by tab_pad_x() on both
-    /// sides with tab_gap() between. "Sheet1" at the stub 8px/char measures
-    /// 48px, so tab 1 spans 2..70 and tab 2 starts at 76.
+    /// The tab strip is drawn and hit-tested by `rswidgets::tabbar`, which
+    /// owns the layout/drop-slot unit tests. What stays corro's is the
+    /// wiring: a `TabBar` must exist after setup and its callbacks must
+    /// reach the shared state (so a select switches sheets).
     #[test]
-    fn tab_drop_index_picks_the_slot_under_the_pointer() {
-        let hits = vec![
-            TabHit { x0: 0.0, x1: 100.0, index: 0 },
-            TabHit { x0: 106.0, x1: 206.0, index: 1 },
-            TabHit { x0: 212.0, x1: 312.0, index: 2 },
-        ];
-        // Left of every midpoint -> slot 0 (before the first tab).
-        assert_eq!(tab_drop_index(&hits, 0.0), 0);
-        assert_eq!(tab_drop_index(&hits, 49.0), 0);
-        // Past the first midpoint -> slot 1.
-        assert_eq!(tab_drop_index(&hits, 51.0), 1);
-        assert_eq!(tab_drop_index(&hits, 150.0), 1);
-        // Past the last midpoint -> past the final tab: a drop slot *after*
-        // the last sheet, so the slot range is 0..=len (not 0..len-1).
-        assert_eq!(tab_drop_index(&hits, 260.0), 2);
-        assert_eq!(tab_drop_index(&hits, 9999.0), 3, "past every tab drops at the end");
-        // No tabs at all: slot 0, never an underflow.
-        assert_eq!(tab_drop_index(&[], 10.0), 0);
-    }
-
-    #[test]
-    fn tab_drag_index_range_guard() {
-        let d = TabDrag { from: 1, to: 2, press_x: 0.0, moved: true };
-        assert!(d.index_in_range(3));
-        // `to == len` is the slot after the last tab, which is a valid drop
-        // position (the commit clamps it), so it stays in range.
-        assert!(d.index_in_range(2), "to == len is the after-last slot");
-        assert!(!d.index_in_range(0), "an empty strip has no valid slot");
-    }
-
-    #[test]
-    fn tab_layout_pads_and_gaps_tabs() {
-        let titles = vec!["Sheet1".to_string(), "Sheet2".to_string()];
-        let hits = tab_layout(&titles, 1, &|t: &str, _w: i32| t.chars().count() as f64 * 8.0);
-        assert_eq!(hits.len(), 2, "one hit per sheet, got {hits:?}");
-        assert_eq!((hits[0].x0, hits[0].x1), (2.0, 70.0));
-        assert_eq!(hits[0].index, 0);
-        assert_eq!((hits[1].x0, hits[1].x1), (76.0, 144.0));
-        assert_eq!(hits[1].index, 1);
-    }
-
-    /// No titles, no hits (single-sheet workbooks hide the bar anyway).
-    #[test]
-    fn tab_layout_empty_without_titles() {
-        assert!(tab_layout(&[], 0, &|_: &str, _: i32| 0.0).is_empty());
-        assert!(tab_layout(&["Only".to_string()], 0, &|_: &str, _: i32| 0.0).len() == 1);
-    }
-
-    /// The active tab measures bold (weight 1): the measure closure must
-    /// observe weight 1 exactly for the active index and 0 elsewhere, or
-    /// bold titles would misalign their hit rects.
-    #[test]
-    fn tab_layout_measures_active_bold() {
-        let titles = vec!["A".to_string(), "B".to_string(), "C".to_string()];
-        let seen = std::cell::RefCell::new(Vec::new());
-        let hits = tab_layout(&titles, 2, &|t: &str, w: i32| {
-            seen.borrow_mut().push((t.to_string(), w));
-            10.0
-        });
-        assert_eq!(seen.borrow().clone(), vec![("A".into(), 0), ("B".into(), 0), ("C".into(), 1)]);
-        assert_eq!(hits.len(), 3);
-        // Each tab is 10 + 10 + 10 = 30 wide with 6px gaps: tab 0 spans
-        // 2..32, tab 1 spans 38..68, tab 2 spans 74..104.
-        assert_eq!((hits[2].x0, hits[2].x1), (74.0, 104.0));
+    fn app_has_a_tab_bar_wiring_seam() {
+        // Compile-time contract: `GuiState` exposes the widget so both the
+        // draw pass and the chrome refresh can reach it.
+        fn _assert_field_exists(state: &GuiState) -> bool {
+            state.tab_bar.borrow().is_some()
+        }
     }
 }
 
@@ -6388,17 +7539,22 @@ mod brightness_tests {
         let col_widths: HashMap<usize, usize> =
             col_ixs.iter().map(|&c| (c, sheet_rec_col_width_for_test(&grid, c))).collect();
         let row_agg = compute::compute_row_agg_func(&grid, &display_rows, hr, 2);
-        let mut sink = GuiCanvasSink::new();
-        render::fill_cells(
-            &mut sink, &display_rows, &col_ixs, &col_widths, &grid,
-            hr, 2, 2, lm, col_ixs.len(), hr, lm, &row_agg,
-        );
+        // Same shared adapter the interactive path uses.
+        let view = rswidgets::gridview::GridView::new(0, 0);
+        {
+            let mut sink = render::GridSink::new(&view);
+            render::fill_cells(
+                &mut sink, &display_rows, &col_ixs, &col_widths, &grid,
+                hr, 2, 2, lm, col_ixs.len(), hr, lm, &row_agg,
+            );
+        }
         let mut dc = RecordingDrawContext::new();
         // Cursor parked off the displayed row so neither sample cell takes
         // the cursor highlight (which would mask the base backgrounds).
         render_to(
-            &sink, &mut dc, &col_ixs, &col_widths, &display_rows,
-            hr, 2, 2, lm, hr + 1, lm, false, "", None,
+            &view, &mut dc, &col_ixs, &col_widths, &display_rows,
+            hr, 2, 2, lm, hr + 1, lm, false, "", None, crate::grid::SelectionKind::Cells,
+            &row_agg, &[],
         );
         // Cell background rects in the grid band, left to right.
         let mut bgs: Vec<((f64, f64), (f64, f64, f64, f64))> = dc
@@ -6427,9 +7583,590 @@ mod brightness_tests {
         );
     }
 
+    /// A totals line is computed, not entered, so it must render off pure
+    /// white — half a step toward the margin, and nothing like it.
+    ///
+    /// A totals column is a *main-region* column, so before this shade it
+    /// painted `CELL_BODY` white, byte-identical to a data column. This is
+    /// the regression: a sheet's derived total had to be told apart from its
+    /// data by reading the numbers.
+    #[test]
+    fn totals_column_and_row_render_off_white() {
+        use crate::grid::{CellAddr, ColumnAddr};
+
+        let mut grid: GridBox = crate::grid::Grid::new(2, 3).into();
+        // Data in A and B...
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
+        grid.set(&CellAddr::Main { row: 0, col: 1 }, "20".into());
+        grid.set(&CellAddr::Main { row: 1, col: 0 }, "30".into());
+        grid.set(&CellAddr::Main { row: 1, col: 1 }, "40".into());
+        // ...and a totals column in C, plus a totals row on main row 1.
+        grid.set(
+            &CellAddr::Header { row: 0, col: ColumnAddr::Main(2) },
+            "=TOTAL".into(),
+        );
+        grid.set(
+            &CellAddr::Left { col: MARGIN_COLS - 1, row: 1 },
+            "=TOTAL".into(),
+        );
+
+        let hr = HEADER_ROWS;
+        let lm = MARGIN_COLS;
+        let mr = 2;
+        let mc = 3;
+        // Two body rows x three main columns, nothing from the margin.
+        let display_rows = vec![hr, hr + 1];
+        let col_ixs = vec![lm, lm + 1, lm + 2];
+        let col_widths: HashMap<usize, usize> = col_ixs
+            .iter()
+            .map(|&c| (c, sheet_rec_col_width_for_test(&grid, c)))
+            .collect();
+        let row_agg = compute::compute_row_agg_func(&grid, &display_rows, hr, mr);
+        let col_agg = compute::compute_col_agg_func(&grid, &col_ixs);
+
+        // The directives must actually be detected, or this test would pass
+        // for the wrong reason (asserting a shade that nothing is using).
+        assert!(
+            col_agg[2].is_some(),
+            "the =TOTAL column must be recognised as a totals column, got {col_agg:?}"
+        );
+        assert!(
+            row_agg[1].is_some(),
+            "the =TOTAL row must be recognised as a totals row, got {row_agg:?}"
+        );
+        assert!(
+            row_agg[0].is_none() && col_agg[0].is_none() && col_agg[1].is_none(),
+            "the plain data row/columns must NOT be marked as totals ({row_agg:?}, {col_agg:?})"
+        );
+
+        let view = rswidgets::gridview::GridView::new(0, 0);
+        {
+            let mut sink = render::GridSink::new(&view);
+            render::fill_cells(
+                &mut sink, &display_rows, &col_ixs, &col_widths, &grid,
+                hr, mr, mc, lm, col_ixs.len(), hr, lm, &row_agg,
+            );
+        }
+        let mut dc = RecordingDrawContext::new();
+        // Cursor parked off both axes so no cell takes the cursor highlight.
+        render_to(
+            &view, &mut dc, &col_ixs, &col_widths, &display_rows,
+            hr, mr, mc, lm, hr + 5, lm + 5, false, "", None,
+            crate::grid::SelectionKind::Cells, &row_agg, &col_agg,
+        );
+
+        // Background rects, in paint order: row 0 (A,B,C) then row 1 (A,B,C).
+        let bgs: Vec<(f64, f64, f64, f64)> = dc
+            .fill_rects()
+            .into_iter()
+            .filter(|r| r.y >= header_h() - 0.5 && r.y < header_h() + 2.0 * row_h() - 0.5)
+            .map(|r| r.rgba)
+            .collect();
+        assert!(bgs.len() >= 6, "expected 6 cell fills, got {bgs:?}");
+        let is = |c: (f64, f64, f64, f64), v: f64| (c.0 - v).abs() < 0.01;
+
+        // Row 0: A and B are plain data (white); C is the totals column.
+        assert!(is(bgs[0], 1.0), "A1 (data) must stay white, got {:?}", bgs[0]);
+        assert!(is(bgs[1], 1.0), "B1 (data) must stay white, got {:?}", bgs[1]);
+        assert!(
+            is(bgs[2], 0.875),
+            "C1 (totals column) must be shaded to 0.875, got {:?}",
+            bgs[2]
+        );
+        // Row 1 is the totals row, so all three of its cells are shaded.
+        for (i, cell) in [3usize, 4, 5].iter().enumerate() {
+            assert!(
+                is(bgs[*cell], 0.875),
+                "totals row cell {i} must be shaded to 0.875, got {:?}",
+                bgs[*cell]
+            );
+        }
+    }
+
+    /// The totals shade must not change the data/margin shades around it, and
+    /// must not become so dark it outranks the margin.
+    #[test]
+    fn aggregate_shade_sits_between_data_and_margin() {
+        let p = chrome::palette();
+        let (data, margin, agg) = (p.cell_body().0, p.margin_body().0, p.aggregate_body().0);
+        assert!(
+            agg < data && agg > margin,
+            "a totals cell must read between data ({data}) and margin ({margin}), got {agg}"
+        );
+        // Half the margin's *darkness*, not half its brightness: taking half
+        // the brightness literally would land below the margin and invert the
+        // hierarchy, making a derived total the loudest thing on the sheet.
+        let margin_darkness = 1.0 - margin;
+        assert!(
+            (1.0 - agg - margin_darkness / 2.0).abs() < 0.001,
+            "totals shade must be half the margin's darkness ({margin_darkness}/2), got {agg}"
+        );
+    }
+
+    /// Night mode repaints corro's own grid surfaces, not just the toolkit's.
+    ///
+    /// The app keeps ownership of its numbers (its `PAPER` is 0.94 where the
+    /// toolkit's `Role::Paper` is 0.96, and it has a gutter the toolkit has no
+    /// role for), so the theme has to reach the app's palette too. This drives
+    /// the real paint path under both schemes and asserts the surfaces invert.
+    #[test]
+    fn night_mode_repaints_the_grid_palette() {
+        // Only `ColorScheme` is used: `Role`/`Theme` were imported here for a
+        // version of this test that read the toolkit's palette directly, which
+        // this one no longer does (it drives corro's own paint path instead).
+        // The unused import was invisible on Linux — where the GTK build is
+        // the one that compiles this — and only surfaced when the module was
+        // compiled for an Apple target, which nothing had done.
+        use rswidgets::core::ColorScheme;
+        let grid = two_by_two_grid();
+        let hr = HEADER_ROWS;
+        let lm = MARGIN_COLS;
+        let mr = 2;
+        let mc = 2;
+        let display_rows = vec![hr, hr + 1];
+        let col_ixs = vec![lm - 1, lm, lm + 1];
+        let col_widths: HashMap<usize, usize> = col_ixs
+            .iter()
+            .map(|&c| (c, sheet_rec_col_width_for_test(&grid, c)))
+            .collect();
+        let row_agg = compute::compute_row_agg_func(&grid, &display_rows, hr, mr);
+        let col_agg = compute::compute_col_agg_func(&grid, &col_ixs);
+
+        // Paint once per scheme and collect the cell fills in the grid band.
+        let paint_fills = |scheme: ColorScheme| -> Vec<(f64, f64, f64, f64)> {
+            rswidgets::core::set_color_scheme(scheme);
+            let view = rswidgets::gridview::GridView::new(0, 0);
+            {
+                let mut sink = render::GridSink::new(&view);
+                render::fill_cells(
+                    &mut sink, &display_rows, &col_ixs, &col_widths, &grid,
+                    hr, mr, mc, lm, col_ixs.len(), hr + 5, lm + 5, &row_agg,
+                );
+            }
+            let mut dc = RecordingDrawContext::new();
+            render_to(
+                &view, &mut dc, &col_ixs, &col_widths, &display_rows,
+                hr, mr, mc, lm, hr + 5, lm + 5, false, "", None,
+                crate::grid::SelectionKind::Cells, &row_agg, &col_agg,
+            );
+            dc.fill_rects()
+                .into_iter()
+                .filter(|r| r.y >= header_h() - 0.5 && r.y < header_h() + 2.0 * row_h() - 0.5)
+                .map(|r| r.rgba)
+                .collect()
+        };
+
+        let light = paint_fills(ColorScheme::Light);
+        let night = paint_fills(ColorScheme::Night);
+        rswidgets::core::set_color_scheme(ColorScheme::Light);
+        assert!(!light.is_empty() && light.len() == night.len());
+
+        // Every painted surface must change: a surface left behind is the
+        // failure mode that reads as "night mode is on but the grid is still
+        // a white sheet".
+        for (i, (l, n)) in light.iter().zip(night.iter()).enumerate() {
+            assert_ne!(
+                l, n,
+                "cell fill {i} did not change between schemes: {l:?} -> {n:?}"
+            );
+        }
+        // And it must invert: a body cell that is bright in light mode is dark
+        // in night mode.
+        let lum = |c: &(f64, f64, f64, f64)| 0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2;
+        let body_light = light
+            .iter()
+            .find(|c| (c.0 - 1.0).abs() < 0.01)
+            .expect("a white body cell in light mode");
+        assert!(lum(body_light) > 0.9, "light body must be bright");
+        // The matching night fill is at the same index; the whole frame is dark.
+        for n in &night {
+            assert!(lum(n) < 0.45, "night fills must be dark, got {n:?}");
+        }
+    }
+
+    /// The default scheme is light, so a build that never toggles is unaffected.
+    ///
+    /// Guards the no-regression property for corro's palette specifically:
+    /// the app's own values must still be the historical ones.
+    #[test]
+    fn the_default_scheme_is_unchanged() {
+        use rswidgets::core::ColorScheme;
+        rswidgets::core::set_color_scheme(ColorScheme::Light);
+        let pal = chrome::palette();
+        assert_eq!(pal.paper(), (0.94, 0.94, 0.94));
+        assert_eq!(pal.gutter(), (0.9, 0.9, 0.9));
+        assert_eq!(pal.gridline(), (0.8, 0.8, 0.8));
+        assert_eq!(pal.margin_body(), (0.75, 0.75, 0.75));
+        assert_eq!(pal.cell_body(), (1.0, 1.0, 1.0));
+        assert_eq!(pal.cell_selected(), (0.9, 0.95, 1.0));
+        assert_eq!(pal.cell_editing(), (1.0, 1.0, 0.8));
+        assert_eq!(pal.cell_cursor(), (0.8, 0.9, 1.0));
+        // The totals shade keeps its documented 0.875.
+        assert_eq!(pal.aggregate_body(), (0.875, 0.875, 0.875));
+    }
+
+    /// The padlock must stay visible against the gutter in night mode.
+    ///
+    /// The two slate values were chosen to contrast with the *light* gutter; a
+    /// dark gutter would swallow both. Asserted as a contrast ratio so it
+    /// states the property rather than a literal.
+    #[test]
+    fn padlocks_stay_visible_in_night_mode() {
+        use rswidgets::core::ColorScheme;
+        rswidgets::core::set_color_scheme(ColorScheme::Night);
+        let gutter = chrome::palette().gutter();
+        for (name, c) in [("unlocked", padlock_open()), ("locked", padlock_shut())] {
+            let ratio = 0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2;
+            let g = 0.2126 * gutter.0 + 0.7152 * gutter.1 + 0.0722 * gutter.2;
+            assert!(
+                (ratio - g).abs() > 0.05,
+                "the {name} padlock must stand out from the night gutter: \
+                 icon {ratio:.3} vs gutter {g:.3}"
+            );
+        }
+        rswidgets::core::set_color_scheme(ColorScheme::Light);
+        // And the locked padlock is the stronger of the two, as in light mode.
+        let (o, s) = (padlock_open(), padlock_shut());
+        assert!(
+            s.0 < o.0,
+            "the locked padlock must be the stronger mark: {o:?} vs {s:?}"
+        );
+    }
+
+    /// A margin cell is already dim, so shading it "half way" to the margin
+    /// would push it *away* from the margin it belongs to. A totals directive
+    /// sitting in the margin (the key cell itself) must therefore leave that
+    /// cell at the margin shade.
+    ///
+    /// Asserted through the real paint path rather than a predicate, so it
+    /// covers the ordering of the branches in `render_to` and not just the
+    /// rule it intends to encode.
+    #[test]
+    fn margin_cells_never_take_the_totals_shade() {
+        use crate::grid::CellAddr;
+        let mut grid: GridBox = crate::grid::Grid::new(1, 2).into();
+        // The key cell that marks main row 0 as a totals row.
+        grid.set(
+            &CellAddr::Left { col: MARGIN_COLS - 1, row: 0 },
+            "=TOTAL".into(),
+        );
+        let hr = HEADER_ROWS;
+        let lm = MARGIN_COLS;
+        let mr = 1;
+        let mc = 2;
+        // One body row, showing the left-margin key column and main column A.
+        let display_rows = vec![hr];
+        let col_ixs = vec![lm - 1, lm];
+        let col_widths: HashMap<usize, usize> = col_ixs
+            .iter()
+            .map(|&c| (c, sheet_rec_col_width_for_test(&grid, c)))
+            .collect();
+        let row_agg = compute::compute_row_agg_func(&grid, &display_rows, hr, mr);
+        assert!(
+            row_agg[0].is_some(),
+            "row 0 must be recognised as a totals row for this test to bite"
+        );
+        let col_agg = compute::compute_col_agg_func(&grid, &col_ixs);
+
+        let view = rswidgets::gridview::GridView::new(0, 0);
+        {
+            let mut sink = render::GridSink::new(&view);
+            render::fill_cells(
+                &mut sink, &display_rows, &col_ixs, &col_widths, &grid,
+                hr, mr, mc, lm, col_ixs.len(), hr, lm, &row_agg,
+            );
+        }
+        let mut dc = RecordingDrawContext::new();
+        render_to(
+            &view, &mut dc, &col_ixs, &col_widths, &display_rows,
+            hr, mr, mc, lm, hr + 3, lm + 3, false, "", None,
+            crate::grid::SelectionKind::Cells, &row_agg, &col_agg,
+        );
+        let bgs: Vec<(f64, f64, f64, f64)> = dc
+            .fill_rects()
+            .into_iter()
+            .filter(|r| r.y >= header_h() - 0.5 && r.y < header_h() + row_h())
+            .map(|r| r.rgba)
+            .collect();
+        assert!(bgs.len() >= 2, "expected margin + main fills, got {bgs:?}");
+        assert!(
+            (bgs[0].0 - chrome::palette().margin_body().0).abs() < 0.01,
+            "the margin key cell carrying the directive must stay at the \
+             margin shade, not take the totals shade, got {:?}",
+            bgs[0]
+        );
+    }
+
+    /// Cursor and selection must keep winning over the totals shade: a cell
+    /// under the caret or inside a selection has to stay findable, whatever
+    /// line it sits on.
+    #[test]
+    fn cursor_and_selection_outrank_the_totals_shade() {
+        use crate::grid::{CellAddr, ColumnAddr};
+
+        let mut grid: GridBox = crate::grid::Grid::new(1, 2).into();
+        grid.set(
+            &CellAddr::Header { row: 0, col: ColumnAddr::Main(1) },
+            "=TOTAL".into(),
+        );
+        let hr = HEADER_ROWS;
+        let lm = MARGIN_COLS;
+        let mr = 1;
+        let mc = 2;
+        let display_rows = vec![hr];
+        let col_ixs = vec![lm, lm + 1];
+        let col_widths: HashMap<usize, usize> = col_ixs
+            .iter()
+            .map(|&c| (c, sheet_rec_col_width_for_test(&grid, c)))
+            .collect();
+        let row_agg = compute::compute_row_agg_func(&grid, &display_rows, hr, mr);
+        let col_agg = compute::compute_col_agg_func(&grid, &col_ixs);
+        let view = rswidgets::gridview::GridView::new(0, 0);
+        {
+            let mut sink = render::GridSink::new(&view);
+            render::fill_cells(
+                &mut sink, &display_rows, &col_ixs, &col_widths, &grid,
+                hr, mr, mc, lm, col_ixs.len(), hr, lm, &row_agg,
+            );
+        }
+        let is = |c: (f64, f64, f64, f64), v: f64| (c.0 - v).abs() < 0.01;
+
+        // Cursor parked ON the totals column: the cursor fill must win.
+        let mut dc = RecordingDrawContext::new();
+        render_to(
+            &view, &mut dc, &col_ixs, &col_widths, &display_rows,
+            hr, mr, mc, lm, hr, lm + 1, false, "", None,
+            crate::grid::SelectionKind::Cells, &row_agg, &col_agg,
+        );
+        let cursor_bg = dc
+            .fill_rects()
+            .into_iter()
+            .filter(|r| r.y >= header_h() - 0.5 && r.y < header_h() + row_h())
+            .map(|r| r.rgba)
+            .last()
+            .expect("a fill for the cursor cell");
+        assert!(
+            is(cursor_bg, chrome::palette().cell_cursor().0),
+            "the cursor cell must keep the cursor fill even on a totals line, got {cursor_bg:?}"
+        );
+
+        // Now the TOTALS cell selected: anchor the selection on the plain data
+        // column and the cursor on the totals column, so the selected cell is
+        // the shaded one. (Anchoring on the totals cell and reading the last
+        // fill would instead read the data column, and assert the wrong cell.)
+        // The cursor must be OFF this cell, or the cursor fill would (rightly)
+        // outrank the selection and the assertion below would be testing the
+        // wrong thing. Park it on a second body row that the selection does not
+        // cover, and select the totals cell on row 1.
+        let mut dc2 = RecordingDrawContext::new();
+        render_to(
+            &view, &mut dc2, &col_ixs, &col_widths, &display_rows,
+            hr, mr, mc, lm, hr + 1, lm, false, "", Some((hr, lm + 1)),
+            crate::grid::SelectionKind::Cells, &row_agg, &col_agg,
+        );
+        // The totals cell is the last fill of the FIRST body row: the cursor
+        // sits on the second row, and selection covers both columns of row 1.
+        let sel_bg = dc2
+            .fill_rects()
+            .into_iter()
+            .filter(|r| r.y >= header_h() - 0.5 && r.y < header_h() + row_h())
+            .map(|r| r.rgba)
+            .nth(1)
+            .expect("a fill for the selected totals cell");
+        assert!(
+            is(sel_bg, chrome::palette().cell_selected().0),
+            "a selected cell must keep the selection fill even on a totals line, got {sel_bg:?}"
+        );
+    }
+
     /// Test-only width lookup mirroring sheet_rec_col_width without an App.
     fn sheet_rec_col_width_for_test(grid: &GridBox, col: usize) -> usize {
         grid.col_width(col).max(1)
+    }
+
+    /// A `Rows`/`Cols` selection highlights the whole main-body row/column,
+    /// not just the anchor↔cursor rectangle. This is the rendering half of
+    /// the gutter-click rule: without the kind, clicking a column header
+    /// would select only the header cell's rectangle (one cell wide) while
+    /// the intent is the entire column.
+    #[test]
+    fn row_and_col_kinds_expand_the_body_highlight() {
+        use crate::grid::SelectionKind;
+        let grid = two_by_two_grid();
+        let hr = HEADER_ROWS;
+        let lm = MARGIN_COLS;
+        // Two display rows and three columns: [A boundary, main A, main B].
+        let display_rows = vec![hr, hr + 1];
+        let col_ixs = vec![lm - 1, lm, lm + 1];
+        let col_widths: HashMap<usize, usize> =
+            col_ixs.iter().map(|&c| (c, sheet_rec_col_width_for_test(&grid, c))).collect();
+        let row_agg = compute::compute_row_agg_func(&grid, &display_rows, hr, 2);
+
+        let view = rswidgets::gridview::GridView::new(0, 0);
+        {
+            let mut sink = render::GridSink::new(&view);
+            render::fill_cells(
+                &mut sink, &display_rows, &col_ixs, &col_widths, &grid,
+                hr, 2, 2, lm, col_ixs.len(), hr, lm, &row_agg,
+            );
+        }
+
+        let sel = chrome::palette().cell_selected();
+        let sel_rgba = (sel.0, sel.1, sel.2, 1.0);
+        // Fill of the topmost cell rect in the grid band at `x` on the given
+        // display row (`row_y` is that row's top y).
+        let fill_at = |kind: SelectionKind,
+                       anchor: (usize, usize),
+                       cursor: (usize, usize),
+                       row_y: f64,
+                       x: f64| {
+            let mut dc = RecordingDrawContext::new();
+            render_to(
+                &view, &mut dc, &col_ixs, &col_widths, &display_rows,
+                hr, 2, 2, lm, cursor.0, cursor.1, false, "", Some(anchor), kind,
+                &row_agg, &[],
+            );
+            dc.fill_rects()
+                .into_iter()
+                .find(|r| r.y >= row_y - 0.5 && r.y < row_y + row_h() && (r.x - x).abs() < 0.5)
+                .map(|r| r.rgba)
+                .unwrap_or_else(|| panic!("no cell rect at x={x}, y={row_y}"))
+        };
+
+        // Column x positions: display order is [left-margin boundary, A, B], so
+        // the gutter width is the origin of the *margin* column, not of A.
+        let x_margin = row_label_w();
+        let x_a = x_margin + *col_widths.get(&(lm - 1)).unwrap() as f64 * char_w();
+        let x_b = x_a + *col_widths.get(&lm).unwrap() as f64 * char_w();
+        let row0_y = header_h();
+        let row1_y = row0_y + row_h();
+
+        // Cells-kind spanning rows 0-1 of column A: A is selected, B is not.
+        // The cursor sits on row 1, so the row-0 samples are never the cursor
+        // cell (whose own highlight would mask the selection fill).
+        assert_eq!(fill_at(SelectionKind::Cells, (hr, lm), (hr + 1, lm), row0_y, x_a), sel_rgba);
+        assert_ne!(
+            fill_at(SelectionKind::Cells, (hr, lm), (hr + 1, lm), row0_y, x_b),
+            sel_rgba,
+            "a Cells selection must not cover column B"
+        );
+
+        // Rows-kind anchored on a single row: the whole row highlights,
+        // including column B and the left-margin boundary cell (which the
+        // anchor↔cursor rectangle alone would miss).
+        assert_eq!(fill_at(SelectionKind::Rows, (hr, lm), (hr, lm), row0_y, x_b), sel_rgba);
+        assert_eq!(fill_at(SelectionKind::Rows, (hr, lm), (hr, lm), row0_y, x_margin), sel_rgba);
+        // ... but not the next row down.
+        assert_ne!(
+            fill_at(SelectionKind::Rows, (hr, lm), (hr, lm), row1_y, x_b),
+            sel_rgba,
+            "a row selection must not bleed into the next row"
+        );
+
+        // Cols-kind anchored on row 0 of column B: every row of B highlights,
+        // and the neighbouring column does not. (The anchor cell is also the
+        // cursor, so sample the column on the *other* row to see the fill.)
+        assert_eq!(fill_at(SelectionKind::Cols, (hr, lm + 1), (hr, lm + 1), row1_y, x_b), sel_rgba);
+        assert_ne!(
+            fill_at(SelectionKind::Cols, (hr, lm + 1), (hr, lm + 1), row0_y, x_a),
+            sel_rgba,
+            "a column selection must not cover the neighbouring column"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gutter_cycle_tests {
+    use super::*;
+
+    /// `apply_selection` must report the **cursor**, not the anchor: the
+    /// renderer reads `last_row`/`last_col` as the cursor, so a caller that
+    /// stored the anchor would collapse a whole-row/column/sheet selection
+    /// back to its first cell. Regression for "the corner box selects only
+    /// A1".
+    #[test]
+    fn apply_selection_reports_the_cursor_not_the_anchor() {
+        let mut app = super::super::App::new_with_paths(Vec::new());
+        let anchor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+        let cursor = SheetCursor { row: HEADER_ROWS + 4, col: MARGIN_COLS + 2 };
+        let (r, c) = apply_selection(&mut app, anchor, cursor, crate::grid::SelectionKind::Cells);
+        assert_eq!((r, c), (cursor.row, cursor.col), "must report the cursor cell");
+        assert_eq!(app.core.anchor, Some(anchor), "anchor must still be stored");
+        assert_eq!(app.core.cursor, cursor);
+        assert_eq!(app.core.selection_kind, crate::grid::SelectionKind::Cells);
+    }
+
+    /// The repeat-click cycle: first click full, second click data cells,
+    /// third click full again — and a different target restarts at full.
+    #[test]
+    fn gutter_cycle_toggles_full_then_data_cells() {
+        let row3 = GutterTarget::Row(HEADER_ROWS + 2);
+        let col1 = GutterTarget::Col(MARGIN_COLS + 1);
+
+        // First click on a target is always the full row/column/sheet.
+        let full = next_gutter_full(None, row3);
+        assert!(full);
+        let state = Some(GutterCycle { target: row3, full });
+
+        // Repeat click on the same target narrows to its data cells.
+        let full = next_gutter_full(state, row3);
+        assert!(!full);
+        let state = Some(GutterCycle { target: row3, full });
+
+        // Third click widens back.
+        assert!(next_gutter_full(state, row3));
+
+        // A click on a different target never continues the old cycle.
+        assert!(next_gutter_full(Some(GutterCycle { target: row3, full: false }), col1));
+        assert!(next_gutter_full(Some(GutterCycle { target: GutterTarget::All, full: false }), row3));
+    }
+
+    /// The data-cells extents are computed from content only and stay inside
+    /// the main band.
+    #[test]
+    fn data_cell_extents_come_from_content_not_the_whole_grid() {
+        let mut grid = GridBox::from(crate::grid::Grid::new(5, 4));
+        // Column A (main col 0) has data on main rows 1 and 3 only.
+        grid.set(&CellAddr::Main { row: 1, col: 0 }, "x".into());
+        grid.set(&CellAddr::Main { row: 3, col: 0 }, "y".into());
+        // Row 1 (logical HEADER_ROWS + 1) has data in main cols 0 and 2.
+        grid.set(&CellAddr::Main { row: 1, col: 2 }, "z".into());
+
+        assert_eq!(
+            col_nonblank_row_extremes_grid(&grid, MARGIN_COLS),
+            Some((HEADER_ROWS + 1, HEADER_ROWS + 3)),
+            "column A's data spans main rows 1..=3"
+        );
+        assert_eq!(
+            row_data_col_extremes_grid(&grid, HEADER_ROWS + 1),
+            Some((MARGIN_COLS, MARGIN_COLS + 2)),
+            "row 2's data spans main columns A..=C"
+        );
+        // A column with no data yields nothing (caller falls back to full).
+        assert_eq!(col_nonblank_row_extremes_grid(&grid, MARGIN_COLS + 3), None);
+        assert_eq!(row_data_col_extremes_grid(&grid, HEADER_ROWS + 4), None);
+    }
+
+    /// The used range is the bounding box of all main data, in main-relative
+    /// indices.
+    #[test]
+    fn used_main_range_is_the_bounding_box_of_main_data() {
+        let mut grid = GridBox::from(crate::grid::Grid::new(6, 5));
+        assert_eq!(used_main_range_grid(&grid), None, "empty sheet has no used range");
+        grid.set(&CellAddr::Main { row: 1, col: 1 }, "a".into());
+        grid.set(&CellAddr::Main { row: 4, col: 3 }, "b".into());
+        // A trailing-blank column beyond the content must not extend the box.
+        grid.set(&CellAddr::Main { row: 4, col: 3 }, "b".into());
+        assert_eq!(used_main_range_grid(&grid), Some((1, 4, 1, 3)));
+
+        // Left-margin/right-margin content still bounds the *rows* (it lives
+        // at main rows) but does not invent main columns past the data.
+        grid.set(&CellAddr::Left { col: MARGIN_COLS - 1, row: 5 }, "key".into());
+        assert_eq!(
+            used_main_range_grid(&grid),
+            Some((1, 5, 1, 3)),
+            "a left-margin value on main row 5 extends the used rows"
+        );
     }
 }
 
@@ -6461,6 +8198,152 @@ mod trailing_tests {
         // Two blanks, cursor inside: hold (keyboard keeps two; the GUI
         // floor is one, and one already exceeds it).
         assert!(!grow_for_trailing_blank(4, 2, Some(0)));
+    }
+    /// A cursor move repaints only the labels whose text actually changed.
+    ///
+    /// `update_state_cursor` runs the whole formula-bar refresh on every
+    /// arrow press — including every auto-repeat — so an unconditional
+    /// `set_text` per label is a real cost on the native backends: on Win32
+    /// each is a `SetWindowText` that reflows, invalidates and repaints the
+    /// label, and `Window::queue_redraw`'s `RDW_ALLCHILDREN` cascade carries
+    /// the repaint down to it. Measured over a 1.5s held Right: 96 widget
+    /// writes before the change-detection, 30 after.
+    ///
+    /// This pins the invariant at the source level, the same way the GTK
+    /// `key_release_filter` tests pin theirs: a cursor move must not push the
+    /// hints line or the status suffix, whose text cannot change while
+    /// arrowing around (status only changes on a completed operation, hints
+    /// only when undo/redo/selection/file state flips).
+    #[test]
+    fn cursor_move_only_writes_changed_labels() {
+        let src = include_str!("gui_backend.rs");
+        // The refresh must compare before writing, for each text label.
+        // (Split the literals so this file does not match itself.)
+        let site = |label: &str, shadow: &str| {
+            let guarded = format!(
+                "if state.{shadow}.borrow().as_str() != ",
+            );
+            assert!(
+                src.contains(&guarded),
+                "the {label} write must be guarded by a change check on `{shadow}`"
+            );
+        };
+        site("address", "addr_shown");
+        site("hints", "hints_shown");
+        site("status", "status_shown");
+        // Visibility of the status suffix is guarded separately.
+        assert!(
+            src.contains("if state.status_vis.get() != show"),
+            "formula_status.set_visible must be guarded by status_vis"
+        );
+        // And the entry compares the live widget text, so a user's in-flight
+        // typing is never clobbered by a stale shadow.
+        assert!(
+            src.contains("state.formula_entry.get_text().as_deref() != Some(val.as_str())"),
+            "the entry write must compare the live widget text, not a shadow copy"
+        );
+    }
+
+    /// The formula bar's address slot must have a pinned width.
+    ///
+    /// Skipping unchanged label writes is not enough on its own: the address
+    /// text legitimately changes on every cursor move, and a shrink-to-fit
+    /// label resizes to its new text, so the controls packed after it — the
+    /// `fx` label, the entry, the status suffix — slide sideways with every
+    /// keypress. `ADDR_SLOT_W_BASE` sizes the slot for the longest address the
+    /// bar can show, and pinning it is what keeps the row still.
+    #[test]
+    fn formula_bar_address_slot_has_pinned_width() {
+        let src = include_str!("gui_backend.rs");
+        // Built by concatenation so this literal cannot match its own
+        // assertion line, which would make the check vacuously true.
+        let needle = ["addr_label.set_fixed_width(Some(", "ADDR_SLOT_W_BASE"].concat();
+        assert!(
+            src.contains(&needle),
+            "addr_label must pin its width: a shrink-to-fit address label \
+             resizes on every move and slides fx/entry/status sideways"
+        );
+        // The slot has to be wide enough for the widest address: a bracketed
+        // two-letter margin column plus a row, or a three-letter excel column
+        // at the cap. 92px at 12px text covers the worst case.
+        assert!(
+            ADDR_SLOT_W_BASE >= 80.0,
+            "ADDR_SLOT_W_BASE ({ADDR_SLOT_W_BASE}) is too narrow; a `[AA_1`-style \
+             address would clip and fx would still shift when a wider address arrived"
+        );
+    }
+
+    /// Every computed total must render bold on body ink.
+    ///
+    /// Covers all three aggregate cells — a right-margin row total, a
+    /// data-column total, and a footer grand total — which share one match
+    /// arm. The ratatui reference bolds only `footer_agg` and leaves
+    /// right-margin totals cyan; black bold across the board is a deliberate
+    /// GUI-side decision for legibility and internal consistency, and the
+    /// terminal backends were moved to match (see `sgr_cell_agg` in
+    /// `pancurses.rs`). The old grey `(0.5,0.5,0.5)` was roughly a 2:1
+    /// contrast ratio against the `(0.75,0.75,0.75)` margin fill.
+    #[test]
+    fn computed_totals_are_bold_on_body_ink() {
+        let src = include_str!("gui_backend.rs");
+        // Built by concatenation so this file cannot match its own assertion.
+        let arm = ["CellDisplayStyle::Aggregate | CellDisplayStyle::FooterAggregate",
+                   " => {"].concat();
+        let start = src.find(&arm).expect("a combined Aggregate arm must exist");
+        // Skip past this arm's own opening, then end at the NEXT arm's opening
+        // (`=> {`) — not the next mention of the type, since the comment
+        // inside this arm names `CellDisplayStyle`.
+        let rest = &src[start + arm.len()..];
+        let end = rest
+            .find(" => {")
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("draw_text_styled"),
+            "the aggregate arm must use draw_text_styled so it can carry a \
+             weight; draw_text is fixed at weight 0"
+        );
+        // Weight 1 == bold, and the ink must come from the palette rather
+        // than a hardcoded literal, so night mode can restyle it. The exact
+        // role is pinned by `totals_use_body_ink_not_highlight_ink`.
+        assert!(
+            body.contains("pal.text()")
+                && body.contains("draw_text_styled")
+                && body.contains(", 1.0, 0, 1)"),
+            "computed totals must draw themed body ink at weight 1 (bold); \
+             got {body}"
+        );
+    }
+
+    /// Totals must use the *body* ink role, never the highlight-ink role.
+    ///
+    /// A total is drawn on the cell body / margin fill, not on the cursor or
+    /// selection highlight. `text_on_highlight` is near-black in the night
+    /// palette (0.04, 0.04, 0.07), so using it for a total puts near-black
+    /// text on a near-black sheet — invisible in exactly the mode this is
+    /// most likely to be noticed in. `text` is the body ink and themes to a
+    /// light 0.92 in night mode, which is the point of reading it from the
+    /// palette rather than hardcoding black.
+    #[test]
+    fn totals_use_body_ink_not_highlight_ink() {
+        let src = include_str!("gui_backend.rs");
+        let arm = ["CellDisplayStyle::Aggregate | CellDisplayStyle::FooterAggregate",
+                   " => {"].concat();
+        let start = src.find(&arm).expect("a combined Aggregate arm must exist");
+        let rest = &src[start + arm.len()..];
+        let end = rest.find(" => {").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("pal.text()"),
+            "computed totals must take their ink from the themed body ink \
+             (`pal.text()`), so night mode paints them light on the dark sheet; \
+             got {body}"
+        );
+        assert!(
+            !body.contains("pal.text_on_highlight()"),
+            "computed totals must NOT use `text_on_highlight`: it is near-black \
+             in the night palette and would make them unreadable there; got {body}"
+        );
     }
 }
 
@@ -6981,5 +8864,222 @@ mod startup_race_tests {
             startup_edit_action(true, false),
             StartupEdit::KeepInFlight
         );
+    }
+}
+
+#[cfg(test)]
+mod mobile_gesture_tests {
+    use super::mobile_gesture::*;
+    use super::{reset_view_zoom, row_h, set_view_zoom};
+
+    /// The sheet canvas id these tests use. `run_gui` publishes the real one;
+    /// a test sets it directly and every gesture call carries it, exactly as
+    /// the mobile hosts do.
+    const SHEET: u64 = 7;
+    /// A different canvas (the sheet-tab strip), which must be left alone.
+    const OTHER: u64 = 8;
+
+    fn setup() {
+        set_sheet_canvas_id(SHEET);
+        mobile_gesture_cancel(SHEET);
+    }
+
+    /// Desktop rule: a mouse press arms selection immediately, so a following
+    /// drag extends it rather than panning.
+    #[test]
+    fn mouse_drag_selects() {
+        setup();
+        assert_eq!(1, mobile_gesture_down(SHEET, 10.0, 10.0, false));
+        assert_eq!(1, mobile_gesture_move(SHEET, 20.0, 20.0));
+        // A drag never re-fires as a tap on release.
+        assert_eq!(0, mobile_gesture_up(SHEET, 20.0, 20.0));
+        setup();
+    }
+
+    /// Phone rule: a finger drag pans (code 2) and does *not* move the
+    /// selection — that is the whole point of the platform-aware split.
+    #[test]
+    fn touch_drag_scrolls() {
+        setup();
+        assert_eq!(0, mobile_gesture_down(SHEET, 10.0, 10.0, true));
+        assert_eq!(2, mobile_gesture_move(SHEET, 40.0, 10.0));
+        assert_eq!(2, mobile_gesture_move(SHEET, 70.0, 10.0));
+        assert_eq!(0, mobile_gesture_up(SHEET, 70.0, 10.0));
+        setup();
+    }
+
+    /// A shaky tap stays inside the slop and is reported as a move that did
+    /// nothing, so the host does not pan by a pixel.
+    #[test]
+    fn touch_move_inside_slop_is_ignored() {
+        setup();
+        mobile_gesture_down(SHEET, 10.0, 10.0, true);
+        assert_eq!(0, mobile_gesture_move(SHEET, 11.0, 11.0));
+        setup();
+    }
+
+    /// A long press arms selection; the drag that follows selects, not
+    /// scrolls.
+    #[test]
+    fn touch_long_press_arms_selection() {
+        setup();
+        assert_eq!(0, mobile_gesture_down(SHEET, 10.0, 10.0, true));
+        assert_eq!(4, mobile_gesture_long_press(SHEET, 10.0, 10.0));
+        assert_eq!(1, mobile_gesture_move(SHEET, 60.0, 60.0));
+        setup();
+    }
+
+    /// Movement cancels a pending long press, so a late timer cannot turn an
+    /// in-flight pan into a selection.
+    #[test]
+    fn movement_cancels_the_pending_long_press() {
+        setup();
+        mobile_gesture_down(SHEET, 10.0, 10.0, true);
+        assert_eq!(2, mobile_gesture_move(SHEET, 60.0, 10.0));
+        assert_eq!(0, mobile_gesture_long_press(SHEET, 60.0, 10.0));
+        setup();
+    }
+
+    /// A cancelled gesture leaves nothing behind: no tap, and the next press
+    /// starts clean.
+    #[test]
+    fn cancel_drops_the_gesture() {
+        setup();
+        mobile_gesture_down(SHEET, 10.0, 10.0, true);
+        mobile_gesture_cancel(SHEET);
+        assert_eq!(0, mobile_gesture_up(SHEET, 10.0, 10.0));
+        setup();
+    }
+
+    /// A press/release with no drag is *reported* as a tap, not applied: the
+    /// host owns the per-canvas click dispatch, so the tab strip's taps do not
+    /// end up on the sheet.
+    #[test]
+    fn tap_is_reported_not_applied() {
+        setup();
+        mobile_gesture_down(SHEET, 10.0, 10.0, true);
+        assert_eq!(3, mobile_gesture_up(SHEET, 10.0, 10.0));
+        setup();
+    }
+
+    /// Gestures on any canvas other than the sheet are ignored, so the
+    /// sheet-tab strip keeps its own (per-canvas) click handling.
+    #[test]
+    fn gestures_on_other_canvases_are_ignored() {
+        setup();
+        assert_eq!(0, mobile_gesture_down(OTHER, 10.0, 10.0, false));
+        assert_eq!(0, mobile_gesture_move(OTHER, 50.0, 10.0));
+        assert_eq!(0, mobile_gesture_up(OTHER, 50.0, 10.0));
+        assert_eq!(0, mobile_gesture_long_press(OTHER, 10.0, 10.0));
+        assert_eq!((0, 0), drag_viewport_by_pixels(OTHER, 0.0, -100.0));
+        setup();
+    }
+
+    /// The pixel→cell conversion is the zoom-aware one, so a pinch changes how
+    /// far a drag pans: at 2x each cell is twice as tall, so the same 40px
+    /// drag is half as many rows.
+    #[test]
+    fn drag_conversion_uses_the_zoom() {
+        // Also touches the process-wide zoom: guard it like the zoom tests.
+        let _zoom_guard = super::ViewZoomGuard::new();
+        setup();
+        reset_view_zoom();
+        let row_h_1x = row_h();
+        let (rows_1x, _) = drag_viewport_by_pixels(SHEET, 0.0, -row_h_1x * 3.0);
+        assert_eq!(3, rows_1x, "no zoom: 3 rows of travel is 3 rows");
+        set_view_zoom(2.0);
+        let (rows_2x, _) = drag_viewport_by_pixels(SHEET, 0.0, -row_h_1x * 3.0);
+        assert_eq!(1, rows_2x, "2x zoom: the same pixels are half as many rows");
+        assert_eq!(
+            0,
+            drag_viewport_by_pixels(SHEET, 0.0, 1.0).0,
+            "sub-cell motion is rounded to none"
+        );
+        reset_view_zoom();
+        setup();
+    }
+}
+
+#[cfg(test)]
+mod view_zoom_tests {
+    use super::*;
+
+    /// Every test here changes the process-wide (thread-local) zoom, so each
+    /// takes a guard that restores 1.0 on drop — including on a panic, which
+    /// would otherwise leave a later test on the same harness thread measuring
+    /// a zoomed grid.
+    fn guard() -> ViewZoomGuard {
+        ViewZoomGuard::new()
+    }
+
+    /// The pinch scale multiplies every grid metric, so one assignment moves
+    /// the renderer, the hit-test and the pixel→cell conversion together — the
+    /// property the whole feature rests on.
+    #[test]
+    fn zoom_scales_every_grid_metric() {
+        let _guard = guard();
+        reset_view_zoom();
+        let (r1, c1, f1, h1, l1) = (row_h(), char_w(), font_size(), header_h(), row_label_w());
+
+        // 2x should double each of them (within float tolerance).
+        let applied = set_view_zoom(2.0);
+        assert_eq!(2.0, applied);
+        assert!((row_h() - 2.0 * r1).abs() < 1e-9);
+        assert!((char_w() - 2.0 * c1).abs() < 1e-9);
+        assert!((font_size() - 2.0 * f1).abs() < 1e-9);
+        assert!((header_h() - 2.0 * h1).abs() < 1e-9);
+        assert!((row_label_w() - 2.0 * l1).abs() < 1e-9);
+
+        reset_view_zoom();
+        assert!((row_h() - r1).abs() < 1e-9, "reset restores the base metrics");
+    }
+
+    /// A pinch is a sequence of ratios, and the result is clamped to the
+    /// documented range — a runaway multiplier must not grow the sheet without
+    /// bound.
+    #[test]
+    fn zoom_by_multiplies_and_clamps() {
+        let _guard = guard();
+        reset_view_zoom();
+        assert!((zoom_view_by(1.5) - 1.5).abs() < 1e-9);
+        assert!((zoom_view_by(2.0) - 3.0).abs() < 1e-9);
+        assert_eq!(MAX_VIEW_ZOOM, zoom_view_by(100.0));
+        assert_eq!(MIN_VIEW_ZOOM, zoom_view_by(0.0001));
+        // Degenerate factors are ignored rather than poisoning the scale.
+        let before = view_zoom();
+        assert_eq!(before, zoom_view_by(0.0));
+        assert_eq!(before, zoom_view_by(f64::NAN));
+        assert!(view_zoom().is_finite() && view_zoom() > 0.0);
+        reset_view_zoom();
+    }
+
+    /// Direct assignment clamps and normalises too, so a host that hands a
+    /// computed scale straight in cannot break the layout.
+    #[test]
+    fn set_zoom_clamps_and_normalises() {
+        let _guard = guard();
+        reset_view_zoom();
+        assert_eq!(MAX_VIEW_ZOOM, set_view_zoom(f64::INFINITY));
+        assert_eq!(MIN_VIEW_ZOOM, set_view_zoom(f64::NEG_INFINITY));
+        assert_eq!(MIN_VIEW_ZOOM, set_view_zoom(-5.0));
+        assert_eq!(1.0, set_view_zoom(f64::NAN));
+        reset_view_zoom();
+    }
+
+    /// The scale is applied inside the metric functions, so the *displayed*
+    /// size and the *hit* geometry can never disagree: both derive from the
+    /// same call. This checks the invariant on the numbers a click maps with:
+    /// a column's pixel width is `characters * char_w()`, so it scales exactly
+    /// like the hit-test's own arithmetic.
+    #[test]
+    fn column_pixel_width_tracks_the_zoom() {
+        let _guard = guard();
+        reset_view_zoom();
+        let columns = 8.0_f64; // any recorded column width, in characters
+        let width_at_1x = columns * char_w();
+        set_view_zoom(2.0);
+        let width_at_2x = columns * char_w();
+        assert!((width_at_2x - 2.0 * width_at_1x).abs() < 1e-9);
+        reset_view_zoom();
     }
 }

@@ -28,6 +28,19 @@ The check that proves the Rust half without a Mac is:
 rustxWidgets/scripts/check_rswidgets_macos.sh
 ```
 
+and, for corro's half of the same path:
+
+```text
+scripts/check_corro_macos.sh      # corro::gui::macos_backend, feature `gui-macos`
+macos/corro/scripts/check_bridge.sh   # the C bridge header vs the Rust exports
+```
+
+`macos/corro` is the host crate: it exports the 20 `corro_macos_*` C entry
+points §3 names, and carries the AppKit `Corro*` shims. The three scripts
+above, plus `.github/workflows/macos.yml`, are what keep it honest without a
+Mac. A *runnable* `.app` still needs a Mac (§2: the bundle, the Xcode project
+and the icons are the host's, and an `NSApplication` needs a window server).
+
 It type-checks the AppKit paths for both macOS targets **and** re-checks an
 iOS target, because both platforms compile the same `backends/apple.rs`: a
 change to the shared module that breaks one platform must not pass on the
@@ -271,11 +284,22 @@ That check runs from both ends:
   `(class, selector)` lists.
 * `ios/corro/scripts/check_selectors.sh` checks the **iOS** shim files really
   implement every selector the iOS adapter sends (it found a live crash:
-  `create_box` sends `corroSetSpacing:`, which nothing implemented), and — since
-  no macOS host exists yet — checks the **macOS** adapter's selectors are all
-  *generatable*, which is what makes writing that host a "run the generator"
-  step rather than a "reinvent the shims" step.
+  `create_box` sends `corroSetSpacing:`, which nothing implemented). The
+  macOS twin is now `macos/corro/scripts/check_bridge.sh`, which diffs
+  `app/CorroMacBridge.h` against the `#[no_mangle]` exports in
+  `macos/corro/src/lib.rs` — in *both* directions, since a symbol nobody
+  exports and a declaration nobody defines fail differently.
+* `.github/workflows/macos.yml` runs all of it: the cfg checks on Linux, and on
+  a Mac the staticlib build plus a link against an Objective-C file that
+  references every `corro_macos_*` symbol. Linking is the only step that proves
+  the header and the exports agree at the ABI level; `cargo check` is metadata
+  only.
 * `c7d73b01` is the case that justifies all of it: generating the declarations
   exposed `measure:` being declared with four arguments for a five-part
   selector, i.e. the ObjC side would have read an unset register. A hand-written
   pair of files cannot catch that without an SDK; a single signature table can.
+  The same class of bug appeared twice more once the macOS host existed — the
+  canvas class name was hardcoded to the iOS `SheetView`, and
+  `corroSetContentHugging:priority:` was declared for a one-argument
+  `corroSetContentHugging:` call. Both now have unit tests in
+  `apple_generator.rs` that fail if the fix is reverted.

@@ -9,7 +9,16 @@
 //! loudly unless GTK4 is actually loaded, and can be run with:
 //!
 //!     GTK_DLOPEN_PREFER_GTK3=0 xvfb-run -a cargo test --features gui \
-//!         --test canvas_display
+//!         --test canvas_display -- --test-threads=1
+//!
+//! **`--test-threads=1` is required, not optional.** GTK4's type system
+//! (`g_type_class_ref` inside `g_object_new`) is not thread-safe, and the
+//! default harness runs each `#[test]` on its own thread, so two tests
+//! initialising GTK concurrently segfault *inside libgtk-4* — verified under
+//! gdb: `SIGSEGV` at `libgtk-4.so.1` ← `g_type_class_ref` ← `g_object_new`.
+//! The crash is in GTK, not in this crate or the loader, so the fix is to
+//! serialise the tests rather than to add locking we cannot enforce for
+//! arbitrary callers. Same rule as any GTK program: touch GTK from one thread.
 #[cfg(all(feature = "gui", target_os = "linux"))]
 mod canvas_tests {
     use std::cell::Cell;
@@ -123,5 +132,84 @@ mod canvas_tests {
             let loop_run = loader.symbols.g_main_loop_run.expect("g_main_loop_run");
             loop_run(loop_ptr);
         }
+    }
+}
+
+/// GTK4 key press/release handling: a release must not be delivered as a
+/// second press.
+///
+/// Regression test for the bug `gui_backend.rs` used to patch with three
+/// `feature = "gtk4"` dedup fields. GTK4 emits BOTH `key-pressed` and
+/// `key-released` from the same `GtkEventControllerKey`; the adapter registers
+/// `key-released` itself and returns `GDK_EVENT_STOP` without calling the host,
+/// so hosts receive a pure press stream.
+///
+/// Run single-threaded — GTK4's type system is not thread-safe:
+///
+///     GTK_DLOPEN_PREFER_GTK3=0 xvfb-run -a cargo test --features gui \
+///         --test canvas_display -- --test-threads=1
+#[cfg(all(feature = "gui", target_os = "linux"))]
+mod gtk4_key_release_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn gtk4_available() -> bool {
+        std::env::var_os("GTK_DLOPEN_PREFER_GTK3").is_some_and(|v| v == "0")
+            && gtk_dynamic_loader::Loader::new().is_ok()
+    }
+
+    macro_rules! require_gtk4 {
+        () => {
+            if !gtk4_available() {
+                eprintln!("SKIP {}: needs GTK4 (set GTK_DLOPEN_PREFER_GTK3=0)", module_path!());
+                return;
+            }
+        };
+    }
+
+    /// Both signals are emitted on one controller, exactly as a physical key
+    /// would produce them, so this reproduces the double-delivery scenario
+    /// without needing synthetic input from the compositor.
+    #[test]
+    fn key_released_is_a_distinct_signal_from_key_pressed() {
+        require_gtk4!();
+        let loader = gtk_dynamic_loader::Loader::new().expect("Loader::new failed");
+        if loader.version != gtk_dynamic_loader::Version::Gtk4 {
+            eprintln!("SKIP: loader selected GTK3");
+            return;
+        }
+
+        let ctrl = gtk_dynamic_loader::EventControllerKey::new(loader.clone())
+            .expect("EventControllerKey::new");
+
+        let presses: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+        let releases: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+        let last: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+        let p = presses.clone();
+        let l = last.clone();
+        let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, _state: u32| -> i32 {
+            p.set(p.get() + 1);
+            l.set(keyval);
+            1
+        }));
+        let r = releases.clone();
+        let _ = ctrl.connect_key_released(Box::new(move |_keyval: u32, _state: u32| -> i32 {
+            r.set(r.get() + 1);
+            1 // GDK_EVENT_STOP — this is what the adapter's filter does
+        }));
+
+        const KEY_A: u32 = 0x41;
+        ctrl.emit_key("key-pressed", KEY_A, 0).expect("emit key-pressed");
+        assert_eq!(1, presses.get(), "press reaches its own handler");
+        assert_eq!(0, releases.get(), "the release handler has not fired yet");
+        assert_eq!(KEY_A, last.get(), "keyval delivered intact");
+
+        ctrl.emit_key("key-released", KEY_A, 0).expect("emit key-released");
+        assert_eq!(1, releases.get(), "release reaches the release handler");
+        assert_eq!(
+            1,
+            presses.get(),
+            "the release must not be delivered to the press handler"
+        );
     }
 }

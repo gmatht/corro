@@ -1,12 +1,11 @@
 use crate::grid::{CellAddr, ColumnAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
 use crate::ui_core;
-use std::collections::HashMap;
 use rswidgets::backends_pancurses_adapter::*;
 
 
 use unicode_width::UnicodeWidthStr;
 
-use super::actions::{commit_cell, dispatch_menu_action, main_addr_label, menu_action_needs_prompt, menu_action_needs_terminal_suspend, run_prompt_action, MenuDispatch};
+use super::actions::{commit_cell, dispatch_menu_action, main_addr_label, menu_action_needs_prompt, menu_action_needs_terminal_suspend, present_menu_dispatch, run_prompt_action};
 use super::extrapolate;
 use super::viewport::Viewport;
 use super::compute;
@@ -66,23 +65,38 @@ fn cursor_column_letter(app: &super::App) -> String {
 /// its caret (ratatui parity: the picker never commits, it splices and
 /// stays in edit mode; the user commits with Enter). When not editing,
 /// snapshot the cursor cell's display text first (caret at end), mirroring
-/// the ratatui picker's snapshot. Positions are byte indices (the widget
-/// inserts bytes); clamp to a char boundary so multibyte choices stay valid.
+/// the ratatui picker's snapshot.
+///
+/// The decision — splice into the live buffer vs append to the cell's text —
+/// lives in [`super::special_picker::SpecialSplice`] so the GTK backend
+/// splices identically; this only writes the result into the pancurses
+/// widget, whose positions are byte indices (hence the char→byte conversion).
 fn splice_special_pick(ss: &Spreadsheet, app: &mut super::App, choice: &str) {
     let (editing, buf, pos) = ss.edit_state();
-    let base = if editing {
-        buf
+    let splice = if editing {
+        // The widget's caret is a byte offset; convert to the shared
+        // char-based caret so the splice never splits a codepoint.
+        let caret_chars = buf[..pos.min(buf.len())].chars().count();
+        super::special_picker::SpecialSplice::into_edit(&buf, caret_chars, choice)
     } else {
         let grid = &app.core.workbook.active_sheet().grid;
-        crate::agg::cell_display(grid, &app.core.cursor.to_addr(grid))
+        let cell_text = crate::agg::cell_display(grid, &app.core.cursor.to_addr(grid));
+        super::special_picker::SpecialSplice::into_cell(&cell_text, choice)
     };
-    let mut base = base;
-    let mut at = pos.min(base.len());
-    while at > 0 && !base.is_char_boundary(at) {
+    // Back to a byte offset for the widget, clamped to a char boundary.
+    let mut at = splice.caret;
+    let mut byte = splice.text.len();
+    for (i, (b, _)) in splice.text.char_indices().enumerate() {
+        if i == at {
+            byte = b;
+            break;
+        }
+    }
+    at = byte.min(splice.text.len());
+    while at > 0 && !splice.text.is_char_boundary(at) {
         at -= 1;
     }
-    base.insert_str(at, choice);
-    ss.set_editing(true, &base, at + choice.len());
+    ss.set_editing(true, &splice.text, at);
 }
 
 /// Borrow the host [`App`](super::App) behind a raw UI-thread pointer.
@@ -136,6 +150,33 @@ fn push_anchor_to_widget(
     rswidgets::backends::pancurses::spreadsheet_set_anchor(sid, widget_anchor);
 }
 
+/// Push a computed [`Viewport`]'s chrome into the widget: border title, row
+/// labels and column layout — the fields every viewport refresh sets, whether
+/// it recomputed rows, columns, or neither.
+///
+/// `with_rows` additionally pushes the row labels (only meaningful when the
+/// visible rows changed); the column layout and title are always cheap enough
+/// to repaint, and `col_ixs_out` receives the visible columns so the caller's
+/// cached list stays in step with what was painted.
+fn push_viewport_chrome(
+    sid: usize,
+    vp: &Viewport,
+    ops_applied: usize,
+    lm: usize,
+    with_rows: bool,
+    col_ixs_out: Option<&mut Vec<usize>>,
+) {
+    spreadsheet_set_border_title(sid, &vp.border_title(ops_applied));
+    if with_rows {
+        spreadsheet_set_row_labels(sid, vp.row_labels.clone());
+    }
+    spreadsheet_set_column_layout(sid, vp.column_layout.clone());
+    spreadsheet_set_grid_config(sid, lm as u32, vp.mc as u32);
+    if let Some(out) = col_ixs_out {
+        *out = vp.col_ixs.clone();
+    }
+}
+
 fn refresh_viewport_after_action(
     app: &mut super::App,
     ss: &Spreadsheet,
@@ -149,11 +190,8 @@ fn refresh_viewport_after_action(
     let cursor = app.core.cursor;
     let vp = Viewport::recompute(app, cursor, data_rows, data_cols, data_width, hr, MARGIN_COLS);
     let rec = app.core.workbook.active_sheet().clone();
-    spreadsheet_set_border_title(sid, &vp.border_title(app.core.ops_applied));
-    spreadsheet_set_row_labels(sid, vp.row_labels.clone());
-    spreadsheet_set_column_layout(sid, vp.column_layout.clone());
+    push_viewport_chrome(sid, &vp, app.core.ops_applied, MARGIN_COLS, true, None);
     *display_rows.borrow_mut() = vp.display_rows.clone();
-    spreadsheet_set_grid_config(sid, MARGIN_COLS as u32, vp.mc as u32);
     // Selection chrome: covered headers highlight, so the widget needs the
     // app's anchor (app->widget; see push_anchor_to_widget).
     push_anchor_to_widget(app, sid, display_rows);
@@ -184,20 +222,18 @@ fn refresh_viewport_after_action(
         let raw = rec.grid.get(&cursor_addr).unwrap_or_default();
         ss.set_raw_cell(new_display_ri as u32, cursor.col as u32, &raw);
     }
-}
-
-/// The About-dialog body text, sourced from the ratatui reference
-/// (`crate::ui::App::about_page_body`) so the pancurses dialog renders the SAME
-/// content as the ratatui backend (render parity).
-fn about_body() -> String {
-    crate::ui_core::about_page_body()
-}
-
-/// The Full-help dialog body text, sourced from the ratatui reference
-/// (`crate::ui::App::help_page_body`) so the pancurses dialog renders the SAME
-/// content as the ratatui backend (render parity).
-fn help_body() -> String {
-    crate::ui_core::help_page_body()
+    // Revision-browse mode owns the hint row: the reference shows exactly
+    // this string in `Mode::RevisionBrowse`, and without it the mode is
+    // invisible (the keys do nothing visible when clamped at either end).
+    // Normal mode restores the widget's default hints.
+    rswidgets::backends::pancurses::spreadsheet_set_status_text(
+        sid,
+        if app.rev_browse {
+            crate::core::state::REVISION_BROWSE_HINTS
+        } else {
+            ""
+        },
+    );
 }
 
 /// Append `bytes` to `path` (create if needed) via raw CreateFileA — std::fs
@@ -245,6 +281,63 @@ fn append_marker_raw(path: &str, bytes: &[u8]) {
     use std::io::Write as _;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = f.write_all(bytes);
+    }
+}
+
+/// The pancurses side of [`actions::MenuPresenter`]: a terminal has an SGR
+/// info box, the toolkit's list popup, and a formula-bar text prompt.
+struct PncMenuPresenter<'a> {
+    app: &'a mut super::App,
+    ss: &'a Spreadsheet,
+}
+
+impl<'a> super::actions::MenuPresenter for PncMenuPresenter<'a> {
+    fn show_dialog(&mut self, which: super::actions::InfoDialog<'_>) {
+        // A terminal has no per-dialog widgets: one SGR info box serves all of
+        // them, with the shared bodies so the text matches the reference.
+        let (title, text) = match which {
+            super::actions::InfoDialog::About => {
+                (" About ", crate::ui_core::about_page_body())
+            }
+            super::actions::InfoDialog::HelpFull => {
+                (" Help ", crate::ui_core::help_page_body())
+            }
+            super::actions::InfoDialog::Other(t, b) => (t, b.to_string()),
+        };
+        show_info_dialog(title, &text);
+    }
+
+    fn show_list_picker(&mut self, title: &str, rows: &[String], selected: usize) {
+        // The shared picker state is opened by the caller of
+        // `present_menu_dispatch` for the variants that need one; here we only
+        // route display + selection to the toolkit popup and ask for a repaint
+        // (the key hook installed below drives arrows/digits/Enter/Esc).
+        rswidgets::backends::pancurses::show_list_picker(title, rows, selected);
+        rswidgets::backends::pancurses::request_redraw();
+    }
+
+    fn open_prompt(&mut self, label: &str, action: &str) {
+        rswidgets::backends::pancurses::set_prompt(label, action);
+    }
+
+    fn begin_edit_with(&mut self, value: &str) {
+        // Enter edit mode on the cursor cell with `value` as the in-progress
+        // buffer (matching ratatui's start_edit_mode for Insert Date / Time).
+        // The user commits with Enter.
+        self.ss.set_editing(true, value, value.len());
+    }
+
+    fn show_keybinds(&mut self) {
+        // Terminal bindings, not GTK's: this box is what a terminal user can
+        // actually press (see `MenuPresenter::show_keybinds`).
+        show_info_dialog("Keybindings", "F2 edit\narrows move\nEnter commit\nCtrl+G go-to\nCtrl+Q quit");
+    }
+
+    fn set_status(&mut self, status: &str) {
+        if !status.is_empty() {
+            self.app.core.status = status.to_string();
+            self.ss.set_formula_bar_trailing(&format!("   ·  {}", status));
+        }
     }
 }
 
@@ -307,36 +400,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // ── Available data width / rows (matching ratatui's draw_visual) ──
     // Use environment variables to allow test backends to control size.
-    let (term_cols, term_rows) = {
-        let env_cols: Option<usize> = std::env::var("CORRO_TERM_COLS").ok().and_then(|s| s.parse().ok());
-        let env_rows: Option<usize> = std::env::var("CORRO_TERM_ROWS").ok().and_then(|s| s.parse().ok());
-        if let (Some(c), Some(r)) = (env_cols, env_rows) {
-            (c, r)
-        } else {
-            #[cfg(unix)]
-            {
-                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-                if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
-                {
-                    (ws.ws_col as usize, ws.ws_row as usize)
-                } else {
-                    let cols: usize = std::env::var("COLUMNS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(80);
-                    (cols, 50usize)
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let cols: usize = std::env::var("COLUMNS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(80);
-                (cols, 50usize)
-            }
-        }
-    };
+    // Terminal size comes from the toolkit: `terminal_size_with_override`
+    // encodes the same precedence this used to hand-roll (`CORRO_TERM_COLS`/
+    // `_ROWS` for tests, then a real `TIOCGWINSZ` query, then `$COLUMNS`), and
+    // unlike the inline version it also knows how to ask a Windows console.
+    let (term_cols, term_rows) = rswidgets::core::terminal_size_with_override();
     let data_width = term_cols
         .saturating_sub(2)
         .saturating_sub(ui_core::ROW_LABEL_CHARS)
@@ -367,64 +435,39 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         col: display_cursor_col,
     };
 
-    // ── Visible rows (matching ratatui's visible_row_indices) ──────────
-    let sheet_rec = app.core.workbook.active_sheet().clone();
-    let (display_rows, _row_scroll) =
-        ui_core::visible_row_indices(&sheet_rec, cursor, data_rows, 0);
+    // ── Viewport: the one shared controller ────────────────────────────
+    // `Viewport::recompute` produces exactly what this setup needs — visible
+    // rows/columns (with the fit-trim), per-column widths, row labels, the
+    // column layout and the per-row aggregate descriptors — using the same
+    // code the periodic refresh and the movie replay use. Deriving those four
+    // by hand here duplicated `viewport::build` verbatim, which is how the
+    // startup frame could drift from every later frame.
+    let lm = MARGIN_COLS;
+    let vp = Viewport::recompute(app, cursor, data_rows, data_cols, data_width, hr, lm);
+    let display_rows = vp.display_rows.clone();
+    let col_ixs = vp.col_ixs.clone();
+    let col_widths = vp.col_widths.clone();
+    let row_agg_func = vp.row_agg_func.clone();
+    let (mr, mc) = (vp.mr, vp.mc);
 
-    // Use the live (pre-clone) grid for column width fitting, then clone
-    // so the resulting overrides are present in the snapshot.
-    let (mut col_ixs, _col_scroll) =
-        ui_core::visible_col_indices(&sheet_rec, cursor, data_cols, 0);
-    {
-        let sht = app.core.workbook.active_sheet_mut();
-        let grd = &mut sht.grid;
-        // Match ratatui: trim columns that don't fit (no proportional refit).
-        crate::ui_core::trim_visible_cols_to_width(grd, &mut col_ixs, cursor.col, data_width);
-    }
-
-    // Re-read the sheet after width adjustments.
+    // Re-read after `recompute` (it mutates the live grid while fitting
+    // column widths, so this snapshot carries those overrides).
     let sheet_rec = app.core.workbook.active_sheet().clone();
     let g = &sheet_rec.grid;
-    let mr = g.main_rows();
-    let mc = g.main_cols();
-    let lm = MARGIN_COLS;
-
-    // ── Column layout with widths matching ratatui's grid.col_width() ──
-    // In ratatui, header and data rows use 1-char gaps everywhere (including
-    // at left-margin→main and main→right-margin boundaries).  Only the
-    // separator row draws a `│` at the boundary, handled by the widget.
-    let mut layout: Vec<(u32, u32, String)> = Vec::new();
-    let mut col_widths: HashMap<usize, usize> = HashMap::new();
-    for &c in col_ixs.iter() {
-        let w = g.col_width(c).max(1);
-        col_widths.insert(c, w);
-        let label = crate::addr::ui_column_fragment(c, mc);
-        layout.push((c as u32, w as u32, label));
-    }
-
-    // ── Precompute aggregate info for each visible row ────────────────
-    let row_agg_func = compute::compute_row_agg_func(g, &display_rows, hr, mr);
 
     // ── Spreadsheet ────────────────────────────────────────────────────
     let total_rows = display_rows.len() as u32;
-    let total_cols = layout.len() as u32;
+    let total_cols = vp.column_layout.len() as u32;
     let spreadsheet = create_spreadsheet(total_rows, total_cols)?;
 
-    // Row labels
-    let mut row_labels: Vec<(u32, String)> = Vec::new();
-    for (idx, &r) in display_rows.iter().enumerate() {
-        let label = crate::addr::ui_row_label(r, mr);
-        row_labels.push((idx as u32, label));
-    }
-    spreadsheet.set_row_labels(row_labels);
+    spreadsheet.set_row_labels(vp.row_labels.clone());
 
     // ── Cell data for ALL visible rows and columns ────────────────────
     render::fill_cells(&mut SpreadsheetSink::new(&spreadsheet), &display_rows, &col_ixs, &col_widths,
         g, hr, mr, mc, lm, data_width,
         display_cursor_row, display_cursor_col, &row_agg_func);
 
-    spreadsheet.set_column_layout(layout);
+    spreadsheet.set_column_layout(vp.column_layout.clone());
     spreadsheet.set_grid_config(lm as u32, mc as u32);
     spreadsheet.set_row_counts(hr as u32, mr as u32);
 
@@ -525,10 +568,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // keys scrolls the visible columns/rows and the grid extent grows as needed.
     let display_rows_for_cb = std::rc::Rc::new(std::cell::RefCell::new(display_rows.clone()));
     let display_rows_for_ce = display_rows_for_cb.clone();
-    // Clones captured by the go-to (Ctrl+G) callback, taken here BEFORE the
-    // cursor-move / commit-edit closures move the originals below.
+    // Clones captured by the go-to (Ctrl+G) callback and the mouse hook, taken
+    // here BEFORE the cursor-move / commit-edit closures move the originals.
     let dr_for_goto_cb = display_rows_for_cb.clone();
     let dr_for_goto_ce = display_rows_for_ce.clone();
+    let dr_for_mouse = display_rows_for_cb.clone();
     let mut col_ixs_cb = col_ixs.clone();
     let sheet_cb = spreadsheet.clone();
     let sid = spreadsheet.id();
@@ -587,75 +631,15 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         if suspend {
             rswidgets::backends::pancurses::resume_terminal();
         }
-        let mut apply_status = |s: &str| {
-            if !s.is_empty() {
-                app.core.status = s.to_string();
-                menu_ss.set_formula_bar_trailing(&format!("   ·  {}", s));
-            }
+        // Present the shared decision through this backend's primitives.
+        // `present_menu_dispatch` owns the variant→presentation mapping so it
+        // lives in one place; this backend only says how a dialog, a list
+        // picker and a prompt look in a terminal.
+        let mut presenter = PncMenuPresenter {
+            app,
+            ss: &menu_ss,
         };
-        match result {
-            MenuDispatch::Status(s) => apply_status(&s),
-            MenuDispatch::Edit { value } => {
-                // Enter edit mode on the cursor cell with `value` as the
-                // in-progress buffer (matching ratatui's start_edit_mode for
-                // Insert Date / Insert Time). The user presses Enter to commit.
-                menu_ss.set_editing(true, &value, value.len());
-            }
-            MenuDispatch::Prompt(label, action) => {
-                rswidgets::backends::pancurses::set_prompt(label, action);
-            }
-            MenuDispatch::AggregatePicker => {
-                // Margin aggregate picker: shared selection state (already
-                // opened with a resolved target by the shared action), the
-                // toolkit list popup for display, and the key hook below for
-                // arrows/digits/Enter/Esc. Committing writes the directive
-                // to the target margin key through the cell-op path.
-                let rows = super::agg_picker::items();
-                let sel = super::agg_picker::index(app).unwrap_or(0);
-                rswidgets::backends::pancurses::show_list_picker(" Aggregate ", &rows, sel);
-                rswidgets::backends::pancurses::request_redraw();
-            }
-            MenuDispatch::SpecialPicker => {
-                // 10-choice picker (ratatui parity): shared selection state,
-                // toolkit list popup for display, key hook below for arrows
-                // /digits/Enter/Esc. Committing splices into the edit (never
-                // the log) exactly like the reference picker.
-                super::special_picker::open(app);
-                let rows: Vec<String> =
-                    super::special_picker::items().into_iter().collect();
-                rswidgets::backends::pancurses::show_list_picker(" Special Char ", &rows, 0);
-                rswidgets::backends::pancurses::request_redraw();
-            }
-            MenuDispatch::BalanceBooks => {
-                // Three-choice dialog (column / report type / direction) the
-                // old single-field prompt threw two of away. The toolkit has
-                // no multi-field modal, so the report-type × direction
-                // combinations are presented as one list over shared picker
-                // state (key hook below); the column is resolved the same way
-                // the prompt path resolved it (cursor cell / auto-detect).
-                super::balance_picker::open(app);
-                let rows: Vec<String> =
-                    super::balance_picker::items().into_iter().collect();
-                let sel = super::balance_picker::index(app).unwrap_or(0);
-                rswidgets::backends::pancurses::show_list_picker(" Balance books ", &rows, sel);
-                rswidgets::backends::pancurses::request_redraw();
-            }
-            MenuDispatch::About { status } => {
-                show_info_dialog(" About ", &about_body());
-                apply_status(&status);
-            }
-            MenuDispatch::HelpFull { status } => {
-                show_info_dialog(" Help ", &help_body());
-                apply_status(&status);
-            }
-            MenuDispatch::HelpKeybinds { status } => {
-                show_info_dialog(
-                    "Keybindings",
-                    "F2 edit\narrows move\nEnter commit\nCtrl+G go-to\nCtrl+Q quit",
-                );
-                apply_status(&status);
-            }
-        }
+        present_menu_dispatch(result, &mut presenter);
         // The action may have mutated the workbook (Insert Date, Cut/Paste,
         // New/Rename sheet, sort, ...).  Re-fill the widget's cells from the
         // workbook so the grid reflects the change immediately instead of
@@ -678,145 +662,159 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     rswidgets::backends::pancurses::set_key_input_hook(Some(Box::new(move |key: &Option<rswidgets::backends::pancurses::KeyInput>| {
         let app = app_from_raw(app_ptr);
         use rswidgets::backends::pancurses::KeyInput;
-        if app.agg_picker.is_some() {
-            let step_agg = |app: &mut super::App, delta: i32| {
-                super::agg_picker::step(app, delta);
-                let idx = super::agg_picker::index(app).unwrap_or(0);
-                rswidgets::backends::pancurses::set_list_picker_selection(idx);
-                rswidgets::backends::pancurses::request_redraw();
-            };
-            let commit_agg = |app: &mut super::App| {
-                if let Some((addr, directive)) = super::agg_picker::take(app) {
-                    // Same op path as typing the directive: commits to the
-                    // live log and undoes identically.
-                    super::actions::commit_cell(app, addr, directive);
-                }
-                rswidgets::backends::pancurses::close_list_picker();
-                rswidgets::backends::pancurses::request_redraw();
-            };
-            match key {
+        // The three list pickers share one key vocabulary (arrows step,
+        // digits jump-and-commit, Enter commits, Esc cancels, anything else
+        // is ignored) via `picker_dispatch`; only the commit action differs.
+        // A single `match` on which picker is open keeps that mapping in one
+        // place instead of three near-identical blocks.
+        if let Some(open) = super::picker_dispatch::open_picker(app) {
+            let input = match key {
                 Some(KeyInput::ArrowDown) | Some(KeyInput::ArrowRight) => {
-                    step_agg(app, 1);
-                    true
+                    super::picker_dispatch::PickerKeyInput::Next
                 }
                 Some(KeyInput::ArrowUp) | Some(KeyInput::ArrowLeft) => {
-                    step_agg(app, -1);
+                    super::picker_dispatch::PickerKeyInput::Prev
+                }
+                Some(KeyInput::Enter) => super::picker_dispatch::PickerKeyInput::Enter,
+                Some(KeyInput::Escape) => super::picker_dispatch::PickerKeyInput::Escape,
+                Some(KeyInput::Char(c)) => super::picker_dispatch::PickerKeyInput::Char(*c),
+                _ => super::picker_dispatch::PickerKeyInput::Other,
+            };
+            use super::picker_dispatch::{handle_picker_key, OpenPicker, PickerKey};
+            let commit = |app: &mut super::App| match open {
+                OpenPicker::Agg => {
+                    if let Some((addr, directive)) = super::agg_picker::take(app) {
+                        // Same op path as typing the directive: commits to the
+                        // live log and undoes identically.
+                        super::actions::commit_cell(app, addr, directive);
+                    }
+                }
+                OpenPicker::Special => {
+                    if let Some(choice) = super::special_picker::take(app) {
+                        splice_special_pick(&extrap_ss, app, &choice);
+                    }
+                }
+                OpenPicker::Balance => {
+                    if let Some(pick) = super::balance_picker::take(app) {
+                        // The picker has no text field, so the column is the
+                        // cursor's own column when it sits on a main column,
+                        // else empty (auto-detect) — the same fallback the old
+                        // prompt path used for blank input.
+                        let column = cursor_column_letter(app);
+                        super::actions::run_balance_books(
+                            app,
+                            &super::dialogs::BalanceChoice {
+                                column,
+                                persist: pick.persist,
+                                direction: pick.direction,
+                            },
+                        );
+                    }
+                }
+            };
+            let outcome = match open {
+                OpenPicker::Agg => handle_picker_key::<super::picker_dispatch::AggPicker>(app, input),
+                OpenPicker::Special => {
+                    handle_picker_key::<super::picker_dispatch::SpecialPicker>(app, input)
+                }
+                OpenPicker::Balance => {
+                    handle_picker_key::<super::picker_dispatch::BalancePicker>(app, input)
+                }
+            };
+            match outcome {
+                PickerKey::Ignored => return false,
+                PickerKey::Stepped => {
+                    let idx = match open {
+                        OpenPicker::Agg => super::agg_picker::index(app),
+                        OpenPicker::Special => super::special_picker::index(app),
+                        OpenPicker::Balance => super::balance_picker::index(app),
+                    }
+                    .unwrap_or(0);
+                    rswidgets::backends::pancurses::set_list_picker_selection(idx);
+                    rswidgets::backends::pancurses::request_redraw();
                     true
                 }
-                Some(KeyInput::Enter) => {
-                    commit_agg(app);
-                    true
-                }
-                Some(KeyInput::Escape) => {
-                    super::agg_picker::close(app);
+                PickerKey::Committed | PickerKey::Commit => {
+                    commit(app);
                     rswidgets::backends::pancurses::close_list_picker();
                     rswidgets::backends::pancurses::request_redraw();
                     true
                 }
-                Some(KeyInput::Char(c)) if c.is_ascii_digit() => {
-                    if let Some(idx) = super::agg_picker::index_for_digit(*c) {
-                        super::agg_picker::set(app, idx);
-                        commit_agg(app);
-                    }
-                    true
-                }
-                _ => false,
-            }
-        } else if app.special_picker.is_some() {
-            let step_sel = |app: &mut super::App, delta: i32| {
-                super::special_picker::step(app, delta);
-                let idx = super::special_picker::index(app).unwrap_or(0);
-                rswidgets::backends::pancurses::set_list_picker_selection(idx);
-                rswidgets::backends::pancurses::request_redraw();
-            };
-            let commit_sel = |app: &mut super::App| {
-                if let Some(choice) = super::special_picker::take(app) {
-                    splice_special_pick(&extrap_ss, app, &choice);
-                }
-                rswidgets::backends::pancurses::close_list_picker();
-                rswidgets::backends::pancurses::request_redraw();
-            };
-            match key {
-                Some(KeyInput::ArrowDown) | Some(KeyInput::ArrowRight) => {
-                    step_sel(app, 1);
-                    true
-                }
-                Some(KeyInput::ArrowUp) | Some(KeyInput::ArrowLeft) => {
-                    step_sel(app, -1);
-                    true
-                }
-                Some(KeyInput::Enter) => {
-                    commit_sel(app);
-                    true
-                }
-                Some(KeyInput::Escape) => {
-                    super::special_picker::close(app);
+                PickerKey::Cancel => {
                     rswidgets::backends::pancurses::close_list_picker();
                     rswidgets::backends::pancurses::request_redraw();
                     true
                 }
-                Some(KeyInput::Char(c)) if c.is_ascii_digit() => {
-                    if let Some(idx) = super::special_picker::index_for_digit(*c) {
-                        super::special_picker::set(app, idx);
-                        commit_sel(app);
-                    }
-                    true
-                }
-                _ => false,
             }
-        } else if app.balance_picker.is_some() {
-            let step_bal = |app: &mut super::App, delta: i32| {
-                super::balance_picker::step(app, delta);
-                let idx = super::balance_picker::index(app).unwrap_or(0);
-                rswidgets::backends::pancurses::set_list_picker_selection(idx);
+        } else if app.rev_browse {
+            // Revision-browse mode (ratatui `Mode::RevisionBrowse` parity):
+            // entered by File▸Replay, which points `source_path` at the log
+            // and sets `revision_browse_limit`. Left/Right step through the
+            // log's revisions *instead of* moving the cursor, Enter/Esc
+            // leave the mode. Returning `true` swallows the key so the
+            // widget never also treats it as cursor movement.
+            //
+            // Stepping re-replays the log, so the grid's contents change and
+            // any scroll/cursor state must be re-derived: the shared
+            // `reload_revision_browse` already resets the cursor and
+            // re-resolves the sheet, and the viewport refresh below pushes
+            // the new cells into the widget.
+            let step_and_refresh = |app: &mut super::App, back: bool| {
+                let action = app.core.step_revision(back);
+                // Headless verification hook: the tests assert the *rendered*
+                // result, but a log line names the revision reached, which is
+                // what makes a failure diagnosable (a swallowed key and a
+                // wrong step look identical on screen). `action` is what
+                // distinguishes a real move from the clamped no-op, which
+                // both leave the limit unchanged.
+                crate::debug_log::log(&format!(
+                    "PNC_REVISION {} {} revision={} of {} status={:?}",
+                    if back { "back" } else { "forward" },
+                    action.name(),
+                    app.core.revision_browse_limit,
+                    app.core.ops_applied,
+                    app.core.status,
+                ));
+                refresh_viewport_after_action(
+                    app, &extrap_ss, sid_extrap, &display_rows_extrap,
+                    data_rows, data_cols, data_width, HEADER_ROWS,
+                );
                 rswidgets::backends::pancurses::request_redraw();
             };
-            let commit_bal = |app: &mut super::App| {
-                if let Some(pick) = super::balance_picker::take(app) {
-                    // The picker has no text field, so the column is the
-                    // cursor's own column when it sits on a main column,
-                    // else empty (auto-detect) — the same fallback the old
-                    // prompt path used for blank input.
-                    let column = cursor_column_letter(app);
-                    super::actions::run_balance_books(
-                        app,
-                        &super::dialogs::BalanceChoice {
-                            column,
-                            persist: pick.persist,
-                            direction: pick.direction,
-                        },
+            match key {
+                Some(KeyInput::ArrowLeft) => {
+                    step_and_refresh(app, true);
+                    true
+                }
+                Some(KeyInput::ArrowRight) => {
+                    step_and_refresh(app, false);
+                    true
+                }
+                Some(KeyInput::Enter) | Some(KeyInput::Escape) => {
+                    // Leaving the mode keeps the workbook exactly as browsed
+                    // — the reference does not re-replay the full log on exit.
+                    // One call resets both browse flags (they are paired).
+                    app.leave_revision_browse();
+                    crate::debug_log::log(&format!(
+                        "PNC_REVISION exit revision={}",
+                        app.core.revision_browse_limit
+                    ));
+                    // Re-push the viewport so the hint row reverts to the
+                    // normal hints: the row is set by this function, so
+                    // clearing the flag without refreshing leaves the browse
+                    // hint on screen after the mode is gone.
+                    refresh_viewport_after_action(
+                        app, &extrap_ss, sid_extrap, &display_rows_extrap,
+                        data_rows, data_cols, data_width, HEADER_ROWS,
                     );
-                }
-                rswidgets::backends::pancurses::close_list_picker();
-                rswidgets::backends::pancurses::request_redraw();
-            };
-            match key {
-                Some(KeyInput::ArrowDown) | Some(KeyInput::ArrowRight) => {
-                    step_bal(app, 1);
-                    true
-                }
-                Some(KeyInput::ArrowUp) | Some(KeyInput::ArrowLeft) => {
-                    step_bal(app, -1);
-                    true
-                }
-                Some(KeyInput::Enter) => {
-                    commit_bal(app);
-                    true
-                }
-                Some(KeyInput::Escape) => {
-                    super::balance_picker::close(app);
-                    rswidgets::backends::pancurses::close_list_picker();
                     rswidgets::backends::pancurses::request_redraw();
                     true
                 }
-                Some(KeyInput::Char(c)) if c.is_ascii_digit() => {
-                    if let Some(idx) = super::balance_picker::index_for_digit(*c) {
-                        super::balance_picker::set(app, idx);
-                        commit_bal(app);
-                    }
-                    true
-                }
-                _ => false,
+                // Every other key is swallowed: in the reference the
+                // RevisionBrowse arm has a catch-all that stays in the mode,
+                // so stray keys cannot silently edit or move in a browsed
+                // (read-only) revision.
+                _ => true,
             }
         } else if app.extrapolate.is_some() {
             match key {
@@ -879,7 +877,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                         true
                     } else {
                         app.core.status =
-                            "Aggregate: no margin TOTAL/MAX/… key for this cell".into();
+                            crate::core::state::NO_AGG_KEY_FOR_CELL.into();
                         rswidgets::backends::pancurses::request_redraw();
                         true
                     }
@@ -1024,16 +1022,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         } else if _display_row == u32::MAX - 1 {
             // Scroll down sentinel: user pressed Down at the last visible row.
             // Grow the grid if the cursor is at the last main row with few
-            // trailing blanks (matching ratatui's move_cursor_one_row_vertical).
-            let cursor_row = app.core.cursor.row;
+            // trailing blanks (shared with GUI via compute::grow_grid_for_cursor).
             {
                 let sheet = app.core.workbook.active_sheet_mut();
-                let mr = sheet.grid.main_rows();
-                if cursor_row == hr_cb + mr.saturating_sub(1)
-                    && compute::trailing_blank_main_rows(&sheet.grid) < crate::ui_core::NAV_BLANK_ROWS
-                {
-                    sheet.grid.grow_main_row_at_bottom();
-                }
+                compute::grow_grid_for_cursor(&mut sheet.grid, app.core.cursor.row, app.core.cursor.col);
             }
             app.core.cursor.row += 1;
             need_viewport_recompute = true;
@@ -1065,11 +1057,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             let vp = Viewport::recompute(app, cursor, data_rows_cb, data_cols_cb, data_width_cb, hr_cb, MARGIN_COLS);
             // Re-read the sheet after width adjustments.
             let rec = app.core.workbook.active_sheet().clone();
-            spreadsheet_set_border_title(sid, &vp.border_title(app.core.ops_applied));
-            spreadsheet_set_row_labels(sid, vp.row_labels.clone());
-            spreadsheet_set_column_layout(sid, vp.column_layout.clone());
-            col_ixs_cb = vp.col_ixs.clone();
-            spreadsheet_set_grid_config(sid, MARGIN_COLS as u32, vp.mc as u32);
+            push_viewport_chrome(sid, &vp, app.core.ops_applied, MARGIN_COLS, true, Some(&mut col_ixs_cb));
             vp.refill(&mut SpreadsheetSink::new(&sheet_cb), &rec.grid, hr_cb, MARGIN_COLS, data_width_cb, cursor.row, cursor.col);
             if let Some(new_display_ri) = vp.display_rows.iter().position(|&r| r == cursor.row) {
                 let cursor_addr = crate::addr::sheet_cursor_to_addr(
@@ -1144,11 +1132,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 let cursor = app.core.cursor;
                 let vp = Viewport::recompute_columns(app, &display_rows_for_cb.borrow(), cursor, data_cols_cb, data_width_cb, hr_cb, MARGIN_COLS);
                 let rec = app.core.workbook.active_sheet().clone();
-                spreadsheet_set_border_title(sid, &vp.border_title(app.core.ops_applied));
-                spreadsheet_set_row_labels(sid, vp.row_labels.clone());
-                spreadsheet_set_column_layout(sid, vp.column_layout.clone());
-                col_ixs_cb = vp.col_ixs.clone();
-                spreadsheet_set_grid_config(sid, lm as u32, vp.mc as u32);
+                push_viewport_chrome(sid, &vp, app.core.ops_applied, lm, true, Some(&mut col_ixs_cb));
                 vp.refill(&mut SpreadsheetSink::new(&sheet_cb), &rec.grid, hr_cb, MARGIN_COLS, data_width_cb, cursor.row, cursor.col);
             } else if !col_ixs_cb.contains(&(_display_col as usize)) {
                 // Update column viewport when cursor column moves outside the
@@ -1156,9 +1140,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 let cursor = app.core.cursor;
                 let vp = Viewport::recompute_columns(app, &display_rows_for_cb.borrow(), cursor, data_cols_cb, data_width_cb, hr_cb, MARGIN_COLS);
                 let rec = app.core.workbook.active_sheet().clone();
-                spreadsheet_set_border_title(sid, &vp.border_title(app.core.ops_applied));
-                spreadsheet_set_column_layout(sid, vp.column_layout.clone());
-                col_ixs_cb = vp.col_ixs.clone();
+                push_viewport_chrome(sid, &vp, app.core.ops_applied, MARGIN_COLS, false, Some(&mut col_ixs_cb));
                 vp.refill(&mut SpreadsheetSink::new(&sheet_cb), &rec.grid, hr_cb, MARGIN_COLS, data_width_cb, cursor.row, cursor.col);
             } else {
                 // Cursor moved within the current viewport — refresh cells to ensure
@@ -1173,7 +1155,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 // itself must stay refill-free here: calling the full
                 // refresh helper from inside the deferred commit drain
                 // panics with "RefCell already borrowed" (observed).
-                spreadsheet_set_border_title(sid, &vp.border_title(app.core.ops_applied));
+                push_viewport_chrome(sid, &vp, app.core.ops_applied, MARGIN_COLS, false, None);
                 vp.refill(&mut SpreadsheetSink::new(&sheet_cb), &rec.grid, hr_cb, MARGIN_COLS, data_width_cb, cursor.row, cursor.col);
             }
             // Render the extrapolate preview into the widget (display-only; not
@@ -1283,10 +1265,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             .position(|&r| r == target_logical)
             .unwrap_or(0);
         app.core.cursor = cursor;
-        spreadsheet_set_border_title(sid_goto, &vp.border_title(app.core.ops_applied));
-        spreadsheet_set_row_labels(sid_goto, vp.row_labels.clone());
-        spreadsheet_set_column_layout(sid_goto, vp.column_layout.clone());
-        spreadsheet_set_grid_config(sid_goto, lm_goto as u32, vp.mc as u32);
+        push_viewport_chrome(sid_goto, &vp, app.core.ops_applied, lm_goto, true, None);
         vp.refill(&mut SpreadsheetSink::new(&goto_sheet), &rec.grid, hr_goto, MARGIN_COLS, data_width_cb, cursor.row, cursor.col);
         // Position the widget cursor on the target cell (A1000).
         goto_sheet.set_cursor(display_ri as u32, lm_goto as u32);
@@ -1299,7 +1278,73 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         *dr_for_goto_ce.borrow_mut() = vp.display_rows.clone();
     });
 
-    _backend.run().map_err(|e| format!("pancurses error: {e}"))?;
+    // ── Mouse: opt in and route clicks to the spreadsheet widget ──────────
+    // The toolkit's mouse support is opt-in (capturing the mouse costs the
+    // terminal's native text selection), so the app asks for it here. Only
+    // the pancurses backend has this call; the GUI host enables pointer input
+    // by construction, which is why `corro` never had to request it before.
+    //
+    // `set_mouse_hook` receives the already-decoded event, so the app works in
+    // the same vocabulary on every backend (the GTK path gets `(x, y, button,
+    // state)` from `Canvas::on_click_button`). The default dispatch inside the
+    // toolkit still runs when the hook returns false — the spreadsheet widget
+    // maps the click to a cell itself — so this only handles what the widget
+    // cannot know: the formula bar losing focus, and a click on the header row
+    // selecting that column.
+    {
+        let click_sheet = spreadsheet.clone();
+        let app_ptr_click = app_ptr;
+        let rows_for_click = dr_for_mouse.clone();
+        rswidgets::backends::pancurses::set_mouse_hook(Some(Box::new(move |ev| {
+            use rswidgets::backends::pancurses::MouseAction;
+            // Only presses/clicks act; wheel and motion are the toolkit's.
+            let button = match ev.action {
+                MouseAction::Pressed(b) | MouseAction::Clicked(b) => b,
+                _ => return false,
+            };
+            if button != 1 {
+                return false;
+            }
+            let app = app_from_raw(app_ptr_click);
+            let dr = rows_for_click.borrow();
+            let display_ri = ev.y.max(0) as usize;
+            let logical_row = match dr.get(display_ri) {
+                Some(&r) => r,
+                // A click outside the rendered rows (chrome/menu/formula bar)
+                // is still reported so the widget can move focus.
+                None => return false,
+            };
+            let col = ev.x.max(0) as usize;
+            // A click in the header band selects the whole column, matching
+            // ratatui's click-on-header behaviour and the GTK backend.
+            if logical_row < HEADER_ROWS && col >= MARGIN_COLS {
+                let main_col = col.saturating_sub(MARGIN_COLS);
+                app.core.cursor.row = HEADER_ROWS;
+                app.core.cursor.col = col;
+                app.core.anchor = Some(crate::grid::SheetCursor {
+                    row: HEADER_ROWS,
+                    col,
+                });
+                app.core.status = format!(
+                    "Column {} selected",
+                    crate::addr::excel_column_name(main_col)
+                );
+                click_sheet.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
+                rswidgets::backends::pancurses::request_redraw();
+                return true;
+            }
+            // Anything else: let the toolkit's dispatch move the cell cursor.
+            false
+        })));
+        rswidgets::backends::pancurses::set_mouse_enabled(true);
+    }
+
+    let res = _backend.run().map_err(|e| format!("pancurses error: {e}"));
+    // Leave the terminal with its own pointer behaviour restored: text
+    // selection is what a user expects once the TUI exits.
+    rswidgets::backends::pancurses::set_mouse_enabled(false);
+    rswidgets::backends::pancurses::set_mouse_hook(None);
+    res?;
     Ok(())
 }
 
@@ -1336,14 +1381,11 @@ pub fn run_pancurses_movie(
 
     // Geometry: reuse the same derivation as the interactive loop so a movie
     // frame is laid out identically to a live session.
-    let (term_cols, term_rows) = {
-        let env_cols: Option<usize> = std::env::var("CORRO_TERM_COLS").ok().and_then(|s| s.parse().ok());
-        let env_rows: Option<usize> = std::env::var("CORRO_TERM_ROWS").ok().and_then(|s| s.parse().ok());
-        match (env_cols, env_rows) {
-            (Some(c), Some(r)) => (c, r),
-            _ => (std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok()).unwrap_or(80), 50usize),
-        }
-    };
+    // Same portable size helper as the interactive loop. This copy previously
+    // skipped the `TIOCGWINSZ` query entirely, so a movie replay laid itself
+    // out at 80x50 unless the env override was set — i.e. a replay was not
+    // identical to a live session despite the comment above claiming it was.
+    let (term_cols, term_rows) = rswidgets::core::terminal_size_with_override();
     let data_width = term_cols
         .saturating_sub(2)
         .saturating_sub(ui_core::ROW_LABEL_CHARS)

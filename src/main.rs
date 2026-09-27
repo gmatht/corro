@@ -28,10 +28,16 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiKind {
+    // The three variants are referenced by every compiled-in UI match arm and
+    // by the argv[0] dispatch, so a given feature set only ever names some of
+    // them. Gate each to the feature that makes it a legal choice (the same
+    // condition as the `--flag` / `determine_default_ui` arms); without this a
+    // non-ratatui build warned that `Ratatui` was never constructed.
+    #[cfg(feature = "ratatui")]
     Ratatui,
-    #[allow(dead_code)]
+    #[cfg(feature = "gui")]
     Gui,
-    #[allow(dead_code)]
+    #[cfg(feature = "pancurses")]
     Pancurses,
 }
 
@@ -47,6 +53,11 @@ struct Args {
     show_version: bool,
     debug_no_number: bool,
     ui: UiKind,
+    // Read only by the ratatui arm below (`--capture-html` drives the TUI
+    // capturer); a gui/pancurses-only build has no reader, so the field is
+    // gated to match instead of warning that it is never read. The CLI still
+    // accepts the flag everywhere; it is consumed there.
+    #[cfg(feature = "ratatui")]
     capture_html: Option<PathBuf>,
     convert_ansi: Option<PathBuf>,
 }
@@ -118,6 +129,26 @@ fn argv0_ui(program: &str) -> Option<UiKind> {
         return Some(UiKind::Gui);
     }
     None
+}
+
+/// True for any compiled-in terminal UI.
+///
+/// `windows_console_action` is built for every Windows target regardless of
+/// which UI features are on, so it cannot name `Ratatui`/`Pancurses` directly
+/// without failing to compile in a `gui`-only build. This helper asks the
+/// question instead of naming the variants.
+#[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
+fn is_tui(ui: UiKind) -> bool {
+    #[cfg(feature = "ratatui")]
+    if matches!(ui, UiKind::Ratatui) {
+        return true;
+    }
+    #[cfg(feature = "pancurses")]
+    if matches!(ui, UiKind::Pancurses) {
+        return true;
+    }
+    let _ = ui;
+    false
 }
 
 /// Windows console handling (modern Windows only; Win95 builds manage their
@@ -195,6 +226,7 @@ mod wincon {
 /// die, so with no explicit --flag, no argv[0] request, and no terminal on
 /// stdio, a GUI-capable build opens the GUI instead. Explicit choices
 /// (flags and argv[0] names) are honored untouched.
+#[cfg(all(target_family = "unix", not(target_arch = "wasm32")))]
 fn resolve_headless_default(
     ui: UiKind,
     explicit: bool,
@@ -254,10 +286,9 @@ fn windows_console_action(
     gui_available: bool,
     tui_available: bool,
 ) -> (UiKind, ConsoleAction) {
-    let tui = matches!(ui, UiKind::Ratatui | UiKind::Pancurses);
+    let tui = is_tui(ui);
     let gui_by_name = matches!(argv0_kind, Some(UiKind::Gui));
-    let tui_by_name =
-        matches!(argv0_kind, Some(UiKind::Ratatui) | Some(UiKind::Pancurses));
+    let tui_by_name = argv0_kind.is_some_and(is_tui);
     if matches!(ui, UiKind::Gui) && (explicit || gui_by_name) {
         return (UiKind::Gui, ConsoleAction::Release);
     }
@@ -365,6 +396,7 @@ fn parse_args() -> Result<Args, String> {
             .and_then(argv0_ui)
             .unwrap_or_else(determine_default_ui)
     };
+    #[cfg(feature = "ratatui")]
     let mut capture_html = None;
     let mut convert_ansi = None;
     let mut positional = Vec::new();
@@ -449,7 +481,17 @@ fn parse_args() -> Result<Args, String> {
                 let Some(path) = it.next() else {
                     return Err("--capture-html requires a file path".into());
                 };
-                capture_html = Some(PathBuf::from(path));
+                // Only the ratatui arm captures; on other feature sets the
+                // option is accepted and ignored rather than erroring, so one
+                // command line works across builds.
+                #[cfg(feature = "ratatui")]
+                {
+                    capture_html = Some(PathBuf::from(path));
+                }
+                #[cfg(not(feature = "ratatui"))]
+                {
+                    let _ = path;
+                }
             }
             "--convert-ansi" => {
                 let Some(path) = it.next() else {
@@ -536,6 +578,7 @@ fn parse_args() -> Result<Args, String> {
         show_version,
         debug_no_number,
         ui,
+        #[cfg(feature = "ratatui")]
         capture_html,
         convert_ansi,
     })
@@ -1224,8 +1267,26 @@ fn export_workbook_to_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_headless_default, Args, RevisionMode, UiKind};
+    use super::{Args, RevisionMode};
     use std::path::PathBuf;
+    // The headless-fallback table mixes a TUI default with a GUI fallback, so
+    // it only compiles where both variants exist (see the tests below). It is
+    // also Unix-only, matching the function's own `cfg`.
+    #[cfg(all(
+        feature = "ratatui",
+        feature = "gui",
+        target_family = "unix",
+        not(target_arch = "wasm32")
+    ))]
+    use super::resolve_headless_default;
+    // Any build that compiles more than one backend has a test naming a
+    // variant other than the default's; import the enum where the bare name
+    // is used (the Windows console table, and the headless table).
+    #[cfg(any(
+        all(target_os = "windows", not(target_family = "rust9x")),
+        all(feature = "ratatui", feature = "gui")
+    ))]
+    use super::UiKind;
     #[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
     use super::{windows_console_action, ConsoleAction, ConsoleState};
 
@@ -1294,6 +1355,8 @@ mod tests {
             ),
             (UiKind::Ratatui, ConsoleAction::Keep)
         );
+        // The pcorro* (pancurses) case needs that variant compiled in.
+        #[cfg(feature = "pancurses")]
         assert_eq!(
             windows_console_action(
                 false,
@@ -1344,6 +1407,17 @@ mod tests {
     }
 
     // resolve_headless_default table (Unix desktops; also pure).
+    //
+    // Gated on `ratatui` + `gui` because the table deliberately mixes all
+    // three `UiKind`s (a TUI default that falls back to the GUI) and those
+    // variants only exist in a build that compiles the matching backend. The
+    // Unix gate matches the function's own, which is Unix-only.
+    #[cfg(all(
+        feature = "ratatui",
+        feature = "gui",
+        target_family = "unix",
+        not(target_arch = "wasm32")
+    ))]
     #[test]
     fn headless_launch_defaults_to_gui() {
         // No flag, neutral name, no tty, GUI compiled -> GUI.
@@ -1353,6 +1427,12 @@ mod tests {
         );
     }
 
+    #[cfg(all(
+        feature = "ratatui",
+        feature = "gui",
+        target_family = "unix",
+        not(target_arch = "wasm32")
+    ))]
     #[test]
     fn headless_honors_explicit_choices() {
         // Explicit --ratatui with piped stdio stays a TUI attempt.
@@ -1361,12 +1441,20 @@ mod tests {
             UiKind::Ratatui
         );
         // pcorro-named binary double-clicked: the name wins, GUI ignored.
+        // Needs the pancurses variant too, so a gui+ratatui build skips it.
+        #[cfg(feature = "pancurses")]
         assert_eq!(
             resolve_headless_default(UiKind::Pancurses, false, true, false, Some(UiKind::Gui)),
             UiKind::Pancurses
         );
     }
 
+    #[cfg(all(
+        feature = "ratatui",
+        feature = "gui",
+        target_family = "unix",
+        not(target_arch = "wasm32")
+    ))]
     #[test]
     fn tty_or_gui_less_stays_put() {
         // Terminal present: default stands.
@@ -1494,6 +1582,7 @@ mod tests {
             show_version,
             debug_no_number: false,
             ui,
+            #[cfg(feature = "ratatui")]
             capture_html: None,
             convert_ansi: None,
         }

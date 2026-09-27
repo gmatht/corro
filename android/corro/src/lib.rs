@@ -25,6 +25,20 @@ pub extern "system" fn Java_com_corro_MainActivity_nativeInit(
     }
 }
 
+/// Called from `SheetView` to route a tap to the canvas that owns it
+/// (`Canvas::on_click` was registered per canvas id). The sheet's tap handler
+/// moves the cursor; the sheet-tab strip's selects/reorders a tab.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeOnTouch(
+    _env: JNIEnv,
+    _class: JClass,
+    canvas_id: i64,
+    x: f32,
+    y: f32,
+) {
+    rswidgets::backends_android_adapter::dispatch_canvas_click(canvas_id as u64, x as f64, y as f64);
+}
+
 /// Called from `SheetView.onDraw`: replays the registered Rust draw closure
 /// against the live `android.graphics.Canvas` at the view's pixel size.
 #[no_mangle]
@@ -39,39 +53,6 @@ pub extern "system" fn Java_com_corro_SheetView_nativeOnDraw(
     rswidgets::backends_android_adapter::dispatch_draw(canvas_id as u64, canvas, &mut env, w, h);
 }
 
-/// Called from `SheetView.onTouchEvent` (ACTION_DOWN): moves the cursor to
-/// the tapped cell and redraws.
-#[no_mangle]
-pub extern "system" fn Java_com_corro_SheetView_nativeOnTouch(
-    _env: JNIEnv,
-    _class: JClass,
-    canvas_id: i64,
-    x: f32,
-    y: f32,
-) {
-    rswidgets::backends_android_adapter::dispatch_canvas_click(canvas_id as u64, x as f64, y as f64);
-    // The click handler queues a redraw; make sure onDraw fires.
-    // (queue_redraw already invalidates; this is belt-and-braces for the
-    // tab strip, whose canvas has no Java view of its own... no-op here.)
-}
-
-/// Called from `SheetView.onTouchEvent` (ACTION_MOVE) during a drag: scrolls
-/// the sheet by whole rows/columns.
-///
-/// Android has no native scrolling for the sheet, so the Java side accumulates
-/// the drag in pixels and converts it to cell counts using
-/// `nativeCellSize()`; this entry point applies the result. `d_rows > 0`
-/// scrolls towards later rows (content moves up under the finger), matching
-/// the natural drag direction.
-#[no_mangle]
-pub extern "system" fn Java_com_corro_SheetView_nativeScrollBy(
-    _env: JNIEnv,
-    _class: JClass,
-    d_rows: i32,
-    d_cols: i32,
-) {
-    corro::gui::android_backend::scroll_viewport(d_rows, d_cols);
-}
 
 /// Called from `SheetView` to learn the grid's row height and default column
 /// width in device pixels, so a pixel drag converts to whole cells with the
@@ -85,6 +66,131 @@ pub extern "system" fn Java_com_corro_SheetView_nativeCellSize(
     match env.new_float_array(2) {
         Ok(arr) => {
             let _ = env.set_float_array_region(&arr, 0, &[row_h as f32, col_w as f32]);
+            arr.into_raw()
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Called from `SheetView.onScale` (a pinch): multiply the sheet's view scale
+/// by `factor`, the gesture's span ratio since the previous event.
+///
+/// Returns the scale actually applied after clamping, so the Java side can
+/// refresh its cached cell size (the metrics now include the zoom) and show
+/// the value. Pinch works on the sheet, not the Activity: everything the grid
+/// draws and everything a tap hits derives from the same scale.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeZoom(
+    _env: JNIEnv,
+    _class: JClass,
+    factor: f32,
+) -> f32 {
+    corro::gui::android_backend::zoom_viewport(factor as f64) as f32
+}
+
+/// Called from `SheetView` to reset the pinch scale to 1.0 (a double-tap).
+/// Returns the applied scale (always 1.0).
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeResetZoom(
+    _env: JNIEnv,
+    _class: JClass,
+) -> f32 {
+    corro::gui::android_backend::reset_viewport_zoom() as f32
+}
+
+/// Called from `SheetView.onTouchEvent(ACTION_DOWN)`: begins a pointer
+/// gesture on the sheet canvas `canvas_id`. `is_touch` is 1 for a finger and
+/// 0 for a mouse (the emulator's pointer or a stylus), which is what decides
+/// whether a drag selects (mouse) or scrolls (finger).
+///
+/// The canvas id matters: the sheet and the sheet-tab strip are both
+/// `SheetView`s, and Rust ignores gestures for any canvas that is not the
+/// sheet, so the strip keeps its own click/reorder handling.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeGestureDown(
+    _env: JNIEnv,
+    _class: JClass,
+    canvas_id: i64,
+    x: f32,
+    y: f32,
+    is_touch: jni::sys::jboolean,
+) {
+    let _ = corro::gui::android_backend::gesture_down(canvas_id as u64, x as f64, y as f64, is_touch != 0);
+}
+
+/// Called from `SheetView` on `GestureDetector.onLongPress`: arms selection so
+/// the drag that follows extends the selection instead of scrolling.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeGestureLongPress(
+    _env: JNIEnv,
+    _class: JClass,
+    canvas_id: i64,
+    x: f32,
+    y: f32,
+) {
+    let _ = corro::gui::android_backend::gesture_long_press(canvas_id as u64, x as f64, y as f64);
+}
+
+/// Called from `SheetView.onTouchEvent(ACTION_MOVE)` during an active gesture.
+/// Returns the shared outcome code (see `nativeGestureDown`).
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeGestureMove(
+    _env: JNIEnv,
+    _class: JClass,
+    canvas_id: i64,
+    x: f32,
+    y: f32,
+) -> jni::sys::jint {
+    corro::gui::android_backend::gesture_move(canvas_id as u64, x as f64, y as f64)
+}
+
+/// Called from `SheetView.onTouchEvent(ACTION_UP)`.
+///
+/// A release that never dragged is reported as a *tap* (`3`), not applied:
+/// the Java side then routes it to the canvas's own click handler
+/// (`nativeOnTouch`), which is per canvas — so the tab strip's taps do not end
+/// up moving the sheet's cursor. Rust applies the tap for the sheet itself.
+///
+/// Returns the outcome code (0 ignored, 2 scroll, 3 tap, …).
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeGestureUp(
+    _env: JNIEnv,
+    _class: JClass,
+    canvas_id: i64,
+    x: f32,
+    y: f32,
+) -> jni::sys::jint {
+    corro::gui::android_backend::gesture_up(canvas_id as u64, x as f64, y as f64)
+}
+
+/// Called from `SheetView` when a gesture is cancelled (the system stole the
+/// touch, the Activity paused). Never produces a tap.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeGestureCancel(
+    _env: JNIEnv,
+    _class: JClass,
+    canvas_id: i64,
+) {
+    corro::gui::android_backend::gesture_cancel(canvas_id as u64);
+}
+
+/// Called from `SheetView` for a touch drag that is scrolling: pans the sheet
+/// by the pixel delta since the last event, converting to whole cells with the
+/// zoom-aware metrics. Returns the counts applied as `[dRows, dCols]` (or
+/// null), so the Java side can keep its sub-cell remainder.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeDragBy(
+    env: JNIEnv,
+    _class: JClass,
+    canvas_id: i64,
+    dx: f32,
+    dy: f32,
+) -> jni::sys::jintArray {
+    let (d_rows, d_cols) =
+        corro::gui::android_backend::drag_viewport(canvas_id as u64, dx as f64, dy as f64);
+    match env.new_int_array(2) {
+        Ok(arr) => {
+            let _ = env.set_int_array_region(&arr, 0, &[d_rows, d_cols]);
             arr.into_raw()
         }
         Err(_) => std::ptr::null_mut(),

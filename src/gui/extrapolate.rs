@@ -102,6 +102,7 @@ pub fn cancel(app: &mut super::App) {
         app.core.workbook.active_sheet_mut().grid = m.saved_grid;
     }
     app.core.anchor = None;
+    app.core.selection_kind = crate::grid::SelectionKind::Cells;
     app.core.status.clear();
 }
 
@@ -111,6 +112,7 @@ pub fn commit(app: &mut super::App) {
     let cells = compute(app);
     app.extrapolate = None;
     app.core.anchor = None;
+    app.core.selection_kind = crate::grid::SelectionKind::Cells;
     if cells.is_empty() {
         app.core.status = "Select cells with a pattern, then Extrapolate".into();
         return;

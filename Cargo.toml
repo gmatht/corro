@@ -75,10 +75,32 @@ gui = ["dep:rswidgets", "rswidgets/gtk", "rswidgets/headless", "dep:gtk_dynamic_
 # no `backends::init` at all. Those live in the target-gated table below, so
 # a real iOS/Android build never sees them.
 gui-mobile = ["dep:rswidgets", "rswidgets/ios", "rswidgets/headless"]
+# macOS: the shared GUI pipeline against the *AppKit* adapter, with no GTK
+# half. This is the desktop-native counterpart of `gui-mobile`, and it is what
+# a macOS host crate (or `scripts/check_corro_macos.sh`) depends on.
+#
+# Why it is separate from `gui`: `gui` resolves `rswidgets/gtk` +
+# `gtk_dynamic_loader`, which cannot link on an Apple target at all. So a Mac
+# build cannot use `gui`, and before this feature existed there was *no* cargo
+# feature that put corro on a native macOS widget backend — `src/gui/
+# macos_backend.rs` was only ever reachable by depending on `gui-mobile`, which
+# is misleading (it is a desktop) and gives a Mac build the iOS feature too.
+#
+# `rswidgets/macos` is a no-op feature (the adapter is gated on
+# `target_os = "macos"`, not on the feature), exactly like `rswidgets/ios`; it
+# is named here so a host can write the same explicit `features = [...]` line
+# it uses on the other Apple platforms. `rswidgets/headless` supplies the
+# headless `backends::init` the shared GUI code expects.
+gui-macos = ["dep:rswidgets", "rswidgets/macos", "rswidgets/headless"]
 # Desktop stand-in for the mobile GUI: `gui-mobile` plus the Linux/Windows
 # backend, so `--example ios-ui` / `--example android-ui` build and run on a
 # workstation. Never used by the app bundles.
 gui-mobile-host = ["gui-mobile", "gui"]
+# Desktop stand-in for the macOS GUI: `gui-macos` plus the Linux/Windows
+# backend, so the AppKit widget tree and the macOS menu model can be built and
+# inspected on a workstation (and, crucially, tested headlessly on Linux CI).
+# Never used by a real .app bundle, which depends on `gui-macos` alone.
+gui-macos-host = ["gui-macos", "gui"]
 wasm = ["dep:rswidgets"]
 pancurses = ["rswidgets/pancurses"]
 gtk = ["gui"]

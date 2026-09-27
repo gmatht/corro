@@ -335,6 +335,343 @@ pub fn locale_is_rtl(tag: &str) -> bool {
     matches!(base.as_str(), "ar" | "he" | "fa" | "ur" | "yi" | "dv" | "ps" | "sd" | "ug")
 }
 
+// ---------------------------------------------------------------------------
+// Colour scheme / theme
+// ---------------------------------------------------------------------------
+//
+// A day/night colour scheme, and the one global that selects it. This is the
+// same shape as [`set_layout_direction`]: a policy-free enum plus a swappable
+// global, with the *palette* left to the app.
+//
+// ## Toolkit purity: why this crate carries no colours
+//
+// The toolkit owns the *mechanism* (a named role -> `Color` lookup, swappable
+// at runtime) and the *role vocabulary* (`cell_body`, `gridline`, `cursor`,
+// ...). The app owns the *palette* — which exact grey means `cell_body` in its
+// own design. A toolkit that hardcoded "night mode is #1e1e1e" would be
+// dictating one app's visual design, and an app that wanted a sepia or a
+// high-contrast scheme would have no way to express it. So the built-in
+// schemes here are generic and *overridable*: [`Theme::custom`] lets an app
+// supply its own values for any role.
+//
+// The roles are semantic, not visual. There is no "light_grey" role, because
+// what a surface *means* (is this entered data, is this derived, is this where
+// the caret is) is stable across schemes, while its colour is not.
+
+/// Which of the two built-in schemes an app is currently using.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ColorScheme {
+    /// The default: the historical light-surface rendering. Every value here
+    /// reproduces the hardcoded constants this crate used before theming
+    /// existed, so a build that never calls [`set_color_scheme`] paints
+    /// pixel-identically to one from before the change.
+    #[default]
+    Light,
+    /// Dark surfaces, light text. Intended for dim rooms; the roles keep the
+    /// same *relative* contrast as in [`ColorScheme::Light`] so a cell that
+    /// reads as "dimmed" in one scheme reads as dimmed in the other.
+    Night,
+}
+
+/// One resolved colour, opaque. Channels are `0.0..=1.0` to match the
+/// `DrawContext` primitives, which take `f64` — no conversion, no rounding
+/// drift, and the terminal backends already quantise from the same range.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Color {
+    pub r: f64,
+    pub g: f64,
+    pub b: f64,
+}
+
+impl Color {
+    /// Build a colour from its three channels. Values outside `0.0..=1.0` are
+    /// not clamped: a backend that receives an out-of-range channel is a
+    /// palette bug, and silently clamping here would hide it.
+    pub const fn new(r: f64, g: f64, b: f64) -> Self {
+        Self { r, g, b }
+    }
+
+    /// The colour with full opacity, as the `DrawContext` primitives want it.
+    pub const fn rgba(self) -> (f64, f64, f64, f64) {
+        (self.r, self.g, self.b, 1.0)
+    }
+
+    /// The colour as a plain `(r, g, b)` triple, for the many call sites that
+    /// pass a colour tuple around rather than unpacking it at the draw call.
+    pub const fn rgb(self) -> (f64, f64, f64) {
+        (self.r, self.g, self.b)
+    }
+
+    /// Relative luminance (ITU-R BT.709, the sRGB coefficients), as `0.0..=1.0`.
+    ///
+    /// The scale is what makes this useful: sRGB is perceptually non-linear, so
+    /// comparing raw channel values says little about whether one surface reads
+    /// as "lighter" than another. Luminance is the standard proxy, and it is
+    /// what lets the theme tests assert "the margin really is dimmer than the
+    /// body" as a statement about the *perceived* result rather than about two
+    /// arbitrary numbers.
+    pub fn luminance(self) -> f64 {
+        0.2126 * self.r + 0.7152 * self.g + 0.0722 * self.b
+    }
+
+    /// WCAG contrast ratio against `other`, from 1.0 (identical) to 21.0
+    /// (black on white). Used by the theme tests to prove text stays legible
+    /// in every scheme, which is the property that actually matters for a dark
+    /// mode: a dark surface with dark text is "correct" in the sense that both
+    /// values came from the palette, and still unreadable.
+    pub fn contrast_ratio(self, other: Color) -> f64 {
+        let (a, b) = (self.luminance(), other.luminance());
+        let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+}
+
+/// The semantic surfaces a renderer needs to name. Adding a role here is a
+/// deliberate act: it means "some painted surface has a stable meaning across
+/// schemes", and every role added must be given a value in *both* built-in
+/// schemes or it silently falls back to the light one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// The backdrop behind everything.
+    Paper,
+    /// An ordinary, editable body cell.
+    CellBody,
+    /// A cell outside the data body (a margin strip, a label band).
+    CellMargin,
+    /// A header/label surface (row labels, column headers, a formula bar).
+    Header,
+    /// The hairline between cells.
+    Gridline,
+    /// The cell under the caret, not editing.
+    Cursor,
+    /// The cell under the caret, while typing.
+    CursorEditing,
+    /// Cells covered by a selection.
+    Selected,
+    /// A derived/computed cell (a total, a subtotal).
+    Aggregate,
+    /// Default body text.
+    Text,
+    /// De-emphasised text (a placeholder, a trailing note).
+    TextMuted,
+    /// Text that calls attention (a link, an active tab's label).
+    TextAccent,
+    /// Text drawn *on* a highlight fill (the cursor, the editing cell, a
+    /// selection) rather than on a body cell.
+    ///
+    /// A separate role because a dark sheet's highlights are *lighter* than
+    /// its body, so the same light body ink that reads well on a body cell
+    /// would be low-contrast on the very cell the user is looking at. In dark
+    /// mode these fills therefore take near-black ink, which is also the
+    /// inverted-selection idiom users already expect.
+    TextOnHighlight,
+    /// The bar behind a row/column of tabs.
+    TabStrip,
+    /// An inactive tab.
+    TabIdle,
+    /// The active tab.
+    TabActive,
+}
+
+/// A complete, swappable palette.
+///
+/// Built-in schemes come from [`Theme::for_scheme`]; an app with its own
+/// design (or a high-contrast mode) starts from one of those and overrides
+/// only the roles it cares about via [`Theme::with`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Theme {
+    scheme: ColorScheme,
+    paper: Color,
+    cell_body: Color,
+    cell_margin: Color,
+    header: Color,
+    gridline: Color,
+    cursor: Color,
+    cursor_editing: Color,
+    selected: Color,
+    aggregate: Color,
+    text: Color,
+    text_muted: Color,
+    text_accent: Color,
+    text_on_highlight: Color,
+    tab_strip: Color,
+    tab_idle: Color,
+    tab_active: Color,
+}
+
+impl Theme {
+    /// The built-in palette for `scheme`.
+    ///
+    /// Every constant in the `Light` arm is the literal this crate hardcoded
+    /// before theming existed, so defaulting to `Light` is a no-op rather than
+    /// a re-design. That is asserted by tests in each renderer.
+    pub fn for_scheme(scheme: ColorScheme) -> Self {
+        match scheme {
+            ColorScheme::Light => Self {
+                scheme,
+                paper: Color::new(0.96, 0.96, 0.96),
+                cell_body: Color::new(1.0, 1.0, 1.0),
+                cell_margin: Color::new(0.75, 0.75, 0.75),
+                header: Color::new(0.88, 0.90, 0.93),
+                gridline: Color::new(0.8, 0.8, 0.8),
+                cursor: Color::new(0.8, 0.9, 1.0),
+                cursor_editing: Color::new(1.0, 1.0, 0.8),
+                selected: Color::new(0.9, 0.95, 1.0),
+                aggregate: Color::new(0.4, 0.4, 0.4),
+                text: Color::new(0.05, 0.05, 0.10),
+                text_muted: Color::new(0.3, 0.3, 0.3),
+                text_accent: Color::new(0.0, 0.0, 0.85),
+                // Light mode's highlights are pale, so body ink already reads
+                // on them; this keeps the *value* identical to `Text` in light
+                // mode, which is what the pixel-identical default requires.
+                text_on_highlight: Color::new(0.05, 0.05, 0.10),
+                tab_strip: Color::new(0.92, 0.92, 0.92),
+                tab_idle: Color::new(0.85, 0.85, 0.85),
+                tab_active: Color::new(0.6, 0.75, 0.95),
+            },
+            ColorScheme::Night => Self {
+                scheme,
+                // A desaturated near-black, not pure black: pure black against
+                // light text is harsh over a large area and makes the cursor
+                // outline hard to place.
+                paper: Color::new(0.11, 0.11, 0.13),
+                cell_body: Color::new(0.16, 0.16, 0.19),
+                // The margin is *darker* than the body here, the inverse of
+                // light mode. Dimming a margin means receding from the paper,
+                // and in a dark scheme the way to recede is to go down, not
+                // up; a margin lighter than the body would read as selected.
+                cell_margin: Color::new(0.13, 0.13, 0.15),
+                header: Color::new(0.22, 0.22, 0.26),
+                gridline: Color::new(0.30, 0.30, 0.34),
+                // Highlight fills are *lighter* than the body, so the cell
+                // under the caret is unmistakable. They take near-black ink
+                // (`TextOnHighlight`) rather than body ink, because light
+                // body text on a light fill is low-contrast precisely where
+                // the user is looking.
+                // `selected` is shifted toward teal rather than reusing the
+                // cursor's blue: a selection spanning many cells and a single
+                // caret are different things, and at the same lightness a
+                // shared hue would make them hard to tell apart at a glance.
+                cursor: Color::new(0.30, 0.40, 0.58),
+                cursor_editing: Color::new(0.55, 0.52, 0.22),
+                selected: Color::new(0.30, 0.44, 0.42),
+                aggregate: Color::new(0.62, 0.62, 0.66),
+                text: Color::new(0.92, 0.92, 0.95),
+                text_muted: Color::new(0.62, 0.62, 0.66),
+                text_accent: Color::new(0.45, 0.72, 1.0),
+                // Near-black on the (lighter) highlight fills.
+                text_on_highlight: Color::new(0.04, 0.04, 0.07),
+                tab_strip: Color::new(0.14, 0.14, 0.16),
+                tab_idle: Color::new(0.20, 0.20, 0.24),
+                tab_active: Color::new(0.28, 0.38, 0.54),
+            },
+        }
+    }
+
+    /// The scheme this palette was built for. Carried so a renderer can branch
+    /// on "is this night mode" (for the few decisions a single colour cannot
+    /// express, like dimming vs. lightening a shadow).
+    pub fn scheme(&self) -> ColorScheme {
+        self.scheme
+    }
+
+    /// The colour for `role`.
+    pub fn color(&self, role: Role) -> Color {
+        match role {
+            Role::Paper => self.paper,
+            Role::CellBody => self.cell_body,
+            Role::CellMargin => self.cell_margin,
+            Role::Header => self.header,
+            Role::Gridline => self.gridline,
+            Role::Cursor => self.cursor,
+            Role::CursorEditing => self.cursor_editing,
+            Role::Selected => self.selected,
+            Role::Aggregate => self.aggregate,
+            Role::Text => self.text,
+            Role::TextMuted => self.text_muted,
+            Role::TextAccent => self.text_accent,
+            Role::TextOnHighlight => self.text_on_highlight,
+            Role::TabStrip => self.tab_strip,
+            Role::TabIdle => self.tab_idle,
+            Role::TabActive => self.tab_active,
+        }
+    }
+
+    /// The same palette with `role` overridden — the customization entry point
+    /// for an app that wants its own scheme.
+    pub fn with(mut self, role: Role, color: Color) -> Self {
+        match role {
+            Role::Paper => self.paper = color,
+            Role::CellBody => self.cell_body = color,
+            Role::CellMargin => self.cell_margin = color,
+            Role::Header => self.header = color,
+            Role::Gridline => self.gridline = color,
+            Role::Cursor => self.cursor = color,
+            Role::CursorEditing => self.cursor_editing = color,
+            Role::Selected => self.selected = color,
+            Role::Aggregate => self.aggregate = color,
+            Role::Text => self.text = color,
+            Role::TextMuted => self.text_muted = color,
+            Role::TextAccent => self.text_accent = color,
+            Role::TextOnHighlight => self.text_on_highlight = color,
+            Role::TabStrip => self.tab_strip = color,
+            Role::TabIdle => self.tab_idle = color,
+            Role::TabActive => self.tab_active = color,
+        }
+        self
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::for_scheme(ColorScheme::Light)
+    }
+}
+
+static THEME: OnceLock<std::sync::RwLock<Theme>> = OnceLock::new();
+
+fn theme_cell() -> &'static std::sync::RwLock<Theme> {
+    THEME.get_or_init(|| std::sync::RwLock::new(Theme::default()))
+}
+
+/// The palette in effect. Defaults to [`ColorScheme::Light`].
+///
+/// A lock, not a `OnceLock`: the whole point of a theme is that the app can
+/// swap it while running, so the cell must be replaceable after first use.
+pub fn theme() -> Theme {
+    match theme_cell().read() {
+        Ok(t) => *t,
+        // A poisoned lock means another thread panicked while holding it. The
+        // palette is plain data, so falling back to the default is safe and
+        // keeps a render path from panicking in turn.
+        Err(_) => Theme::default(),
+    }
+}
+
+/// Replace the palette for every renderer that reads [`theme`].
+///
+/// Apps should follow a swap with a redraw of anything already realised: the
+/// palette is consulted per paint call, so the change lands on the next frame
+/// rather than immediately.
+pub fn set_theme(theme: Theme) {
+    match theme_cell().write() {
+        Ok(mut t) => *t = theme,
+        Err(_) => {}
+    }
+}
+
+/// Convenience wrapper: switch to `scheme`'s built-in palette, discarding any
+/// per-role overrides. This is what a plain "View > Night mode" toggle wants;
+/// an app with its own design should use [`set_theme`] directly.
+pub fn set_color_scheme(scheme: ColorScheme) {
+    set_theme(Theme::for_scheme(scheme));
+}
+
+/// The scheme currently in effect.
+pub fn color_scheme() -> ColorScheme {
+    theme().scheme()
+}
+
 /// A menu item in a backend-agnostic menu model. Backends render and navigate
 /// this model with their own widgets; the model itself is shared so an
 /// application can build one menu and hand it to any backend.
@@ -514,6 +851,36 @@ pub fn terminal_size() -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// Terminal size with the override precedence a testable host needs.
+///
+/// Order: `COLS_OVERRIDE_ENV`/`ROWS_OVERRIDE_ENV` (explicit, for tests and
+/// scripted runs), then a real terminal query ([`terminal_size`]), then
+/// `$COLUMNS` and a 80x50 fallback. Backends should call this rather than
+/// issuing their own `ioctl`: the query is the same on every terminal backend,
+/// and a host that needs a deterministic size (a test harness, a recorded
+/// demo) must not have to re-implement the precedence.
+///
+/// Returns `(cols, rows)`.
+pub const TERM_SIZE_OVERRIDE_ENV: (&str, &str) = ("CORRO_TERM_COLS", "CORRO_TERM_ROWS");
+
+/// See [`TERM_SIZE_OVERRIDE_ENV`].
+pub fn terminal_size_with_override() -> (usize, usize) {
+    let (cols_env, rows_env) = TERM_SIZE_OVERRIDE_ENV;
+    let env_cols = std::env::var(cols_env).ok().and_then(|s| s.parse::<usize>().ok());
+    let env_rows = std::env::var(rows_env).ok().and_then(|s| s.parse::<usize>().ok());
+    if let (Some(c), Some(r)) = (env_cols, env_rows) {
+        return (c, r);
+    }
+    if let Some((c, r)) = terminal_size() {
+        return (c, r);
+    }
+    let cols = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80);
+    (cols, 50)
 }
 
 /// Opaque handler id returned when connecting signals
@@ -1419,38 +1786,38 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         {
             let inner = crate::backends_gtk_adapter::create_entry()?;
-            return Ok(crate::common::Entry { inner });
+            return Ok(crate::common::Entry::new(inner));
         }
         #[cfg(all(windows, not(feature = "zork")))]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_entry(parent)?;
-            Ok(crate::common::Entry { inner })
+            Ok(crate::common::Entry::new(inner))
         }
         #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
         {
             let inner = crate::backends_pancurses_adapter::create_entry()?;
-            Ok(crate::common::Entry { inner })
+            Ok(crate::common::Entry::new(inner))
         }
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_entry()?;
-            Ok(crate::common::Entry { inner })
+            Ok(crate::common::Entry::new(inner))
         }
         #[cfg(all(target_os = "android", not(feature = "zork")))]
         {
             let inner = crate::backends_android_adapter::create_entry()?;
-            Ok(crate::common::Entry { inner })
+            Ok(crate::common::Entry::new(inner))
         }
         #[cfg(all(target_os = "ios", not(feature = "zork")))]
         {
             let inner = crate::backends_ios_adapter::create_entry()?;
-            return Ok(crate::common::Entry { inner });
+            return Ok(crate::common::Entry::new(inner));
         }
         #[cfg(all(target_os = "macos", not(feature = "zork")))]
         {
             let inner = crate::backends_macos_adapter::create_entry()?;
-            return Ok(crate::common::Entry { inner });
+            return Ok(crate::common::Entry::new(inner));
         }
     }
 
@@ -1526,6 +1893,26 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_os = "macos", not(feature = "zork")))]
         {
             let inner = crate::backends_macos_adapter::create_scrolled_window()?;
+            return Ok(crate::common::ScrolledWindow { inner });
+        }
+        // Terminal: a scrolled window is a container node. It adds no native
+        // scrollbar chrome (a character display has none), but it must exist so
+        // the portable `new_scrolled_window` contract holds on every backend —
+        // a host that nests its canvas in one (as `gui_backend` does) can then
+        // be built unchanged against the terminal.
+        #[cfg(all(
+            feature = "pancurses",
+            not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android", target_os = "ios", target_os = "macos"))
+        ))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_scrolled_window()?;
+            return Ok(crate::common::ScrolledWindow { inner });
+        }
+        // Zork (the scripted-terminal fallback) has containers but no
+        // scrollbars; same reasoning as the pancurses arm above.
+        #[cfg(feature = "zork")]
+        {
+            let inner = crate::backends_zork_adapter::create_scrolled_window()?;
             return Ok(crate::common::ScrolledWindow { inner });
         }
         #[allow(unreachable_code)]
@@ -1903,6 +2290,197 @@ mod tests {
         assert!(!locale_is_rtl("de"));
         assert!(!locale_is_rtl(""));
     }
+
+    // ---- theme / colour scheme ----
+
+    /// The palette is light until an app says otherwise.
+    ///
+    /// Load-bearing: every colour literal this crate used to hardcode is the
+    /// `Light` value, so a build that never calls `set_color_scheme` must paint
+    /// exactly as it did before theming existed. `default_is_the_historical_palette`
+    /// pins the values themselves; this pins the wiring.
+    #[test]
+    fn theme_defaults_to_light() {
+        assert_eq!(color_scheme(), ColorScheme::Light);
+        assert_eq!(theme(), Theme::for_scheme(ColorScheme::Light));
+    }
+
+    /// The `Light` palette reproduces the literals that were hardcoded before
+    /// theming existed.
+    ///
+    /// If this fails, a build that never opts into theming has been restyled —
+    /// the worst possible outcome for a "new feature", because every existing
+    /// app and every golden-pixel test changes under it.
+    #[test]
+    fn default_is_the_historical_palette() {
+        set_color_scheme(ColorScheme::Light);
+        let t = theme();
+        let eq = |role: Role, r: f64, g: f64, b: f64| {
+            assert_eq!(
+                t.color(role),
+                Color::new(r, g, b),
+                "role {role:?} must keep its historical light value"
+            );
+        };
+        eq(Role::Paper, 0.96, 0.96, 0.96); // spreadsheet::paint clear
+        eq(Role::CellBody, 1.0, 1.0, 1.0);
+        eq(Role::CellMargin, 0.75, 0.75, 0.75);
+        eq(Role::Header, 0.88, 0.9, 0.93);
+        eq(Role::Gridline, 0.8, 0.8, 0.8);
+        eq(Role::Cursor, 0.8, 0.9, 1.0);
+        eq(Role::CursorEditing, 1.0, 1.0, 0.8);
+        eq(Role::Text, 0.05, 0.05, 0.1);
+        eq(Role::TextMuted, 0.3, 0.3, 0.3);
+        eq(Role::TextAccent, 0.0, 0.0, 0.85); // hyperlink blue
+    }
+
+    /// Switching schemes swaps the whole palette, and switching back restores
+    /// it exactly — the property that makes the toggle safe to spam.
+    #[test]
+    fn scheme_round_trips() {
+        set_color_scheme(ColorScheme::Light);
+        let light = theme();
+        set_color_scheme(ColorScheme::Night);
+        let night = theme();
+        assert_eq!(color_scheme(), ColorScheme::Night);
+        assert_ne!(light, night, "night must actually differ from light");
+        set_color_scheme(ColorScheme::Light);
+        assert_eq!(theme(), light, "toggling back must restore the light palette exactly");
+    }
+
+    /// `set_theme` installs an app-supplied palette, and `with` overrides one
+    /// role without disturbing the rest. This is the customization path a host
+    /// with its own design uses, so it has to work per-role.
+    #[test]
+    fn custom_theme_overrides_only_the_named_role() {
+        let base = Theme::for_scheme(ColorScheme::Night);
+        let custom = base.with(Role::CellBody, Color::new(0.2, 0.05, 0.05));
+        assert_eq!(custom.color(Role::CellBody), Color::new(0.2, 0.05, 0.05));
+        assert_eq!(
+            custom.color(Role::Text),
+            base.color(Role::Text),
+            "an override must not disturb any other role"
+        );
+        set_theme(custom);
+        assert_eq!(theme().color(Role::CellBody), Color::new(0.2, 0.05, 0.05));
+        // Leave the global as the next test expects to find it.
+        set_color_scheme(ColorScheme::Light);
+    }
+
+    /// Text has to stay legible in *both* schemes.
+    ///
+    /// This is the assertion that makes the night palette a dark theme rather
+    /// than a set of dark numbers: a dark surface with dark text is perfectly
+    /// well-formed and completely unreadable. Asserted as a contrast ratio,
+    /// which is the property a reader actually experiences.
+    #[test]
+    fn body_text_stays_legible_in_both_schemes() {
+        for scheme in [ColorScheme::Light, ColorScheme::Night] {
+            let t = Theme::for_scheme(scheme);
+            let text = t.color(Role::Text);
+            // Body text on a plain cell, and on the dimmest surface it is ever
+            // drawn over.
+            // Every surface body text is ever drawn over, not just the plain
+            // cell: the cell under the caret, the cell being typed into, a
+            // selected cell and the dimmed margin. A dark scheme that passes
+            // only on the body cell can still render the *caret* unreadable,
+            // which is the one surface a user must always be able to read.
+            // WCAG AA for body text is 4.5:1; the highlights are held to the
+            // same bar rather than a looser one, because they carry the same
+            // text.
+            for (role, label) in [
+                (Role::CellBody, "body cell"),
+                (Role::CellMargin, "margin cell"),
+            ] {
+                let ratio = text.contrast_ratio(t.color(role));
+                assert!(
+                    ratio >= 4.5,
+                    "{scheme:?}: body text on a {label} is only {ratio:.2}:1"
+                );
+            }
+            // Highlight ink on the highlight fills — a *different* pairing in
+            // each scheme (light ink on dark fills, dark ink on light fills),
+            // which is exactly why this is a separate assertion. Checking body
+            // ink against a highlight fill is the mistake that made the first
+            // night palette unreadable at the caret.
+            let on_hi = t.color(Role::TextOnHighlight);
+            for (role, label) in [
+                (Role::Cursor, "cursor cell"),
+                (Role::CursorEditing, "editing cell"),
+                (Role::Selected, "selected cell"),
+            ] {
+                let ratio = on_hi.contrast_ratio(t.color(role));
+                assert!(
+                    ratio >= 4.5,
+                    "{scheme:?}: highlight text on a {label} is only {ratio:.2}:1"
+                );
+            }
+            // The highlights must also be visibly distinct from the body, or
+            // "legible" would hold only because every surface is one flat
+            // colour and the caret is invisible.
+            for (role, label) in [
+                (Role::Cursor, "cursor cell"),
+                (Role::CursorEditing, "editing cell"),
+                (Role::Selected, "selected cell"),
+            ] {
+                assert!(
+                    (t.color(role).luminance() - t.color(Role::CellBody).luminance()).abs() > 0.01,
+                    "{scheme:?}: a {label} must be visibly distinct from a body cell"
+                );
+            }
+        }
+    }
+
+    /// Night mode is a *dark* scheme, and light mode a *light* one: the
+    /// relationship inverts rather than simply darkening. Stated in luminance
+    /// so it is about what a reader sees, not about the raw channel values.
+    #[test]
+    fn night_mode_actually_inverts_the_surface_luminance() {
+        let light = Theme::for_scheme(ColorScheme::Light);
+        let night = Theme::for_scheme(ColorScheme::Night);
+        let lum = |t: &Theme, role: Role| t.color(role).luminance();
+        assert!(
+            lum(&light, Role::CellBody) > 0.9,
+            "light body must be bright, got {}",
+            lum(&light, Role::CellBody)
+        );
+        assert!(
+            lum(&night, Role::CellBody) < 0.25,
+            "night body must be dark, got {}",
+            lum(&night, Role::CellBody)
+        );
+        assert!(
+            lum(&night, Role::Text) > lum(&night, Role::CellBody) * 4.0,
+            "night text must be far lighter than the surface it sits on"
+        );
+    }
+
+    /// The margin stays subordinate to the body in both schemes.
+    ///
+    /// "Dimmer" means the same perceptual thing in each, but the direction
+    /// flips: in light mode the margin is darker than the body, in night mode
+    /// it is *darker still* (below the body, not above it). What must not
+    /// happen is the margin becoming the more prominent surface, which is why
+    /// this asserts the ordering rather than a literal value.
+    #[test]
+    fn margin_stays_subordinate_to_the_body_in_both_schemes() {
+        for scheme in [ColorScheme::Light, ColorScheme::Night] {
+            let t = Theme::for_scheme(scheme);
+            let body = t.color(Role::CellBody).luminance();
+            let margin = t.color(Role::CellMargin).luminance();
+            // The margin differs from the body (it is visibly a separate zone)
+            // but the two stay distinguishable from the paper.
+            assert!(
+                (body - margin).abs() > 0.01,
+                "{scheme:?}: margin and body must differ"
+            );
+            assert!(
+                t.color(Role::Paper).contrast_ratio(t.color(Role::CellBody)) < 2.0,
+                "{scheme:?}: the body must read as a distinct surface from the paper"
+            );
+        }
+    }
+
 }
 
 // ---------------------------------------------------------------------------

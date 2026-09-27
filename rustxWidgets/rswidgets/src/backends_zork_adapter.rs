@@ -626,6 +626,22 @@ impl Canvas {
     pub fn queue_redraw(&self) {}
     pub fn set_draw_callback(&self, _cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {}
     pub fn on_click(&self, _cb: Box<dyn FnMut(f64, f64)>) {}
+
+    /// No-op: the zork terminal canvas has no pointer buttons. The pancurses
+    /// terminal canvas does implement these (see the pancurses adapter).
+    pub fn on_click_button(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {}
+    /// No-op: see `on_click_button`.
+    pub fn on_motion(&self, _cb: Box<dyn FnMut(f64, f64, u32)>) {}
+    /// This canvas's top-left in screen coordinates, or `None` when the
+    /// backend cannot report one. Callers then open a context menu
+    /// unpositioned rather than guessing. See the GTK backend's
+    /// `screen_origin`.
+    pub fn screen_origin(&self) -> Option<(i32, i32)> {
+        None
+    }
+
+    /// No-op: see `on_click_button`.
+    pub fn on_release(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {}
     /// No-op: terminal canvases are virtual; visibility is meaningless.
     pub fn set_visible(&self, _v: bool) {}
     pub fn on_key(&self, _cb: Box<dyn FnMut(u32) -> bool>) {}

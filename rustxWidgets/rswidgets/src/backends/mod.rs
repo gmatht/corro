@@ -7,6 +7,30 @@ pub type BackendError = Box<dyn StdError + Send + Sync>;
 pub trait BackendApp {
     /// Run the backend main loop. Consumes the backend app.
     fn run(self: Box<Self>) -> Result<(), BackendError>;
+
+    /// Whether this backend **owns** its event loop, or hands control to a
+    /// framework that owns it.
+    ///
+    /// This is the one structural difference between backends that survives
+    /// every other unification, and it is not a gap to close — it is a
+    /// property of the host environment:
+    ///
+    /// * `false` — a toolkit or OS framework owns dispatch and calls back into
+    ///   the widgets. GTK and NWG are like this (`g_main_loop_run`,
+    ///   `GetMessageW`), and so are WASM and the mobile backends, where the
+    ///   browser / Activity / UIKit owns the loop and `run` returns immediately.
+    ///   Such apps build widgets, then release control, and quit by signalling
+    ///   the owner (`quit_main_loop`).
+    /// * `true` — nothing else wants to dispatch for us, so the backend reads
+    ///   input directly and *is* the loop. Pancurses and zork are like this:
+    ///   `run` blocks in `getch()`, and there is no loop pointer to publish.
+    ///
+    /// Hosts that must behave differently (e.g. "is a quit request
+    /// asynchronous?") can ask, instead of using `cfg`. Defaults to `false`
+    /// because most backends delegate.
+    fn owns_event_loop(&self) -> bool {
+        false
+    }
 }
 
 /// Priority chain: each backend module is always compiled when its feature is on,

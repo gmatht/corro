@@ -70,3 +70,8 @@ android/corro/target/
 xcuserdata/
 DerivedData/
 *.xcarchive
+
+# macOS host crate: same reasoning as the iOS one — macos/corro is a
+# standalone workspace, so its target/ is separate from the main one and
+# would otherwise show up as a large untracked tree.
+/macos/corro/target/

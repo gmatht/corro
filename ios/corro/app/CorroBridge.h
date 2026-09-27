@@ -35,6 +35,41 @@ void corro_ios_canvas_size(uint64_t canvas_id, int32_t w, int32_t h);
 /// SheetView tap: move the cursor to the tapped cell.
 void corro_ios_canvas_click(uint64_t canvas_id, double x, double y);
 
+/// SheetView pinch: multiply the sheet's view scale by the recogniser's scale
+/// ratio; returns the scale actually applied (clamped).
+double corro_ios_canvas_zoom(double factor);
+
+/// SheetView double-tap: reset the pinch scale to 1.0.
+double corro_ios_canvas_zoom_reset(void);
+
+/// SheetView gesture begin. `is_touch` is 1 for a finger (drag pans, long
+/// press selects) and 0 for a mouse/trackpad (drag selects). `canvas_id`
+/// names the canvas: gestures on any canvas that is not the sheet are ignored
+/// by Rust, so the sheet-tab strip keeps its own click handling.
+void corro_ios_canvas_gesture_down(uint64_t canvas_id, double x, double y, int32_t is_touch);
+
+/// SheetView long press: arm selection for the drag that follows.
+void corro_ios_canvas_gesture_long_press(uint64_t canvas_id, double x, double y);
+
+/// SheetView drag move; returns the shared outcome code (0 ignored, 1 select,
+/// 2 scroll, 3 tap, 4 long press).
+int32_t corro_ios_canvas_gesture_move(uint64_t canvas_id, double x, double y);
+
+/// SheetView gesture end. A release that never dragged returns 3 (tap); the
+/// shim then routes it through `corro_ios_canvas_click` for *this* canvas.
+int32_t corro_ios_canvas_gesture_up(uint64_t canvas_id, double x, double y);
+
+/// SheetView gesture cancelled: never produces a tap.
+void corro_ios_canvas_gesture_cancel(uint64_t canvas_id);
+
+/// Pan the sheet by a pixel delta from a scroll drag. `out` receives the
+/// applied `[dRows, dCols]` so the host can keep its sub-cell remainder.
+void corro_ios_canvas_drag_by(uint64_t canvas_id, double dx, double dy, int32_t *out);
+
+/// Write the grid's `[row_h, col_w]` (points) so the host accumulates drags
+/// with the same metrics the renderer uses (pinch included).
+void corro_ios_canvas_cell_size(double *out);
+
 /// SheetView hardware key: returns whether the key was consumed.
 bool corro_ios_canvas_key(uint64_t canvas_id, uint32_t keyval, uint32_t mods);
 

@@ -127,7 +127,18 @@ mod pancurses_adapter {
         pub fn set_visible(&self, visible: bool) {
             crate::backends::pancurses::set_label_visible(self.id, visible);
         }
+        /// Pin the label's laid-out width so changing its text never shifts
+        /// the widgets packed after it. `w` is in character cells (the unit
+        /// the terminal layout works in); `None` restores shrink-to-fit.
+        pub fn set_fixed_width(&self, w: Option<i32>) {
+            crate::backends::pancurses::set_label_fixed_width(self.id, w);
+        }
         pub fn set_xalign(&self, _x: f32) {}
+        /// Left inset of the label's text. A no-op in the terminal: the box
+        /// layout there is cell-based and `set_fixed_width` already holds the
+        /// slot, so there is no sub-cell margin to speak of. Present so the
+        /// cross-backend `Label` surface matches the GUI backends.
+        pub fn set_margin_start(&self, _px: i32) {}
         pub fn raw_handle(&self) -> *mut c_void {
             &self.id as *const usize as *mut c_void
         }
@@ -242,14 +253,25 @@ mod pancurses_adapter {
         pub fn set_margin_top(&self, _margin: i32) {}
         pub fn add_class(&self, _class_name: &str) {}
         pub fn remove_class(&self, _class_name: &str) {}
-        pub fn grab_focus(&self) {}
-        /// Terminal entries report no caret: callers keep their own.
-        pub fn get_position(&self) -> Option<usize> { None }
-        pub fn set_position(&self, _pos: usize) {}
-        /// Terminal entries never take GTK-style focus: report false so
-        /// callers keep today's push behavior.
+        /// Focus this entry (sets the widget tree's single `focus_id`).
+        pub fn grab_focus(&self) {
+            crate::backends::pancurses::entry_grab_focus(self.id);
+        }
+
+        /// The caret's byte offset, which the widget maintains as the user
+        /// types. Exposing it means a host no longer needs a parallel copy.
+        pub fn get_position(&self) -> Option<usize> {
+            crate::backends::pancurses::get_entry_cursor(self.id)
+        }
+
+        /// Move the caret (clamped to a char boundary by the backend).
+        pub fn set_position(&self, pos: usize) {
+            crate::backends::pancurses::set_entry_cursor(self.id, pos);
+        }
+
+        /// Whether this entry currently holds focus.
         pub fn has_focus(&self) -> bool {
-            false
+            crate::backends::pancurses::entry_has_focus(self.id)
         }
         /// No pointer clicks on terminal entries: accept and never fire.
         pub fn connect_button_press(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
@@ -405,6 +427,16 @@ mod pancurses_adapter {
 
     impl MenuBar {
         pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool { false }
+
+        /// Open the submenu whose mnemonic is `keyval` at a screen position.
+        ///
+        /// Only the GTK backend can do this (its `GtkMenu` takes a position
+        /// callback); elsewhere the menu system has no programmatic
+        /// popup-at-position call, so this reports `false` instead of
+        /// pretending. The caller surfaces that as an "unavailable" status.
+        pub fn popup_submenu_by_mnemonic_at(&self, _keyval: u32, _x: i32, _y: i32) -> bool {
+            false
+        }
         pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool { false }
         pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
         pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool { false }
@@ -678,8 +710,54 @@ mod pancurses_adapter {
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
         pub fn set_content_size(&self, _w: i32, _h: i32) {}
         pub fn queue_redraw(&self) {}
-        pub fn set_draw_callback(&self, _cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {}
-        pub fn on_click(&self, _cb: Box<dyn FnMut(f64, f64)>) {}
+        /// Register a draw callback — the same contract every GUI canvas
+        /// implements. The callback gets a `DrawContext` backed by a terminal
+        /// cell grid; the backend reduces that grid to ANSI and flushes it on
+        /// each redraw, so a canvas-painted UI works on a character display.
+        pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
+            crate::backends::pancurses::canvas_set_draw_callback(self.id, cb);
+        }
+        /// Register a plain click handler — the same contract the GTK/NWG
+        /// canvases implement. The toolkit converts the terminal's cell hit
+        /// into the pixel-space coordinates `DrawContext` uses, so a host's
+        /// click math is backend-independent.
+        pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
+            crate::backends::pancurses::canvas_on_click(self.id, cb);
+        }
+
+        /// Button/modifier-aware click. See the GTK backend's
+        /// `on_click_button`: kept alongside `on_click` so both can be
+        /// registered (as on GTK, where they share one signal connection).
+        /// `button` is 1-based; the terminal reports the primary button as 1.
+        pub fn on_click_button(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            crate::backends::pancurses::canvas_on_click_button(self.id, cb);
+        }
+
+        /// Pointer motion over the canvas; see the GTK backend's `on_motion`.
+        /// Terminals only report motion while a button is held (or as bare
+        /// position reports); both arrive here, with `button` = 0 for the
+        /// no-button case.
+        pub fn on_motion(&self, cb: Box<dyn FnMut(f64, f64, u32)>) {
+            crate::backends::pancurses::canvas_on_motion(self.id, cb);
+        }
+
+        /// This canvas's top-left in screen coordinates, or `None` when the
+        /// backend cannot report one. Callers then open a context menu
+        /// unpositioned rather than guessing. See the GTK backend's
+        /// `screen_origin`.
+        pub fn screen_origin(&self) -> Option<(i32, i32)> {
+            None
+        }
+
+        /// Drop this canvas's draw callback.
+        pub fn clear_draw_callback(&self) {
+            crate::backends::pancurses::canvas_clear_draw_callback(self.id);
+        }
+
+        /// Pointer release; see the GTK backend's `on_release`.
+        pub fn on_release(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            // No-op: terminal canvases have no buttons or pointer.
+        }
         /// No-op: terminal canvases are virtual; visibility is meaningless.
         pub fn set_visible(&self, _v: bool) {}
         pub fn on_key(&self, _cb: Box<dyn FnMut(u32) -> bool>) {}

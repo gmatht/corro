@@ -454,3 +454,158 @@ mod right_margin_display_tests {
         );
     }
 }
+
+/// A [`CellSink`] that writes the viewport into an rswidgets `GridView`.
+///
+/// This is the **one** sink both hosts share. Before it, each backend had its
+/// own: `SpreadsheetSink` written against the pancurses widget
+/// (`pnc_backend.rs`), and `GuiCanvasSink` written against four `HashMap`s
+/// (`gui_backend.rs`). Those two differed only in *where* they put the cells —
+/// and the GUI's four maps (`cells`, `styles`, `raw_values`, `cursor_pos`) are
+/// exactly the fields `SpreadsheetModel` already has, so the difference was not
+/// real. `GridView` is that model plus the surface to draw it on, so routing
+/// both backends through this adapter removes the last genuine duplication
+/// between them.
+///
+/// The style conversion lives here rather than in each backend because the u8
+/// style bits are the model's vocabulary (mirroring
+/// `CellDisplayStyle::to_pancurses_style`), not a backend's.
+pub struct GridSink<'a> {
+    grid: &'a rswidgets::gridview::GridView,
+}
+
+impl<'a> GridSink<'a> {
+    pub fn new(grid: &'a rswidgets::gridview::GridView) -> Self {
+        GridSink { grid }
+    }
+
+    /// The style-bit conversion, shared so a backend cannot drift from the
+    /// model's numbering.
+    pub fn style_bits(style: CellDisplayStyle) -> u8 {
+        match style {
+            CellDisplayStyle::Default => 0,
+            CellDisplayStyle::Cursor => 1,
+            CellDisplayStyle::Aggregate => 2,
+            CellDisplayStyle::FooterAggregate => 3,
+            CellDisplayStyle::Selected => 4,
+            CellDisplayStyle::ActiveHeader => 5,
+            CellDisplayStyle::InactiveHeader => 6,
+            CellDisplayStyle::Hyperlink => 7,
+        }
+    }
+}
+
+impl CellSink for GridSink<'_> {
+    fn set_cell(&mut self, display_row: u32, display_col: u32, text: &str) {
+        self.grid.set_cell(display_row, display_col, text);
+    }
+    fn set_cell_style(&mut self, display_row: u32, display_col: u32, style: CellDisplayStyle) {
+        self.grid.set_cell_style(display_row, display_col, Self::style_bits(style));
+    }
+    fn set_raw_cell(&mut self, display_row: u32, display_col: u32, text: &str) {
+        self.grid.set_raw_cell(display_row, display_col, text);
+    }
+    fn set_cursor(&mut self, display_row: u32, display_col: u32) {
+        self.grid.set_cursor(display_row, display_col);
+    }
+}
+
+#[cfg(test)]
+mod grid_sink_tests {
+    use super::*;
+    use rswidgets::gridview::GridView;
+
+    /// The adapter must forward all four `CellSink` operations into the grid's
+    /// model, and map the style bits to the model's own numbering.
+    #[test]
+    fn grid_sink_forwards_into_the_model() {
+        let grid = GridView::new(4, 3);
+        {
+            let mut sink = GridSink::new(&grid);
+            sink.set_cell(1, 2, "hi");
+            sink.set_cell_style(1, 2, CellDisplayStyle::Hyperlink);
+            sink.set_raw_cell(1, 2, "hi");
+            sink.set_cursor(1, 2);
+        }
+        let m = grid.model();
+        let m = m.borrow();
+        assert_eq!(Some(&"hi".to_string()), m.cells.get(&(1, 2)));
+        assert_eq!(Some(&7u8), m.cell_styles.get(&(1, 2)), "hyperlink is style 7");
+        assert_eq!(Some(&"hi".to_string()), m.raw_cells.get(&(1, 2)));
+        assert_eq!((1, 2), (m.cursor_row, m.cursor_col));
+    }
+
+    /// Every style must map, and the numbering must match
+    /// `CellDisplayStyle::to_pancurses_style` — this is the contract the
+    /// renderer reads, so a silent renumbering would repaint every cell.
+    #[test]
+    fn style_bits_match_the_models_numbering() {
+        for (style, bits) in [
+            (CellDisplayStyle::Default, 0u8),
+            (CellDisplayStyle::Cursor, 1),
+            (CellDisplayStyle::Aggregate, 2),
+            (CellDisplayStyle::FooterAggregate, 3),
+            (CellDisplayStyle::Selected, 4),
+            (CellDisplayStyle::ActiveHeader, 5),
+            (CellDisplayStyle::InactiveHeader, 6),
+            (CellDisplayStyle::Hyperlink, 7),
+        ] {
+            assert_eq!(bits, GridSink::style_bits(style));
+            #[cfg(feature = "pancurses")]
+            assert_eq!(bits, style.to_pancurses_style(), "must agree with the existing map");
+        }
+    }
+
+    /// `fill_cells` must drive the shared sink end to end: the generic
+    /// renderer writes through it into the model, which is what both hosts
+    /// need.
+    ///
+    /// NOTE on `hr`: `grid::HEADER_ROWS` is a **sentinel** (999_999_999), not a
+    /// count — it is the logical row index of the topmost header, used so
+    /// headers can grow upward without renumbering. `display_rows` are absolute
+    /// logical rows starting at `hr`, and `mr` is the *count* of main rows. So
+    /// `compute_row_agg_func(g, display_rows, hr, mr)` gets `hr` as the
+    /// sentinel and `mr` as the count, which is why passing a small `hr` here
+    /// would classify every row as a header. Getting this wrong is not a
+    /// silent mis-render: a non-sentinel `hr` makes the `lr < hr + mr` branch
+    /// run for ~10^9 rows and the test hangs. That trap is worth a comment.
+    #[test]
+    fn fill_cells_writes_through_the_shared_sink() {
+        use std::collections::HashMap;
+
+        let mut sheet = crate::ops::SheetState::new_seeded();
+        sheet.grid.set_main_size(3, 2);
+        let g = &sheet.grid;
+        let hr = crate::grid::HEADER_ROWS; // sentinel, not a count
+        let mr = g.main_rows();
+        let mc = g.main_cols();
+
+        // Absolute logical rows: the header band, then the main rows.
+        let display_rows: Vec<usize> = (0..mr).map(|i| hr + i).collect();
+        let col_ixs: Vec<usize> = (0..mc).collect();
+        let widths: HashMap<usize, usize> =
+            col_ixs.iter().map(|&c| (c, g.col_width(c).max(1))).collect();
+        let agg = compute::compute_row_agg_func(g, &display_rows, hr, mr);
+
+        let grid = GridView::new(display_rows.len() as u32, col_ixs.len() as u32);
+        {
+            let mut sink = GridSink::new(&grid);
+            fill_cells(
+                &mut sink, &display_rows, &col_ixs, &widths, g,
+                hr, mr, mc, 0, 4096, display_rows[0], 0, &agg,
+            );
+        }
+
+        // Read the model in ONE borrow: holding a temporary `Ref` (as
+        // `&m.borrow().cells` does) across a second `borrow()` deadlocks the
+        // RefCell, which is what this test is careful not to do.
+        let m = grid.model();
+        let m = m.borrow();
+        assert!(
+            !m.cells.is_empty(),
+            "fill_cells must have written cells through the shared sink"
+        );
+        // The cursor was forwarded as well (fill_cells calls set_cursor).
+        assert_eq!((0u32, 0u32), (m.cursor_row, m.cursor_col));
+    }
+}

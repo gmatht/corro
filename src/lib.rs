@@ -15,6 +15,7 @@ pub mod io;
 pub mod ods;
 pub mod ops;
 pub mod debug_log;
+pub mod lock;
 pub mod ui_core;
 
 // C99 CRT float shims, needed when linking the VC6 static CRT (rust9x msvc
@@ -36,7 +37,19 @@ pub mod ui;
 /// exposes [`gui::android_backend`], which drives the same tree from the
 /// Activity's content view via JNI (see `android/corro`). `examples/
 /// android_ui.rs` builds that tree standalone for inspection.
-#[cfg(any(feature = "gui", feature = "gui-mobile", feature = "pancurses", target_arch = "wasm32"))]
+///
+/// `gui-macos` enables it for the AppKit backend: a native macOS build cannot
+/// use `gui` (that feature resolves `rswidgets/gtk` + `gtk_dynamic_loader`,
+/// which do not link on an Apple target), so without this the GUI module
+/// would not exist at all on a Mac and `gui::macos_backend` would be
+/// unreachable. See `Cargo.toml`.
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    feature = "pancurses",
+    target_arch = "wasm32"
+))]
 pub mod gui;
 #[cfg(feature = "rswidgets-term")]
 pub mod rswidgets_term;

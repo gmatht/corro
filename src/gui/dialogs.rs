@@ -106,24 +106,83 @@ pub fn file_export_dialog(action: &str) -> Option<PathBuf> {
 }
 
 pub fn show_about_dialog() {
+    show_text_dialog(
+        "about_dialog",
+        "About corro",
+        300,
+        200,
+        &format!(
+            "corro {}\n\nAppend-only collaborative spreadsheet",
+            env!("CARGO_PKG_VERSION"),
+        ),
+        None,
+        &format!(
+            "corro {} - append-only collaborative spreadsheet",
+            env!("CARGO_PKG_VERSION")
+        ),
+    );
+}
+
+pub fn show_keybinds_help() {
+    show_text_dialog(
+        "keybinds_help",
+        "Keybindings",
+        400,
+        300,
+        "Navigation:    Arrow keys / Page Up/Down / Home / End\n\
+         Edit:          Enter (edit cell), F2 (edit cell)\n\
+         Cancel:        Escape\n\
+         Help:          F1\n\
+         Quit:          Ctrl+Q\n\
+         Menu:          Alt+underlined letter\n\
+         \n\
+         File menu:     Ctrl+O (open), Ctrl+S (save)\n\
+         Edit menu:     Ctrl+Z (undo), Ctrl+Y (redo)\n\
+                           Ctrl+X (cut), Ctrl+C (copy), Ctrl+V (paste)\n\
+                           Ctrl+F (find), Ctrl+H (replace)",
+        Some((0, 400, 300)),
+        "Keybindings: arrows=navigate, Enter=edit, Esc=cancel, F1=help, Ctrl+Q=quit",
+    );
+}
+
+/// A read-only, word/line-wrapped text dialog with a single Close button.
+///
+/// Both the About and Keybindings dialogs are exactly this — a title, a
+/// block of text and a Close (dismiss) button — so they share one
+/// implementation rather than two copies that drift in geometry, wrap mode
+/// or lifetime handling.
+///
+/// A multi-line text view is used rather than a Label: the NWG STATIC used
+/// for labels vertically centres a single line and collapses its client area
+/// to one line height, so a two-line label silently drops its second line.
+/// EDIT boxes keep their full client height and render the whole block on
+/// every backend.
+///
+/// `wrap` is the optional `(mode, width, height)` size/wrap request (the
+/// Keybindings text is wide and needs wrapping, the About text does not).
+#[cfg_attr(not(feature = "gui"), allow(unused_variables))]
+fn show_text_dialog(
+    action: &str,
+    title: &str,
+    w: i32,
+    h: i32,
+    text: &str,
+    wrap: Option<(i32, i32, i32)>,
+    fallback: &str,
+) {
+    log_dialog_action(action, "");
     #[cfg(feature = "gui")]
     {
-        log_dialog_action("about_dialog", "");
         if let Ok(rxapp) = rswidgets::App::init() {
             if let Ok(dialog) = rxapp.new_dialog() {
-                // A multi-line (read-only) text view rather than a Label: the
-                // NWG STATIC used for labels vertically centers a single line
-                // and collapses its client area to one line height, so a
-                // two-line label silently drops its second line. EDIT boxes
-                // keep their full client height and render the whole block on
-                // every backend (same control the Keybindings dialog uses).
                 if let Ok(tv) = rxapp.create_textview() {
-                    tv.set_text(&format!(
-                        "corro {}\n\nAppend-only collaborative spreadsheet",
-                        env!("CARGO_PKG_VERSION"),
-                    ));
-                    dialog.set_title("About corro");
-                    dialog.set_default_size(300, 200);
+                    tv.set_text(text);
+                    if let Some((mode, tw, th)) = wrap {
+                        tv.set_wrap_mode(mode);
+                        tv.set_size_request(tw, th);
+                    }
+                    dialog.set_title(title);
+                    dialog.set_default_size(w, h);
                     dialog.append_content_area(&tv);
                     dialog.add_button("Close", -7);
                     dialog.connect_response(move |_| {}).ok();
@@ -139,51 +198,11 @@ pub fn show_about_dialog() {
             }
         }
     }
-    #[cfg(not(feature = "gui"))]
-    eprintln!("corro {} - append-only collaborative spreadsheet", env!("CARGO_PKG_VERSION"));
+    // No toolkit (or dialog creation failed): print the same content so the
+    // information is not simply lost.
+    let _ = (title, w, h, wrap);
+    eprintln!("{fallback}");
 }
-
-pub fn show_keybinds_help() {
-    #[cfg(feature = "gui")]
-    {
-        log_dialog_action("keybinds_help", "");
-        if let Ok(rxapp) = rswidgets::App::init() {
-            if let Ok(dialog) = rxapp.new_dialog() {
-                if let Ok(tv) = rxapp.create_textview() {
-                    dialog.set_title("Keybindings");
-                    tv.set_text(
-                        "Navigation:    Arrow keys / Page Up/Down / Home / End\n\
-                         Edit:          Enter (edit cell), F2 (edit cell)\n\
-                         Cancel:        Escape\n\
-                         Help:          F1\n\
-                         Quit:          Ctrl+Q\n\
-                         Menu:          Alt+underlined letter\n\
-                         \n\
-                         File menu:     Ctrl+O (open), Ctrl+S (save)\n\
-                         Edit menu:     Ctrl+Z (undo), Ctrl+Y (redo)\n\
-                                           Ctrl+X (cut), Ctrl+C (copy), Ctrl+V (paste)\n\
-                                           Ctrl+F (find), Ctrl+H (replace)"
-                    );
-                    tv.set_wrap_mode(0);
-                    tv.set_size_request(400, 300);
-                    dialog.append_content_area(&tv);
-                    dialog.add_button("Close", -7);
-                    dialog.connect_response(move |_| {}).ok();
-                    dialog.present();
-                    // Leak the textview (see show_about_dialog): dropping the
-                    // wrapper destroys the native EDIT and the dialog renders
-                    // empty.
-                    let _ = Box::into_raw(Box::new(tv));
-                    let _ = Box::into_raw(Box::new(dialog));
-                    return;
-                }
-            }
-        }
-    }
-    #[cfg(not(feature = "gui"))]
-    eprintln!("Keybindings: arrows=navigate, Enter=edit, Esc=cancel, F1=help, Ctrl+Q=quit");
-}
-
 
 /// Focus a dialog's text entry after present(): modeless (NWG) dialogs do
 /// not take focus on their own the way modal GTK dialogs do — without this,
@@ -207,25 +226,23 @@ fn wire_prompt_confirm<F: FnOnce(Option<String>) + 'static>(
     on_result: F,
 ) {
     use rswidgets::common::Entry as CommonEntry;
-    let shared: std::rc::Rc<std::cell::RefCell<(Option<F>, bool)>> =
-        std::rc::Rc::new(std::cell::RefCell::new((Some(on_result), false)));
+    // One guard shared by the two signals that can report a result (the
+    // OK/Cancel response and Enter in the entry), so the caller's callback
+    // runs exactly once whichever fires first.
+    let once = super::once_callback::OnceCallback::new(on_result);
     {
-        let shared = shared.clone();
+        let once = once.clone();
         dialog
             .connect_response(move |response_id| {
-                let mut g = shared.borrow_mut();
-                if g.1 {
-                    return;
-                }
-                g.1 = true;
-                if let Some(f) = g.0.take() {
+                once.claim(|f| {
                     let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
                     if response_id == 1 {
                         f(entry.get_text());
                     } else {
                         f(None);
                     }
-                }
+                    true
+                });
             })
             .ok();
     }
@@ -233,31 +250,40 @@ fn wire_prompt_confirm<F: FnOnce(Option<String>) + 'static>(
         // Enter confirms like the OK button (and closes: the response path's
         // auto-close does not run here, so close explicitly). On backends
         // whose entry-activate is a no-op stub, Tab/Space/click still work.
-        let shared = shared.clone();
+        let once = once.clone();
         let dlg = dialog.clone();
         let entry_ref: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
         entry_ref
             .connect_activate(move |_| {
-                let mut g = shared.borrow_mut();
-                if g.1 {
-                    return;
-                }
-                g.1 = true;
-                if let Some(f) = g.0.take() {
+                once.claim(|f| {
                     let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
                     f(entry.get_text());
                     dlg.close();
-                }
+                    true
+                });
             })
             .ok();
     }
 }
 
 /// Generic single-entry modal prompt with caller-supplied title, OK button
-/// label, and initial text. Prompt-gated menu actions (rename/copy/delete
-/// sheet, go to cell, column widths, ...) each get correctly labeled chrome
-/// through this — never a recycled "Find" dialog (which is what Rename
-/// Sheet showed before this existed).
+/// label, initial text, and an optional hint line describing the expected
+/// input. Prompt-gated menu actions (rename/copy/delete sheet, go to cell,
+/// column widths, ...) each get correctly labeled chrome through this — never
+/// a recycled "Find" dialog (which is what Rename Sheet showed before this
+/// existed).
+///
+/// `hint` is rendered as a label *above* the entry, so a prompt whose accepted
+/// input is not self-evident (go to cell takes a cell ref, a row, a column, a
+/// header/footer/margin ref) tells the user what to type instead of showing an
+/// empty box. `None` renders no label, so the other prompts are unchanged.
+///
+/// The hint goes in a vertical box with the entry and the dialog gets an
+/// explicit default size. Appending the label and the entry to the content
+/// area directly left the box sized to the *entry alone* on a dialog with no
+/// default size, so a taller hint row was clipped to half its height (the
+/// dialog does not grow after `show_all`).
+///
 /// Params are consumed only by the `gui` body below; other backends take
 /// the `on_result(None)` fallback (typed TUI prompts live elsewhere).
 #[allow(unused_variables)]
@@ -265,16 +291,39 @@ pub fn prompt_dialog<F: FnOnce(Option<String>) + 'static>(
     title: &str,
     ok_label: &str,
     initial: &str,
+    hint: Option<&str>,
     on_result: F,
 ) {
     #[cfg(feature = "gui")]
     {
+        use rswidgets::common::Orientation;
         if let Ok(rxapp) = rswidgets::App::init() {
             if let Ok(dialog) = rxapp.new_dialog() {
                 if let Ok(entry) = rxapp.new_entry() {
                     dialog.set_title(title);
                     entry.set_text(initial);
-                    dialog.append_content_area(&entry);
+                    if hint.is_some() {
+                        // Room for the hint line plus the entry, so neither is
+                        // clipped. Without a hint the plain entry keeps the
+                        // single-line dialog it has always had.
+                        dialog.set_default_size(420, 150);
+                        if let Ok(vbox) = rxapp.new_box(Orientation::Vertical, 4) {
+                            if let Some(text) = hint {
+                                if let Ok(label) = rxapp.new_label(text) {
+                                    label.set_xalign(0.0);
+                                    vbox.append(&label);
+                                    let _ = Box::into_raw(Box::new(label));
+                                }
+                            }
+                            vbox.append(&entry);
+                            dialog.append_content_area(&vbox);
+                            let _ = Box::into_raw(Box::new(vbox));
+                        } else {
+                            dialog.append_content_area(&entry);
+                        }
+                    } else {
+                        dialog.append_content_area(&entry);
+                    }
                     dialog.add_button("Cancel", 0);
                     dialog.add_button(ok_label, 1);
                     let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
@@ -339,17 +388,11 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
                 let replace_ptr = Box::into_raw(Box::new(replace_entry)) as usize;
                 // Shared once-only confirm: OK button (response path) and
                 // Enter in either entry (activate path, ratatui parity).
-                let shared: std::rc::Rc<std::cell::RefCell<(Option<F>, bool)>> =
-                    std::rc::Rc::new(std::cell::RefCell::new((Some(on_result), false)));
+                let once = super::once_callback::OnceCallback::new(on_result);
                 {
-                    let shared = shared.clone();
+                    let once = once.clone();
                     dialog.connect_response(move |response_id| {
-                        let mut g = shared.borrow_mut();
-                        if g.1 {
-                            return;
-                        }
-                        g.1 = true;
-                        if let Some(f) = g.0.take() {
+                        once.claim(|f| {
                             let find_entry: &CommonEntry = unsafe { &*(find_ptr as *const CommonEntry) };
                             let replace_entry: &CommonEntry = unsafe { &*(replace_ptr as *const CommonEntry) };
                             if response_id == 1 {
@@ -360,21 +403,17 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
                             } else {
                                 f(None);
                             }
-                        }
+                            true
+                        });
                     }).ok();
                 }
                 {
                     // Enter in either field confirms like Replace (and
                     // closes: the response path's auto-close runs only there).
-                    let shared = shared.clone();
+                    let once = once.clone();
                     let dlg = dialog.clone();
                     let confirm = move || {
-                        let mut g = shared.borrow_mut();
-                        if g.1 {
-                            return;
-                        }
-                        g.1 = true;
-                        if let Some(f) = g.0.take() {
+                        once.claim(|f| {
                             let find_entry: &CommonEntry = unsafe { &*(find_ptr as *const CommonEntry) };
                             let replace_entry: &CommonEntry = unsafe { &*(replace_ptr as *const CommonEntry) };
                             f(Some((
@@ -382,7 +421,8 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
                                 replace_entry.get_text().unwrap_or_default(),
                             )));
                             dlg.close();
-                        }
+                            true
+                        });
                     };
                     let confirm = std::rc::Rc::new(confirm);
                     let c1 = confirm.clone();
@@ -467,15 +507,7 @@ pub fn choice_dialog_parented<F: FnOnce(Option<usize>) + 'static>(
 ) {
     #[cfg(feature = "gui")]
     {
-        // Combined-gui flips the root prelude to pancurses-adapter types;
-        // these dialog widgets are always native (same shadowing as
-        // `sort_dialog`).
-        #[cfg(target_os = "linux")]
-        use rswidgets::backends_gtk_adapter::DropDown;
-        #[cfg(windows)]
-        use rswidgets::backends_nwg_adapter::DropDown;
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        use rswidgets::prelude::DropDown;
+        use super::dialog_widgets::DropDown;
         if let Ok(rxapp) = rswidgets::App::init() {
             let refs: Vec<&str> = items.iter().map(String::as_str).collect();
             if let (Ok(dialog), Ok(dropdown)) =
@@ -502,28 +534,24 @@ pub fn choice_dialog_parented<F: FnOnce(Option<usize>) + 'static>(
                 // while it is open, so this only fires once it is closed).
                 dialog.inner.set_default_response(1);
                 let dd_ptr = Box::into_raw(Box::new(dropdown)) as usize;
-                let mut on_result = Some(on_result);
-                let callback_called = std::cell::RefCell::new(false);
+                let once = super::once_callback::OnceCallback::new(on_result);
                 // Close FIRST, then report (same sequencing as the radio
                 // version): teardown restores focus synchronously, so a
                 // callee's focus grab lands instead of racing the destroy.
                 let dlg_close = dialog.clone();
                 dialog.connect_response(move |response_id| {
-                    let mut called = callback_called.borrow_mut();
-                    if !*called {
-                        *called = true;
-                        if let Some(f) = on_result.take() {
-                            let dd: &DropDown = unsafe { &*(dd_ptr as *const DropDown) };
-                            let result = if response_id == 1 {
-                                let idx = dd.get_active();
-                                if idx < 0 { Some(initial) } else { Some(idx as usize) }
-                            } else {
-                                None
-                            };
-                            dlg_close.close();
-                            f(result);
-                        }
-                    }
+                    once.claim(|f| {
+                        let dd: &DropDown = unsafe { &*(dd_ptr as *const DropDown) };
+                        let result = if response_id == 1 {
+                            let idx = dd.get_active() as i64;
+                            if idx < 0 { Some(initial) } else { Some(idx as usize) }
+                        } else {
+                            None
+                        };
+                        dlg_close.close();
+                        f(result);
+                        true
+                    });
                 }).ok();
                 dialog.present();
                 let dd: &DropDown = unsafe { &*(dd_ptr as *const DropDown) };
@@ -539,13 +567,7 @@ pub fn choice_dialog_parented<F: FnOnce(Option<usize>) + 'static>(
 pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &WorkbookState, on_result: F) {
     #[cfg(feature = "gui")]
     {
-        // (same native-widget shadowing as above)
-        #[cfg(target_os = "linux")]
-        use rswidgets::backends_gtk_adapter::{CheckButton, DropDown};
-        #[cfg(windows)]
-        use rswidgets::backends_nwg_adapter::{CheckButton, DropDown};
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        use rswidgets::prelude::{CheckButton, DropDown};
+        use super::dialog_widgets::{CheckButton, DropDown};
         use rswidgets::common::Orientation;
         let cols: &[&str] = &["Column A", "Column B", "Column C", "Column D", "Column E"];
         if let Ok(rxapp) = rswidgets::App::init() {
@@ -567,24 +589,20 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
                 dialog.add_button("Sort", 1);
                 let sort_col_ptr = Box::into_raw(Box::new(sort_col)) as usize;
                 let ascending_ptr = Box::into_raw(Box::new(ascending)) as usize;
-                let mut on_result = Some(on_result);
-                let callback_called = std::cell::RefCell::new(false);
+                let once = super::once_callback::OnceCallback::new(on_result);
                 dialog.connect_response(move |response_id| {
-                    let mut called = callback_called.borrow_mut();
-                    if !*called {
-                        *called = true;
-                        if let Some(f) = on_result.take() {
-                            let sort_col: &DropDown = unsafe { &*(sort_col_ptr as *const DropDown) };
-                            let ascending: &CheckButton = unsafe { &*(ascending_ptr as *const CheckButton) };
-                            if response_id == 1 {
-                                let col = sort_col.get_active().max(0) as usize;
-                                let asc = ascending.is_active();
-                                f(Some((col, asc)));
-                            } else {
-                                f(None);
-                            }
+                    once.claim(|f| {
+                        let sort_col: &DropDown = unsafe { &*(sort_col_ptr as *const DropDown) };
+                        let ascending: &CheckButton = unsafe { &*(ascending_ptr as *const CheckButton) };
+                        if response_id == 1 {
+                            let col = sort_col.get_active().max(0) as usize;
+                            let asc = ascending.is_active();
+                            f(Some((col, asc)));
+                        } else {
+                            f(None);
                         }
-                    }
+                        true
+                    });
                 }).ok();
                 dialog.present();
                 let _ = Box::into_raw(Box::new(dialog));
@@ -619,12 +637,7 @@ pub fn sort_view_dialog<F: FnOnce(Option<String>) + 'static>(
         use crate::grid::CellAddr;
         use rswidgets::common::{Entry as CommonEntry, Orientation};
 
-        #[cfg(target_os = "linux")]
-        use rswidgets::backends_gtk_adapter::{CheckButton, DropDown};
-        #[cfg(windows)]
-        use rswidgets::backends_nwg_adapter::{CheckButton, DropDown};
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        use rswidgets::prelude::{CheckButton, DropDown};
+        use super::dialog_widgets::{CheckButton, DropDown};
 
         // Collect non-empty columns from the active sheet.
         let sheet = workbook.active_sheet();
@@ -714,7 +727,7 @@ pub fn sort_view_dialog<F: FnOnce(Option<String>) + 'static>(
                         let entry: &CommonEntry = unsafe { &*(entry_ptr2 as *const CommonEntry) };
                         let dd: &DropDown = unsafe { &*(dd_ptr2 as *const DropDown) };
                         let desc: &CheckButton = unsafe { &*(desc_ptr2 as *const CheckButton) };
-                        let idx = dd.get_active();
+                        let idx = dd.get_active() as i64;
                         if idx < 0 {
                             return;
                         }
@@ -737,26 +750,22 @@ pub fn sort_view_dialog<F: FnOnce(Option<String>) + 'static>(
 
                 // Wire OK/Cancel.
                 let entry_ptr2 = entry_ptr;
-                let mut on_result = Some(on_result);
-                let called = std::cell::RefCell::new(false);
+                let once = super::once_callback::OnceCallback::new(on_result);
                 dialog.connect_response(move |response_id| {
-                    let mut done = called.borrow_mut();
-                    if *done {
-                        return;
-                    }
-                    *done = true;
-                    let Some(f) = on_result.take() else { return };
-                    if response_id == 1 {
-                        let entry: &CommonEntry = unsafe { &*(entry_ptr2 as *const CommonEntry) };
-                        let text = entry.get_text().unwrap_or_default();
-                        if text.trim().is_empty() {
-                            f(None);
+                    once.claim(|f| {
+                        if response_id == 1 {
+                            let entry: &CommonEntry = unsafe { &*(entry_ptr2 as *const CommonEntry) };
+                            let text = entry.get_text().unwrap_or_default();
+                            if text.trim().is_empty() {
+                                f(None);
+                            } else {
+                                f(Some(text));
+                            }
                         } else {
-                            f(Some(text));
+                            f(None);
                         }
-                    } else {
-                        f(None);
-                    }
+                        true
+                    });
                 }).ok();
 
                 dialog.present();
@@ -800,16 +809,10 @@ pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(
     {
         use rswidgets::common::Orientation;
 
-        // The widget types differ per backend exactly as in `sort_dialog`.
-        // These are the adapter types `create_checkbutton` / `create_radiobutton`
-        // / `create_dropdown` actually return on each backend (the prelude's
-        // names differ).
-        #[cfg(target_os = "linux")]
-        use rswidgets::backends_gtk_adapter::{CheckButton, DropDown, RadioButton};
-        #[cfg(windows)]
-        use rswidgets::backends_nwg_adapter::{CheckButton, DropDown, RadioButton};
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        use rswidgets::prelude::{CheckButton, DropDown, RadioButton};
+        // The widget types are resolved per backend by `dialog_widgets`
+        // (gtk on Linux, nwg on Windows, the prelude elsewhere), so this
+        // import is valid on every target — do not narrow it by target_os.
+        use super::dialog_widgets::{CheckButton, DropDown, RadioButton};
 
         if let Ok(rxapp) = rswidgets::App::init() {
             // A drop-down needs at least one row to be usable; when no numeric
@@ -885,53 +888,50 @@ pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(
                 // The response closure is `'static`, so it owns a copy of the
                 // choices it maps the drop-down index back through.
                 let column_choices_owned: Vec<String> = column_choices.to_vec();
-                let mut on_result = Some(on_result);
-                let called = std::cell::RefCell::new(false);
+                let once = super::once_callback::OnceCallback::new(on_result);
                 dialog
                     .connect_response(move |response_id| {
-                        let mut done = called.borrow_mut();
-                        if *done {
-                            return;
-                        }
-                        *done = true;
-                        let Some(f) = on_result.take() else { return };
-                        if response_id != 1 {
-                            f(None);
-                            return;
-                        }
-                        let column: &DropDown = unsafe { &*(column_ptr as *const DropDown) };
-                        let persist: &CheckButton =
-                            unsafe { &*(persist_ptr as *const CheckButton) };
-                        let direction = match neg_pos_ptr {
-                            Some(p) => {
-                                let rb: &RadioButton = unsafe { &*(p as *const RadioButton) };
-                                if rb.is_active() {
-                                    BalanceDirection::NegToPos
-                                } else {
-                                    BalanceDirection::PosToNeg
-                                }
+                        once.claim(|f| {
+                            if response_id != 1 {
+                                f(None);
+                                return true;
                             }
-                            None => BalanceDirection::PosToNeg,
-                        };
-                        // The drop-down reports an index; map it back to the
-                        // column label. With no numeric columns the placeholder
-                        // row must not masquerade as a column name, so the
-                        // selection is left empty for run_balance_books to
-                        // auto-detect (and report if it still finds nothing).
-                        let idx = column.get_active();
-                        let selected = if no_choices || idx < 0 {
-                            String::new()
-                        } else {
-                            column_choices_owned
-                                .get(idx as usize)
-                                .cloned()
-                                .unwrap_or_default()
-                        };
-                        f(Some(BalanceChoice {
-                            column: selected,
-                            persist: persist.is_active(),
-                            direction,
-                        }));
+                            let column: &DropDown = unsafe { &*(column_ptr as *const DropDown) };
+                            let persist: &CheckButton =
+                                unsafe { &*(persist_ptr as *const CheckButton) };
+                            let direction = match neg_pos_ptr {
+                                Some(p) => {
+                                    let rb: &RadioButton = unsafe { &*(p as *const RadioButton) };
+                                    if rb.is_active() {
+                                        BalanceDirection::NegToPos
+                                    } else {
+                                        BalanceDirection::PosToNeg
+                                    }
+                                }
+                                None => BalanceDirection::PosToNeg,
+                            };
+                            // The drop-down reports an index; map it back to
+                            // the column label. With no numeric columns the
+                            // placeholder row must not masquerade as a column
+                            // name, so the selection is left empty for
+                            // run_balance_books to auto-detect (and report if
+                            // it still finds nothing).
+                            let idx = column.get_active() as i64;
+                            let selected = if no_choices || idx < 0 {
+                                String::new()
+                            } else {
+                                column_choices_owned
+                                    .get(idx as usize)
+                                    .cloned()
+                                    .unwrap_or_default()
+                            };
+                            f(Some(BalanceChoice {
+                                column: selected,
+                                persist: persist.is_active(),
+                                direction,
+                            }));
+                            true
+                        });
                     })
                     .ok();
                 dialog.present();

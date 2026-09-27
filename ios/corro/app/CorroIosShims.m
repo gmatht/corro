@@ -39,8 +39,21 @@
 @property (nonatomic, assign) uint64_t corroCanvasId;
 /// Re-entrancy guard for the fill-the-superview adjustment in layoutSubviews.
 @property (nonatomic, assign) BOOL corroFillingSuperview;
+/// True between touchesBegan: and touchesEnded:/Cancelled:.
+@property (nonatomic, assign) BOOL corroGestureActive;
+/// Set once the pinch/long-press/double-tap recognisers are attached.
+@property (nonatomic, assign) BOOL corroGesturesInstalled;
+/// Last point a scroll drag reached, for the incremental delta.
+@property (nonatomic, assign) CGFloat corroLastX;
+@property (nonatomic, assign) CGFloat corroLastY;
+/// Sub-cell pixel remainder carried between scroll events, so a slow drag
+/// still scrolls smoothly instead of rounding every event to zero.
+@property (nonatomic, assign) CGFloat corroPendingX;
+@property (nonatomic, assign) CGFloat corroPendingY;
 /// Declared with its availability so clang accepts the UIKey uses inside.
 - (void)corroHandlePresses:(NSSet<UIPress *> *)presses API_AVAILABLE(ios(13.4));
+- (void)corroInstallGestureRecognisers;
+- (void)corroScrollByDrag:(CGPoint)p;
 @end
 
 // Declared ahead of use so the availability annotation is visible at the call
@@ -49,6 +62,10 @@
 
 - (void)corroSetCanvasId:(int64_t)canvasId {
     self.corroCanvasId = (uint64_t)canvasId;
+    // The view is now real: attach the pinch/long-press/double-tap
+    // recognisers. Doing it here (rather than in init) means they exist
+    // exactly once per canvas and only for a view that is actually in use.
+    [self corroInstallGestureRecognisers];
 }
 
 // Report the laid-out size as soon as UIKit knows it.
@@ -111,15 +128,178 @@
                           (int32_t)CGRectGetHeight(self.bounds));
 }
 
-// A tap moves the cursor. `touchesEnded:` rather than `touchesBegan:` so a
-// drag that starts on the grid does not move the selection mid-gesture.
-- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+// A tap moves the cursor; a finger drag pans the sheet; a long press then
+// drag selects a range. Which of those a drag means is decided in Rust (one
+// rule shared with Android and with the `GridView` widget), so this class only
+// reports the raw stream plus the platform facts it alone can see (is this a
+// finger? has the finger held still?).
+//
+// Gestures are delivered from the raw touch methods rather than from separate
+// recognisers for drag, so the press origin and the sub-cell pixel remainder
+// live in one place; the pinch and long press DO come from recognisers, since
+// UIKit's own timing/slop rules for those are the platform behaviour users
+// expect.
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *touch = touches.anyObject;
+    self.corroGestureActive = (touch != nil);
+    self.corroPendingX = 0.0;
+    self.corroPendingY = 0.0;
+    if (touch != nil) {
+        CGPoint p = [touch locationInView:self];
+        self.corroLastX = p.x;
+        self.corroLastY = p.y;
+        // A finger pans; a mouse/trackpad (simulator with a trackpad, an iPad
+        // with a pointer) selects, as on a desktop. `UITouchTypeIndirectPointer`
+        // is iOS 13.4+, while this app deploys to iOS 12, so everything older
+        // than that is a direct touch by definition: a finger.
+        BOOL isTouch = YES;
+        if (@available(iOS 13.4, *)) {
+            isTouch = (touch.type != UITouchTypeIndirectPointer);
+        }
+        corro_ios_canvas_gesture_down(self.corroCanvasId, p.x, p.y, isTouch ? 1 : 0);
+    }
+    [super touchesBegan:touches withEvent:event];
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (!self.corroGestureActive) {
+        [super touchesMoved:touches withEvent:event];
+        return;
+    }
     UITouch *touch = touches.anyObject;
     if (touch != nil) {
         CGPoint p = [touch locationInView:self];
-        corro_ios_canvas_click(self.corroCanvasId, (double)p.x, (double)p.y);
+        // A second finger is a pinch, not a drag: the pinch recogniser owns
+        // that gesture, and panning underneath it would scroll while zooming.
+        if ([event allTouches].count > 1) {
+            self.corroGestureActive = NO;
+            corro_ios_canvas_gesture_cancel(self.corroCanvasId);
+        } else {
+            int32_t outcome = corro_ios_canvas_gesture_move(self.corroCanvasId, p.x, p.y);
+            if (outcome == 2 /* scroll */) {
+                [self corroScrollByDrag:p];
+            }
+        }
     }
+    [super touchesMoved:touches withEvent:event];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (self.corroGestureActive) {
+        self.corroGestureActive = NO;
+        UITouch *touch = touches.anyObject;
+        if (touch != nil) {
+            CGPoint p = [touch locationInView:self];
+            // Rust decides whether this was a tap or the end of a drag, and
+            // *reports* it. A tap is then routed to THIS canvas's click
+            // handler, so the tab strip's taps do not move the sheet's cursor.
+            if (corro_ios_canvas_gesture_up(self.corroCanvasId, p.x, p.y) == 3 /* tap */) {
+                corro_ios_canvas_click(self.corroCanvasId, (double)p.x, (double)p.y);
+            }
+        }
+    }
+    self.corroPendingX = 0.0;
+    self.corroPendingY = 0.0;
     [super touchesEnded:touches withEvent:event];
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (self.corroGestureActive) {
+        self.corroGestureActive = NO;
+        corro_ios_canvas_gesture_cancel(self.corroCanvasId);
+    }
+    self.corroPendingX = 0.0;
+    self.corroPendingY = 0.0;
+    [super touchesCancelled:touches withEvent:event];
+}
+
+/// Convert a scroll drag from the last point to `p` into whole rows/columns.
+///
+/// The conversion happens in Rust: it is the only side that knows the live
+/// metrics (a pinch changes them), so a cell size cached here would pan by the
+/// stale amount after a zoom. The sub-cell remainder stays pending here, so a
+/// slow drag still scrolls.
+- (void)corroScrollByDrag:(CGPoint)p {
+    self.corroPendingX += p.x - self.corroLastX;
+    self.corroPendingY += p.y - self.corroLastY;
+    self.corroLastX = p.x;
+    self.corroLastY = p.y;
+
+    int32_t applied[2] = {0, 0};
+    corro_ios_canvas_drag_by(self.corroCanvasId, self.corroPendingX, self.corroPendingY, applied);
+
+    double size[2] = {20.0, 8.0};
+    corro_ios_canvas_cell_size(size);
+    self.corroPendingX -= applied[1] * size[1];
+    self.corroPendingY -= applied[0] * size[0];
+}
+
+/// Pinch: the sheet's view scale, exactly like a photo. The recogniser reports
+/// a ratio, which is what the shared zoom takes.
+- (void)corroPinched:(UIPinchGestureRecognizer *)recogniser {
+    if (recogniser.state != UIGestureRecognizerStateBegan &&
+        recogniser.state != UIGestureRecognizerStateChanged) {
+        return;
+    }
+    CGFloat factor = recogniser.scale;
+    if (factor <= 0.0) {
+        return;
+    }
+    double applied = corro_ios_canvas_zoom((double)factor);
+    // Reset the recogniser's reference so the next callback is again the ratio
+    // since this one — `scale` is cumulative for the whole gesture.
+    recogniser.scale = 1.0;
+    fprintf(stderr, "[corro] pinch factor=%.3f applied=%.3f\n", (double)factor, applied);
+    fflush(stderr);
+}
+
+/// Long press: the signal that turns a finger drag into a selection. UIKit's
+/// own timing and slop rules are what users expect, so this is a recogniser
+/// rather than hand-rolled timing.
+- (void)corroLongPressed:(UILongPressGestureRecognizer *)recogniser {
+    if (recogniser.state != UIGestureRecognizerStateBegan) {
+        return;
+    }
+    CGPoint p = [recogniser locationInView:self];
+    corro_ios_canvas_gesture_long_press(self.corroCanvasId, p.x, p.y);
+}
+
+/// Double tap: reset the zoom, the phone's equivalent of "reset view".
+- (void)corroDoubleTapped:(UITapGestureRecognizer *)recogniser {
+    (void)recogniser;
+    double applied = corro_ios_canvas_zoom_reset();
+    fprintf(stderr, "[corro] zoom reset -> %.3f\n", applied);
+    fflush(stderr);
+}
+
+/// Attach the gesture recognisers once the view has a canvas id (and therefore
+/// is on screen). Called from `corroSetCanvasId:`.
+- (void)corroInstallGestureRecognisers {
+    if (self.corroGesturesInstalled) {
+        return;
+    }
+    self.corroGesturesInstalled = YES;
+    UIPinchGestureRecognizer *pinch =
+        [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(corroPinched:)];
+    [self addGestureRecognizer:pinch];
+    UILongPressGestureRecognizer *press =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(corroLongPressed:)];
+    // A slightly longer hold than the 0.5s default: a finger that is about to
+    // drag has usually moved a little, and the recogniser must not fire for
+    // that. The shared Rust machine also cancels a long press on movement, so
+    // this is belt-and-braces.
+    press.minimumPressDuration = 0.6;
+    [self addGestureRecognizer:press];
+    UITapGestureRecognizer *doubleTap =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(corroDoubleTapped:)];
+    doubleTap.numberOfTapsRequired = 2;
+    [self addGestureRecognizer:doubleTap];
+    // The single-tap cursor move comes from the raw touch stream, so the
+    // double-tap must not also be delivered as two taps: require the single
+    // tap path to wait is not possible from the touch methods, so instead the
+    // double-tap recogniser cancels in-flight touches (its default behaviour
+    // for a recognised gesture) and Rust only applies a tap on a release that
+    // never became a drag.
 }
 
 // The view must be able to take focus for hardware keyboards (iPad, simctl).

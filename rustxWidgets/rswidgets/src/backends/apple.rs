@@ -188,6 +188,25 @@ pub unsafe fn msg1iv(obj: *mut std::os::raw::c_void, selname: &str, v: isize) {
     unsafe { f(obj, sel(selname), v) }
 }
 
+/// `void (*)(id, SEL, CGFloat)` — setters taking a point value
+/// (`setHeadIndent:`, `constraintEqualToConstant:`). Split by width for the
+/// same reason as [`msg4cv`]: `CGFloat` is `double` on 64-bit and `float` on
+/// 32-bit, and sending the wrong one corrupts the register file.
+#[cfg(target_pointer_width = "64")]
+pub unsafe fn msg1cv(obj: *mut std::os::raw::c_void, selname: &str, v: f64) {
+    let f: unsafe extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void, f64) =
+        unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel(selname), v) }
+}
+
+/// 32-bit (armv7s) `CGFloat` is `float`.
+#[cfg(target_pointer_width = "32")]
+pub unsafe fn msg1cv(obj: *mut std::os::raw::c_void, selname: &str, v: f64) {
+    let f: unsafe extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void, f32) =
+        unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel(selname), v as f32) }
+}
+
 /// `void (*)(id, SEL, CGFloat, CGFloat, CGFloat, CGFloat)`. `CGFloat` is
 /// `float` on 32-bit and `double` on 64-bit — the single most important
 /// ABI difference between the arm64 and armv7s builds, so it is selected
@@ -610,6 +629,29 @@ pub struct WidgetMeta {
     /// The laid-out size in points, learned from the host view's draw
     /// callback. `(0, 0)` until the first draw.
     pub laid_out: (i32, i32),
+    /// `Label::set_fixed_width`: a pinned width in points, so a label whose
+    /// *text* changes (the formula bar's address slot, `A1` -> `AAA~1`) keeps
+    /// its slot instead of resizing and shoving every sibling packed after it
+    /// sideways. `None` releases the pin.
+    ///
+    /// Recorded on both Apple backends, and for the same reason GTK records
+    /// it as a real width request: a stack view sizes a label from its
+    /// intrinsic content width, so *only* an explicit width stops the
+    /// reflow. `NSStackView` has no "fixed width" of its own — see
+    /// `Label::set_fixed_width` in the adapters for how the pin becomes an
+    /// `NSLayoutConstraint` plus a high hugging priority.
+    pub fixed_width: Option<i32>,
+    /// `Label::set_margin_start`: left inset of the label's contents, in
+    /// points. Pairs with [`Self::fixed_width`] — a pinned, left-aligned
+    /// label sits flush against its slot's edge, and this restores the inset
+    /// the shrink-to-fit label used to have.
+    pub margin_start: i32,
+    /// `Label::set_xalign`: horizontal text alignment, `0.0` left ..
+    /// `1.0` right. `NSTextField`/`UILabel` centre their text by default, so
+    /// a pinned slot would otherwise make the text *float* mid-slot and
+    /// slide within it as the text changes width — the same reflow the pin
+    /// exists to stop, relocated from the slot's edge to the glyphs.
+    pub xalign: f32,
 }
 
 impl Default for WidgetMeta {
@@ -623,6 +665,9 @@ impl Default for WidgetMeta {
             canvas_id: 0,
             size_request: (0, 0),
             laid_out: (0, 0),
+            fixed_width: None,
+            margin_start: 0,
+            xalign: 0.5,
         }
     }
 }

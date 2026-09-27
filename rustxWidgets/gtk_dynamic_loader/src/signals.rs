@@ -330,6 +330,36 @@ pub extern "C" fn gtk_compat_destroy_notify_key_pressed(data: *mut c_void, _clos
     }
 }
 
+// trampoline for GTK4 GtkEventControllerKey::key-released.
+//
+// Same signature as `key-pressed` (GtkEventControllerKey emits both from the
+// same controller), and needed because GTK4 delivers a physical key as BOTH a
+// `key-pressed` and a `key-released` signal. Without a handler for the release
+// signal, a host that only hooks `key-pressed` sees each key twice on the
+// versions/display servers where the release is routed through the same
+// handler — the bug `gui_backend.rs` used to paper over with consecutive-keyval
+// heuristics. Connecting this separately lets the adapter swallow releases and
+// hand the host a pure press stream.
+#[no_mangle]
+pub extern "C" fn gtk_compat_trampoline_key_released(_instance: *mut c_void, keyval: u32, _keycode: u32, _state: u32, user_data: *mut c_void) -> i32 {
+    unsafe {
+        if user_data.is_null() { return 0; }
+        let inner_ptr = user_data as *mut Box<dyn FnMut(u32) -> i32>;
+        if inner_ptr.is_null() { return 0; }
+        let closure_ref: &mut dyn FnMut(u32) -> i32 = &mut **inner_ptr;
+        closure_ref(keyval)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gtk_compat_destroy_notify_key_released(data: *mut c_void, _closure: *mut c_void) {
+    unsafe {
+        if data.is_null() { return; }
+        let inner_ptr = data as *mut Box<dyn FnMut(u32) -> i32>;
+        let _boxed: Box<Box<dyn FnMut(u32) -> i32>> = Box::from_raw(inner_ptr);
+    }
+}
+
 // trampoline for GTK4 gtk_drawing_area_set_draw_func — passes (cr, width, height)
 #[no_mangle]
 pub extern "C" fn gtk_compat_trampoline_draw_gtk4(_area: *mut c_void, cr: *mut c_void, w: i32, h: i32, user_data: *mut c_void) {
@@ -348,5 +378,43 @@ pub extern "C" fn gtk_compat_destroy_notify_draw_gtk4(data: *mut c_void, _closur
         if data.is_null() { return; }
         let inner_ptr = data as *mut Box<dyn FnMut(*mut c_void, i32, i32)>;
         let _boxed: Box<Box<dyn FnMut(*mut c_void, i32, i32)>> = Box::from_raw(inner_ptr);
+    }
+}
+
+#[cfg(test)]
+mod key_release_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The `key-released` trampoline must deliver the keyval to the closure.
+    ///
+    /// This is the contract the GTK4 release filter relies on: the adapter
+    /// connects `key-released` and returns GDK_EVENT_STOP without touching the
+    /// host, so if the trampoline ever stopped delivering the keyval the
+    /// filter would silently become a no-op and hosts would see double keys
+    /// again (the bug it exists to prevent).
+    #[test]
+    fn key_released_trampoline_delivers_the_keyval() {
+        let seen: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
+        let s = seen.clone();
+        let cb: Box<dyn FnMut(u32) -> i32> = Box::new(move |kv: u32| {
+            s.borrow_mut().push(kv);
+            1
+        });
+        let raw = Box::into_raw(Box::new(cb)) as *mut c_void;
+        let rc = gtk_compat_trampoline_key_released(std::ptr::null_mut(), 0xff52, 0, 0, raw);
+        assert_eq!(1, rc, "trampoline returns the closure's value");
+        assert_eq!(vec![0xff52], *seen.borrow());
+        // The destroy notify must free the box without double-freeing: run it
+        // once (the trampoline itself must not consume the box).
+        gtk_compat_destroy_notify_key_released(raw, std::ptr::null_mut());
+    }
+
+    /// A null user_data must not crash (GObject can deliver to a dropped
+    /// closure during teardown).
+    #[test]
+    fn key_released_trampoline_tolerates_null() {
+        assert_eq!(0, gtk_compat_trampoline_key_released(std::ptr::null_mut(), 0x41, 0, 0, std::ptr::null_mut()));
     }
 }

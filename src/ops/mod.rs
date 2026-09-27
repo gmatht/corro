@@ -1560,7 +1560,7 @@ impl Op {
                 cols.iter()
                     .map(|spec| {
                         let name =
-                            crate::addr::excel_column_name(spec.col.saturating_sub(MARGIN_COLS));
+                            crate::addr::global_column_letter(spec.col);
                         if spec.desc {
                             format!("!{name}")
                         } else {

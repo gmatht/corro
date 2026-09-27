@@ -19,7 +19,8 @@ use crate::formula::{
 };
 use crate::grid::{
     CellAddr, CellFormat, ColumnAddr, FormatScope, GridBox as Grid, MainRange, NumberFormat,
-    SheetCursor, SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS, DEFAULT_MAX_COL_WIDTH,
+    SelectionKind, SheetCursor, SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
+    DEFAULT_MAX_COL_WIDTH,
 };
 use crate::io::{
     commit_workbook_op, commit_workbook_set_column_format_batch, load_workbook_revisions_partial,
@@ -52,12 +53,9 @@ use std::fs::OpenOptions;
 
 // Debug agent helpers removed: logging and sampling statics were debug-only
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SelectionKind {
-    Cells,
-    Rows,
-    Cols,
-}
+// Selection coverage (`SelectionKind`) lives in `crate::grid`, next to
+// `SheetCursor`: the widget-tree GUI and pancurses host share the same
+// three cases, so the enum is imported above rather than redefined here.
 
 #[cfg(test)]
 mod extrapolate_tests {
@@ -392,6 +390,10 @@ pub(crate) enum MenuSection {
     FormatNumber,
     FormatAlign,
     Sheet,
+    /// Sheet ▸ Freeze — pin a row/column so it stays visible while scrolling.
+    /// A submenu of Sheet in the shared tree, so it needs its own section here
+    /// to keep the two backends enumerating the same items.
+    Freeze,
     Export,
     Width,
     Insert,
@@ -447,6 +449,9 @@ pub(crate) enum MenuAction {
     MoveSheet,
     SheetPrev,
     SheetNext,
+    /// Freeze panes: pin the cursor's column / row.
+    ColLock,
+    RowLock,
     GoToCell,
     Exit,
     ExportTsv,
@@ -474,6 +479,10 @@ pub(crate) enum MenuAction {
     FormatAlignRight,
     FormatAlignDefault,
     FormatReset,
+    /// `Format ▸ Night mode`: flip the global palette. See the GUI's
+    /// `toggle_night_mode` arm for why this is a view setting that writes no
+    /// op.
+    ToggleNightMode,
     InsertRows,
     InsertMitosisRow,
     InsertMitosisCol,
@@ -609,7 +618,7 @@ const FILE_MENU_ITEMS: [MenuItem; 9] = [
     },
 ];
 
-const FORMAT_MENU_ITEMS: [MenuItem; 4] = [
+const FORMAT_MENU_ITEMS: [MenuItem; 5] = [
     MenuItem {
         shortcut: 'S',
         label: "Scope",
@@ -629,6 +638,13 @@ const FORMAT_MENU_ITEMS: [MenuItem; 4] = [
         shortcut: 'R',
         label: "Reset",
         target: MenuTarget::Action(MenuAction::FormatReset),
+    },
+    // Same mnemonic as the GUI tree (`K`, not `G`: the TUI's Alt block spends
+    // G on the generic number format) so the two menus stay mirror images.
+    MenuItem {
+        shortcut: 'K',
+        label: "Night mode",
+        target: MenuTarget::Action(MenuAction::ToggleNightMode),
     },
 ];
 
@@ -665,7 +681,7 @@ const FORMAT_SCOPE_MENU_ITEMS: [MenuItem; 6] = [
     },
 ];
 
-const SHEET_MENU_ITEMS: [MenuItem; 8] = [
+const SHEET_MENU_ITEMS: [MenuItem; 9] = [
     MenuItem {
         shortcut: '[',
         label: "Prev sheet",
@@ -705,6 +721,32 @@ const SHEET_MENU_ITEMS: [MenuItem; 8] = [
         shortcut: 'B',
         label: "Balance books",
         target: MenuTarget::Action(MenuAction::BalanceBooks),
+    },
+    // Submenu container, mirroring the shared tree's `Sheet ▸ Freeze`. Its
+    // two leaves live in FREEZE_MENU_ITEMS.
+    MenuItem {
+        shortcut: 'Z',
+        label: "Freeze",
+        target: MenuTarget::Submenu(MenuSection::Freeze),
+    },
+];
+
+    /// Sheet ▸ Freeze. Both items act on the cursor, so there is nothing to pick
+    /// from a dialog; X-Lock keeps Excel's name for freezing a row.
+    ///
+    /// The mnemonics avoid the TUI's vim keys (`h`/`j`/`k`/`l`), which the
+    /// menu handler consumes *before* the shortcut lookup — so X-Lock could
+    /// not be `K` (its mnemonic letter) and still be reachable.
+const FREEZE_MENU_ITEMS: [MenuItem; 2] = [
+    MenuItem {
+        shortcut: 'C',
+        label: "Col Lock",
+        target: MenuTarget::Action(MenuAction::ColLock),
+    },
+    MenuItem {
+        shortcut: 'W',
+        label: "X-Lock",
+        target: MenuTarget::Action(MenuAction::RowLock),
     },
 ];
 
@@ -891,7 +933,7 @@ const HELP_MENU_ITEMS: [MenuItem; 4] = [
 pub fn all_menu_shortcuts() -> Vec<(char, &'static str)> {
     use MenuSection::*;
     [
-        Edit, File, Format, FormatScope, FormatNumber, FormatAlign, Sheet, Insert,
+        Edit, File, Format, FormatScope, FormatNumber, FormatAlign, Sheet, Freeze, Insert,
         Export, Width, Help,
     ]
     .iter()
@@ -919,6 +961,7 @@ fn menu_items(section: MenuSection) -> &'static [MenuItem] {
         MenuSection::FormatNumber => &FORMAT_NUMBER_MENU_ITEMS,
         MenuSection::FormatAlign => &FORMAT_ALIGN_MENU_ITEMS,
         MenuSection::Sheet => &SHEET_MENU_ITEMS,
+        MenuSection::Freeze => &FREEZE_MENU_ITEMS,
         MenuSection::Insert => &INSERT_ROOT_MENU_ITEMS,
         MenuSection::Export => &EXPORT_MENU_ITEMS,
         MenuSection::Width => &WIDTH_MENU_ITEMS,
@@ -935,6 +978,7 @@ pub(crate) fn menu_title(section: MenuSection) -> &'static str {
         MenuSection::FormatNumber => "Format Number",
         MenuSection::FormatAlign => "Format Align",
         MenuSection::Sheet => "Sheet",
+        MenuSection::Freeze => "Freeze",
         MenuSection::Export => "Export",
         MenuSection::Width => "Width",
         MenuSection::Insert => "Insert",
@@ -1533,6 +1577,26 @@ impl App {
             MenuAction::GoToCell => Mode::GoToCell {
                 buffer: self.start_input_mode(String::new()),
             },
+            MenuAction::ColLock => {
+                // Pins the cursor's global column. Same edit as clicking the
+                // gutter padlock; `crate::lock` owns the state.
+                //
+                // `ensure_sheet` FIRST: `LockState` starts on sheet 0, so
+                // toggling before the sheet is claimed would have the pin
+                // wiped by the next read (`ensure_sheet` clears on a mismatch).
+                let sid = self.view_sheet_id;
+                self.locks.ensure_sheet(sid);
+                self.locks.toggle_col(self.cursor.col);
+                self.status = format!("Col lock: {}", self.column_lock_status());
+                Mode::Normal
+            }
+            MenuAction::RowLock => {
+                let sid = self.view_sheet_id;
+                self.locks.ensure_sheet(sid);
+                self.locks.toggle_row(self.cursor.row);
+                self.status = format!("X-lock: {}", self.row_lock_status());
+                Mode::Normal
+            }
             MenuAction::Exit => {
                 if self.path.is_none() && self.unsaved_file.is_none() {
                     Mode::QuitPrompt
@@ -1764,6 +1828,36 @@ impl App {
             }
             MenuAction::FormatReset => {
                 self.apply_format_reset();
+                Mode::Normal
+            }
+            MenuAction::ToggleNightMode => {
+                // The TUI paints through ratatui's own terminal palette, which
+                // the terminal itself themes, so flipping the toolkit global
+                // changes nothing visible here. The item exists for menu parity
+                // and so the action reports its new state rather than being a
+                // silent no-op.
+                //
+                // cfg-gated because `rswidgets` is an optional dependency: the
+                // default (ratatui-only) build does not link it, so referencing
+                // it unconditionally would break `cargo build`. On that build
+                // the menu item still dispatches and still reports the state,
+                // it just has no palette to swap.
+                #[cfg(feature = "gui")]
+                {
+                    let next = match rswidgets::core::color_scheme() {
+                        rswidgets::core::ColorScheme::Light => rswidgets::core::ColorScheme::Night,
+                        rswidgets::core::ColorScheme::Night => rswidgets::core::ColorScheme::Light,
+                    };
+                    rswidgets::core::set_color_scheme(next);
+                    self.status = format!(
+                        "Night mode {} (terminal palette: use your terminal's theme)",
+                        if next == rswidgets::core::ColorScheme::Night { "on" } else { "off" }
+                    );
+                }
+                #[cfg(not(feature = "gui"))]
+                {
+                    self.status = "Night mode: set your terminal's theme".to_string();
+                }
                 Mode::Normal
             }
         }
@@ -2094,6 +2188,31 @@ fn visible_row_indices(
     (display_rows[start..start + dim].to_vec(), start)
 }
 
+/// Merge a frozen pane back in at the head of a scroll window.
+///
+/// `pinned` rows stay visible while the rest scrolls under them (the same
+/// `LockState` the GUI reads, so a lock means the same thing everywhere).
+/// Used by the render path: the window is computed by the caller, which knows
+/// how many cells are actually free.
+fn with_frozen_panes(window: Vec<usize>, pinned: &[usize], room: usize) -> Vec<usize> {
+    if pinned.is_empty() {
+        return window;
+    }
+    // `union_pinned` puts the frozen ones first and drops duplicates, so a pin
+    // that scrolled out of the window is re-inserted (that is the freeze
+    // working) while one still visible is not drawn twice.
+    let out = crate::lock::union_pinned(&window, pinned);
+    if out.len() > room {
+        // Trim from the tail (the scrolling part) so a full window of freezes
+        // does not push the body off; the frozen head is never dropped.
+        let keep = room.max(pinned.len()).min(out.len());
+        let mut v = out;
+        v.truncate(keep);
+        return v;
+    }
+    out
+}
+
 /// Column viewport with pinned left context and minimal-scroll movement.
 fn visible_col_indices(
     state: &SheetState,
@@ -2340,50 +2459,11 @@ fn trim_visible_cols_to_width(grid: &Grid, cols: &mut Vec<usize>, cursor_col: us
 // ── Navigation helpers ────────────────────────────────────────────────────────
 
 fn trailing_blank_main_rows(state: &SheetState) -> usize {
-    let g = &state.grid;
-    let hr = HEADER_ROWS;
-    let mr = g.main_rows();
-    match (0..mr)
-        .rev()
-        .find(|&r| g.logical_row_has_content(hr + r) || left_margin_template_applies(g, r))
-    {
-        None => mr,
-        Some(last) => mr.saturating_sub(last + 1),
-    }
+    crate::ui_core::trailing_blank_main_rows(&state.grid)
 }
 
 fn trailing_blank_main_cols(state: &SheetState) -> usize {
-    let g = &state.grid;
-    let lm = MARGIN_COLS;
-    let mc = g.main_cols();
-    match (0..mc).rev().find(|&c| {
-        g.logical_col_has_content(lm + c)
-            || header_template_applies(g, c)
-            || right_col_agg_func(g, lm + c).is_some()
-    }) {
-        None => mc,
-        Some(last) => mc.saturating_sub(last + 1),
-    }
-}
-
-fn header_template_applies(grid: &Grid, main_col: usize) -> bool {
-    let raw = grid.get(&CellAddr::Header {
-        row: (HEADER_ROWS - 1) as u32,
-        col: ColumnAddr::Main(main_col as u32),
-    });
-    // Consider any non-empty header cell as contributing to the visible
-    // main-column window. Previously this checked only for formula-like
-    // "templates"; treat ordinary header text the same for visibility so
-    // users see e.g. a Column D header even when the data cells are blank.
-    raw.as_deref().is_some()
-}
-
-fn left_margin_template_applies(grid: &Grid, main_row: usize) -> bool {
-    let raw = grid.get(&CellAddr::Left {
-        col: (MARGIN_COLS - 1),
-        row: main_row as u32,
-    });
-    raw.as_deref().is_some_and(is_formula)
+    crate::ui_core::trailing_blank_main_cols(&state.grid)
 }
 
 // ── Cell-address shorthand ───────────────────────────────────────────────────
@@ -2634,6 +2714,10 @@ fn read_clipboard() -> Result<String, String> {
     agg_picker_target: Option<CellAddr>,
     pending_format_target: Option<FormatTarget>,
     view_sheet_id: u32,
+    /// Frozen rows/cols (`Sheet ▸ Freeze`): kept visible ahead of the scroll
+    /// window. The same [`crate::lock::LockState`] the GUI drives, so a lock
+    /// means the same thing on every backend.
+    locks: crate::lock::LockState,
     persisted_view_sort_cols: HashMap<u32, Vec<SortSpec>>,
     edit_target_addr: Option<CellAddr>,
     /// When set, edit buffer commits to all listed addresses (same value). Preview uses all addrs in [`App::addr_at`].
@@ -2696,14 +2780,8 @@ impl App {
 
     fn insert_text_into_buffer(buffer: &mut String, cursor: &mut Option<usize>, text: &str) {
         let len = buffer.chars().count();
-        let pos = cursor.get_or_insert(len);
-        let pos = (*pos).min(len);
-        let mut chars: Vec<char> = buffer.chars().collect();
-        for (i, ch) in text.chars().enumerate() {
-            chars.insert(pos + i, ch);
-        }
-        *buffer = chars.into_iter().collect();
-        *cursor = Some(pos + text.chars().count());
+        let pos = (*cursor.get_or_insert(len)).min(len);
+        *cursor = Some(crate::ui_core::insert_str_at_char(buffer, pos, text));
     }
 
     pub fn new(path: Option<PathBuf>) -> Self {
@@ -2857,6 +2935,7 @@ impl App {
             agg_picker_target: None,
             pending_format_target: None,
             view_sheet_id,
+            locks: crate::lock::LockState::new(),
             persisted_view_sort_cols: HashMap::new(),
             edit_target_addr: None,
             edit_range_addrs: None,
@@ -3124,6 +3203,35 @@ impl App {
         self.status = format!("Sheet {} of {}", next + 1, count);
     }
 
+    /// Human-readable lock state for the status line, naming the cursor's
+    /// gutter so the toggle reads unambiguously ("Column B: locked" vs
+    /// "Column C: unlocked").
+    fn column_lock_status(&self) -> String {
+        let label = crate::addr::ui_column_fragment(
+            self.cursor.col,
+            self.state.grid.main_cols(),
+        );
+        let locked = self.locks.col_locked(self.cursor.col);
+        format!("Column {}: {}", label, if locked { "locked" } else { "unlocked" })
+    }
+
+    /// See [`App::column_lock_status`]; row flavour ("X-lock" is Excel's name
+    /// for freezing a row, which is why the menu item is labelled that way).
+    fn row_lock_status(&self) -> String {
+        let label = crate::addr::ui_row_label(self.cursor.row, self.state.grid.main_rows());
+        let locked = self.locks.row_locked(self.cursor.row);
+        format!("Row {}: {}", label, if locked { "locked" } else { "unlocked" })
+    }
+
+    /// Pinned rows/cols for the active sheet, cleared on a sheet switch
+    /// (see [`crate::lock::LockState::ensure_sheet`]).
+    fn locked_sets(&mut self) -> (Vec<usize>, Vec<usize>) {
+        // `view_sheet_id` is already the active sheet's id (the TUI's own
+        // cache), so no index lookup is needed.
+        let (rows, cols) = self.locks.ensure_sheet(self.view_sheet_id);
+        (rows.iter().copied().collect(), cols.iter().copied().collect())
+    }
+
     fn start_input_mode(&mut self, buffer: String) -> String {
         self.input_cursor = Some(buffer.chars().count());
         buffer
@@ -3321,16 +3429,7 @@ impl App {
     }
 
     fn replay_status(prefix: &str, path: &Path, replay: &PartialReplay) -> String {
-        match (replay.failed_line, replay.error.as_deref()) {
-            (Some(line), Some(err)) => {
-                format!(
-                    "{prefix} {} @ revision {} stopped at line {line}: {err}",
-                    path.display(),
-                    replay.op_count
-                )
-            }
-            _ => format!("{prefix} {} @ revision {}", path.display(), replay.op_count),
-        }
+        crate::core::state::replay_status(prefix, path, replay)
     }
 
     fn linked_source_from_path(path: &Path) -> Option<LinkedSource> {
@@ -3483,46 +3582,67 @@ impl App {
         Ok(())
     }
 
-    fn reload_revision_browse(&mut self) -> Result<(), IoError> {
-        let Some(path) = self.source_path.clone() else {
+    /// One arrow-key revision step for the TUI, using the shared
+    /// field-level arithmetic (`core::state::revision_step_request`) so the
+    /// clamped boundaries match both GUIs; the re-replay is the TUI's own
+    /// `reload_revision_browse` (scroll offsets included).
+    fn tui_step_revision(&mut self, back: bool) -> Result<(), IoError> {
+        let before = self.revision_browse_limit;
+        let requested = crate::core::state::revision_step_request(
+            back,
+            &self.source_path,
+            &mut self.revision_browse_limit,
+        );
+        if requested != crate::core::state::RevisionStep::Moved {
             return Ok(());
-        };
-        self.workbook = WorkbookState::new();
-        self.state = SheetState::new(1, 1);
-        self.cursor = SheetCursor {
-            row: HEADER_ROWS,
-            col: MARGIN_COLS,
-        };
-        self.anchor = None;
+        }
+        self.reload_revision_browse()?;
+        // The TUI shows the re-replay's own status text, but classifying the
+        // step here keeps the boundary semantics identical to the GUIs'
+        // `step_revision` (and makes a clamp visible in the debug log).
+        let outcome = crate::core::state::revision_step_outcome(
+            back,
+            before,
+            self.revision_browse_limit,
+        );
+        if outcome != crate::core::state::RevisionStep::Moved {
+            crate::debug_log::log(&format!(
+                "TUI_REVISION {} {} revision={}",
+                if back { "back" } else { "forward" },
+                if back { "at_oldest" } else { "at_newest" },
+                self.revision_browse_limit,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Re-replay `source_path` at `revision_browse_limit`.
+    ///
+    /// The bookkeeping itself lives in the shared
+    /// [`crate::core::state::reload_revision_browse_fields`] so both GUIs
+    /// and this reference share one implementation; only what is specific
+    /// to the TUI (scroll offsets, persisted-sort cache) is added here.
+    fn reload_revision_browse(&mut self) -> Result<(), IoError> {
         self.row_scroll = 0;
         self.col_scroll = 0;
         self.export_preview_scroll = 0;
-        self.path = None;
-        self.watcher = None;
-        let mut active_sheet = self.workbook.sheet_id(self.workbook.active_sheet);
-        let requested_limit = self.revision_browse_limit;
-        let (off, replay) = load_workbook_revisions_partial(
-            &path,
-            requested_limit,
+        let result = crate::core::state::reload_revision_browse_fields(
+            &mut self.source_path,
+            &mut self.revision_browse_limit,
             &mut self.workbook,
-            &mut active_sheet,
-        )?;
-        self.view_sheet_id = active_sheet;
-        self.sync_active_sheet_cache();
+            &mut self.state,
+            &mut self.cursor,
+            &mut self.anchor,
+            &mut self.selection_kind,
+            &mut self.path,
+            &mut self.watcher,
+            &mut self.view_sheet_id,
+            &mut self.offset,
+            &mut self.ops_applied,
+            &mut self.status,
+        );
         self.sync_persisted_sort_cache_from_workbook();
-        for c in 0..self.state.grid.main_cols() {
-            self.fit_column_to_rendered_content(MARGIN_COLS + c);
-        }
-        self.offset = off;
-        self.ops_applied = replay.op_count;
-        self.revision_browse_limit = replay.op_count;
-        self.status = if replay.failed_line.is_some() {
-            Self::replay_status("Browsing", &path, &replay)
-        } else {
-            format!("Browsing {} @ revision {}", path.display(), replay.op_count)
-        };
-        self.cursor.clamp(&self.state.grid);
-        Ok(())
+        result
     }
 
     fn commit_active_sheet_cache(&mut self) {
@@ -4547,45 +4667,49 @@ impl App {
     }
 
     fn expand_selection_to_rows(&mut self) {
-        let hr = HEADER_ROWS;
-        let left = MARGIN_COLS;
-        let right = MARGIN_COLS + self.state.grid.main_cols().saturating_sub(1);
+        // The span itself is shared with the GUI/pancurses gutter-click rule
+        // (`ui_core::main_row_selection_span`), so "select this row" means the
+        // same cells everywhere.
         let row = self
             .cursor
             .row
-            .clamp(hr, hr + self.state.grid.main_rows().saturating_sub(1));
+            .clamp(HEADER_ROWS, HEADER_ROWS + self.state.grid.main_rows().saturating_sub(1));
+        let Some((row_anchor, row_cursor)) =
+            crate::ui_core::main_row_selection_span(&self.state.grid, row)
+        else {
+            return;
+        };
         if let Some(anchor) = self.anchor {
             let r0 = anchor.row.min(row);
             let r1 = anchor.row.max(row);
-            self.anchor = Some(SheetCursor { row: r0, col: left });
-            self.cursor = SheetCursor {
-                row: r1,
-                col: right,
-            };
+            self.anchor = Some(SheetCursor { row: r0, col: row_anchor.col });
+            self.cursor = SheetCursor { row: r1, col: row_cursor.col };
         } else {
-            self.anchor = Some(SheetCursor { row, col: left });
-            self.cursor = SheetCursor { row, col: right };
+            self.anchor = Some(row_anchor);
+            self.cursor = row_cursor;
         }
         self.selection_kind = SelectionKind::Rows;
     }
 
     fn expand_selection_to_cols(&mut self) {
-        let hr = HEADER_ROWS;
-        let bottom = hr + self.state.grid.main_rows().saturating_sub(1);
+        // Twin of `expand_selection_to_rows`: the column span comes from the
+        // shared helper, so a GUI header click and this command agree.
         let left = MARGIN_COLS;
         let right = MARGIN_COLS + self.state.grid.main_cols().saturating_sub(1);
         let col = self.cursor.col.clamp(left, right);
+        let Some((col_anchor, col_cursor)) =
+            crate::ui_core::main_col_selection_span(&self.state.grid, col)
+        else {
+            return;
+        };
         if let Some(anchor) = self.anchor {
             let c0 = anchor.col.min(col);
             let c1 = anchor.col.max(col);
-            self.anchor = Some(SheetCursor { row: hr, col: c0 });
-            self.cursor = SheetCursor {
-                row: bottom,
-                col: c1,
-            };
+            self.anchor = Some(SheetCursor { row: col_anchor.row, col: c0 });
+            self.cursor = SheetCursor { row: col_cursor.row, col: c1 };
         } else {
-            self.anchor = Some(SheetCursor { row: hr, col });
-            self.cursor = SheetCursor { row: bottom, col };
+            self.anchor = Some(col_anchor);
+            self.cursor = col_cursor;
         }
         self.selection_kind = SelectionKind::Cols;
     }
@@ -5903,103 +6027,7 @@ impl App {
     }
 
     fn rendered_width_for_column(&self, global_col: usize) -> Option<usize> {
-        let mut maxw = 0usize;
-        let mut saw_content = false;
-        let main_cols = self.state.grid.main_cols();
-
-        // Inspect header/footer cells: prefer using numeric formatting for
-        // stored non-formula date/numeric literals so column-width decisions
-        // match the numeric serial representation while the UI still renders
-        // the original literal text.
-        for (addr, _) in self.state.grid.iter_nonempty() {
-            match addr {
-                CellAddr::Header { col, .. } | CellAddr::Footer { col, .. }
-                    if col.to_global(main_cols) == global_col =>
-                {
-                    let mut measured = None;
-                    if let Some(raw) = self.state.grid.get(&addr) {
-                        measured = measured_width_text_for_stored_literal(&raw);
-                    }
-                    // Fallback to the displayed/evaluated text.
-                    let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
-                    if !val.is_empty() {
-                        saw_content = true;
-                        maxw = maxw.max(val.width() + 1);
-                        #[cfg(test)]
-                        if global_col == 720 || global_col == 721 {
-                            eprintln!(
-                                "DEBUG: rendered_width_for_column contribute hdr/ftr col={} addr={:?} val={:?} width={}",
-                                global_col,
-                                addr,
-                                val,
-                                val.width() + 1
-                            );
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Inspect main / margin cells.
-        for r in 0..self.state.grid.main_rows() {
-            if global_col < MARGIN_COLS {
-                let addr = CellAddr::Left {
-                    col: global_col,
-                    row: r as u32,
-                };
-                let mut measured = None;
-                if let Some(raw) = self.state.grid.get(&addr) {
-                    measured = measured_width_text_for_stored_literal(&raw);
-                }
-                let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
-                if !val.is_empty() {
-                    saw_content = true;
-                    maxw = maxw.max(val.width() + 1);
-                }
-            } else if global_col < MARGIN_COLS + main_cols {
-                let addr = CellAddr::Main {
-                    row: r as u32,
-                    col: (global_col - MARGIN_COLS) as u32,
-                };
-                let mut measured = None;
-                if let Some(raw) = self.state.grid.get(&addr) {
-                    measured = measured_width_text_for_stored_literal(&raw);
-                }
-                let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
-                if !val.is_empty() {
-                    saw_content = true;
-                    maxw = maxw.max(val.width() + 1);
-                }
-            } else {
-                let addr = CellAddr::Right {
-                    col: (global_col - MARGIN_COLS - main_cols),
-                    row: r as u32,
-                };
-                let mut measured = None;
-                if let Some(raw) = self.state.grid.get(&addr) {
-                    measured = measured_width_text_for_stored_literal(&raw);
-                }
-                let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
-                if !val.is_empty() {
-                    saw_content = true;
-                    maxw = maxw.max(val.width() + 1);
-                }
-            }
-        }
-
-        #[cfg(test)]
-        {
-            if global_col == 720 || global_col == 721 {
-                eprintln!(
-                    "DEBUG: rendered_width_for_column col={} saw_content={} maxw={}",
-                    global_col,
-                    saw_content,
-                    maxw
-                );
-            }
-        }
-        saw_content.then_some(maxw.max(4))
+        crate::ui_core::rendered_width_for_column(&self.state.grid, global_col)
     }
 
     fn move_selected_rows_by_one(&mut self, down: bool) -> Result<bool, RunError> {
@@ -8081,7 +8109,7 @@ impl App {
         let buffer = cols
             .iter()
             .map(|spec| {
-                let col_name = addr::excel_column_name(spec.col.saturating_sub(MARGIN_COLS));
+                let col_name = addr::global_column_letter(spec.col);
                 if spec.desc {
                     format!("!{col_name}")
                 } else {
@@ -9291,6 +9319,12 @@ impl App {
             }
         }
 
+        // `Sheet ▸ Freeze` pins a row/column so it stays put while the rest of
+        // the window scrolls under it; the pins come off the shared
+        // `LockState`, so a lock set in one backend is a lock everywhere.
+        // Read them before the `grid` borrow below takes `&self.state`.
+        let (pin_rows, pin_cols) = self.locked_sets();
+
         let grid = preview_grid.as_ref().unwrap_or(&self.state.grid);
 
         // Determine visible rows/cols from stable sheet state, then trim the
@@ -9298,8 +9332,12 @@ impl App {
         // change which columns are visible, not dynamically refit widths.
         let (row_ixs, next_row_scroll) =
             visible_row_indices(&self.state, self.cursor, data_rows, self.row_scroll);
-        let (mut col_ixs, next_col_scroll) =
+        let (col_ixs, next_col_scroll) =
             visible_col_indices(&self.state, self.cursor, data_cols, self.col_scroll);
+        // A pinned row/column is re-inserted at the head of the window; the
+        // scroll offsets are unchanged, so freezing never moves the viewport.
+        let row_ixs = with_frozen_panes(row_ixs, &pin_rows, data_rows);
+        let mut col_ixs = with_frozen_panes(col_ixs, &pin_cols, data_cols);
         self.row_scroll = next_row_scroll;
         self.col_scroll = next_col_scroll;
 
@@ -10124,7 +10162,7 @@ impl App {
             Mode::OpenPath { .. } => {
                 "  type path or link <file> <revision>   Enter·open   Esc·cancel".into()
             }
-            Mode::RevisionBrowse => "  left/right·step revisions   Enter·close   Esc·close".into(),
+            Mode::RevisionBrowse => crate::core::state::REVISION_BROWSE_HINTS.into(),
             Mode::SheetRename { .. } => "  type sheet title   Enter·rename   Esc·cancel".into(),
             Mode::SheetCopy { .. } => "  type sheet title   Enter·copy   Esc·cancel".into(),
             Mode::GoToCell { .. } => {
@@ -10718,16 +10756,12 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     return Ok(false);
                 }
                 KeyCode::Left => {
-                    if self.revision_browse_limit > 1 {
-                        self.revision_browse_limit -= 1;
-                        self.reload_revision_browse()?;
-                    }
+                    self.tui_step_revision(true)?;
                     self.mode = Mode::RevisionBrowse;
                     return Ok(false);
                 }
                 KeyCode::Right => {
-                    self.revision_browse_limit = self.revision_browse_limit.saturating_add(1);
-                    self.reload_revision_browse()?;
+                    self.tui_step_revision(false)?;
                     self.mode = Mode::RevisionBrowse;
                     return Ok(false);
                 }
@@ -14098,9 +14132,32 @@ mod drive_feature_tests {
         assert!(!is_header_highlighted(rowlabel_style(&buf, "1")));
         assert!(is_header_highlighted(rowlabel_style(&buf, "2")));
     }
+    /// The row/column selection commands must produce exactly the span the
+    /// shared helper defines — the same helper a GUI click on the row/column
+    /// gutter uses. This is the ratatui half of the "click a header selects
+    /// the row/column" feature; if the two ever diverge, one backend would
+    /// select a different set of cells than the other.
     #[test]
-    fn selected_headers_rows_kind_covers_rows_only() {
+    fn expand_selection_matches_the_shared_gutter_spans() {
         let mut app = fresh_2x3();
+        app.expand_selection_to_rows();
+        let (row_anchor, row_cursor) =
+            crate::ui_core::main_row_selection_span(&app.state.grid, HEADER_ROWS).unwrap();
+        assert_eq!(app.anchor, Some(row_anchor));
+        assert_eq!(app.cursor, row_cursor);
+        assert_eq!(app.selection_kind, SelectionKind::Rows);
+
+        let mut app = fresh_2x3();
+        app.expand_selection_to_cols();
+        let (col_anchor, col_cursor) =
+            crate::ui_core::main_col_selection_span(&app.state.grid, MARGIN_COLS).unwrap();
+        assert_eq!(app.anchor, Some(col_anchor));
+        assert_eq!(app.cursor, col_cursor);
+        assert_eq!(app.selection_kind, SelectionKind::Cols);
+    }
+
+    #[test]
+    fn selected_headers_rows_kind_covers_rows_only() {        let mut app = fresh_2x3();
         app.expand_selection_to_rows();
         // Extend down: anchor row 1, cursor row 2, still Rows-kind. Row 1's
         // label must glow via coverage (it is not the active row); no
@@ -14929,6 +14986,145 @@ mod drive_feature_tests {
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::empty()); // Full help
         assert!(matches!(app.mode, Mode::Help), "Help▸Full help opens Help mode (mode={:?})", app.mode);
+    }
+
+    // ── Sheet ▸ Freeze ─────────────────────────────────────
+    //
+    // The lock state is shared with the GUI (`crate::lock::LockState`), so
+    // what is worth pinning here is the TUI half: the menu items reach the
+    // same state, and the pinned row/column actually stays in the window.
+
+    /// With nothing frozen the window is returned untouched — the merge must
+    /// not perturb normal scrolling.
+    #[test]
+    fn no_pins_leaves_the_window_alone() {
+        let w = vec![3, 4, 5, 6];
+        assert_eq!(with_frozen_panes(w.clone(), &[], 4), w);
+    }
+
+    /// A frozen row is re-inserted at the head of the window even after the
+    /// scroll has moved past it; that is the whole point of freezing.
+    ///
+    /// The window is capacity-bound, so the frozen row takes one of the
+    /// scrolling slots rather than making the window a row taller (that would
+    /// push the body past the viewport bottom).
+    #[test]
+    fn a_pinned_row_survives_scrolling_past_it() {
+        let scrolled = vec![40, 41, 42, 43];
+        let out = with_frozen_panes(scrolled, &[3], 4);
+        assert_eq!(out[0], 3, "the frozen row leads the window: {out:?}");
+        assert!(out.contains(&3), "the frozen row must be visible: {out:?}");
+        assert_eq!(out.len(), 4, "the window stays within its room: {out:?}");
+    }
+
+    /// Freezing must not duplicate a row that is already visible (drawing one
+    /// row twice would misalign the whole body).
+    #[test]
+    fn a_visible_pinned_row_is_not_duplicated() {
+        let w = vec![3, 4, 5, 6];
+        let out = with_frozen_panes(w, &[4], 4);
+        assert_eq!(out.iter().filter(|&&r| r == 4).count(), 1, "duplicated: {out:?}");
+        assert_eq!(out, vec![4, 3, 5, 6]);
+    }
+
+    /// A window already at capacity drops rows from the *scrolling* tail, not
+    /// the frozen head, so freezing many rows cannot push them back out.
+    #[test]
+    fn a_full_window_truncates_the_scrolling_tail() {
+        let w = vec![10, 11, 12, 13];
+        let out = with_frozen_panes(w, &[1, 2], 4);
+        assert_eq!(out, vec![1, 2, 10, 11], "frozen rows must be kept: {out:?}");
+    }
+
+    /// End to end: the menu item toggles the shared state, and the pinned
+    /// column is then merged into the rendered window.
+    #[test]
+    fn menu_col_lock_pins_the_cursor_column() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(5, 3);
+        // Park the cursor on a real main cell: `HEADER_ROWS` is a sentinel
+        // (an unbounded header band), and Freeze acts on the cursor, so the
+        // test has to aim at a cell the grid actually has.
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS,
+        };
+        let col = app.cursor.col;
+        assert!(!app.locks.col_locked(col));
+
+        let mode = app.menu_action_mode(MenuAction::ColLock);
+        assert!(matches!(mode, Mode::Normal), "locking is not a modal");
+        assert!(app.locks.col_locked(col), "Col Lock must pin the cursor column");
+        assert!(
+            app.status.contains("locked"),
+            "the status must say what happened, got {:?}",
+            app.status
+        );
+
+        // And the pin reaches the window the renderer draws.
+        let (pin_rows, pin_cols) = app.locked_sets();
+        assert_eq!(pin_cols, vec![col]);
+        assert!(pin_rows.is_empty());
+        let win = vec![col + 1, col + 2];
+        assert_eq!(with_frozen_panes(win, &pin_cols, 2)[0], col);
+
+        // Toggling again releases it.
+        app.menu_action_mode(MenuAction::ColLock);
+        assert!(!app.locks.col_locked(col));
+    }
+
+    /// The TUI's only route into a submenu is Alt+letter then a shortcut
+    /// letter, so the items must be reachable that way too — a Freeze buried
+    /// behind a key the menu cannot press would be invisible here even though
+    /// the tree and dispatcher are correct.
+    #[test]
+    fn freeze_items_are_reachable_from_the_keyboard() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(5, 3);
+        app.cursor = SheetCursor { row: HEADER_ROWS + 1, col: MARGIN_COLS };
+        let col = app.cursor.col;
+
+        // Alt+S opens Sheet, "z" the Freeze submenu, "c" the Col Lock leaf.
+        open_menu(&mut app, 's');
+        choose(&mut app, 'z');
+        choose(&mut app, 'c');
+        assert!(
+            app.locks.col_locked(col),
+            "Alt+S, z, c must pin the cursor column"
+        );
+
+
+        // ...and the row item the same way ("w" is X-Lock's mnemonic; "k"
+        // cannot be, it is the TUI's vim "up" key).
+        app.cursor = SheetCursor { row: HEADER_ROWS + 2, col: MARGIN_COLS };
+        let row = app.cursor.row;
+        open_menu(&mut app, 's');
+        choose(&mut app, 'z');
+        choose(&mut app, 'w');
+        assert!(app.locks.row_locked(row), "Alt+S, z, w must pin the cursor row");
+    }
+
+    /// The row axis, via the item labelled X-Lock (Excel's name for freezing
+    /// a row).
+    #[test]
+    fn menu_row_lock_pins_the_cursor_row() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(5, 3);
+        // Park the cursor on a real main cell: `HEADER_ROWS` is a sentinel
+        // (an unbounded header band), and Freeze acts on the cursor, so the
+        // test has to aim at a cell the grid actually has.
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS,
+        };
+        let row = app.cursor.row;
+
+        app.menu_action_mode(MenuAction::RowLock);
+        assert!(app.locks.row_locked(row), "X-Lock must pin the cursor row");
+        let (pin_rows, pin_cols) = app.locked_sets();
+        assert_eq!(pin_rows, vec![row]);
+        assert!(pin_cols.is_empty(), "X-Lock must not pin a column");
+        assert!(app.status.contains("locked"), "status: {:?}", app.status);
     }
 }
 
@@ -23899,16 +24095,13 @@ fn linked_tsv_edits_persist_on_save() {
     }
 }
 
-/// Serializes the unsaved-file tests. They configure process-global
-/// environment variables (`CORRO_UNSAVED_TEST_DIR`,
-/// `CORRO_AUTO_UNSAVED_TEST`), so running two of them concurrently let
-/// one test read the other's directory — an intermittent failure that
-/// looked like a product bug. Every test that touches those variables
-/// holds this lock for its whole body.
-static UNSAVED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Install the unsaved-file test environment for a scope, restoring the
-/// previous values on drop. Held together with [`UNSAVED_ENV_LOCK`].
+/// previous values on drop.
+///
+/// Holds [`crate::core::state::UNSAVED_ENV_LOCK`], the crate-wide lock for
+/// these process-global variables, so tests here and in `core::state` (which
+/// set the same variables) serialise against each other rather than only
+/// within one module.
 struct UnsavedEnv {
     _guard: std::sync::MutexGuard<'static, ()>,
     prev_test_dir: Option<std::ffi::OsString>,
@@ -23925,7 +24118,9 @@ impl UnsavedEnv {
     }
 
     fn new(dir: &std::path::Path) -> Self {
-        let _guard = UNSAVED_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::core::state::UNSAVED_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev_test_dir = std::env::var_os("CORRO_UNSAVED_TEST_DIR");
         let prev_auto = std::env::var_os("CORRO_AUTO_UNSAVED_TEST");
         let prev_state_home = std::env::var_os("XDG_STATE_HOME");

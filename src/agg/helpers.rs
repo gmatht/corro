@@ -6,7 +6,6 @@ use num_complex::Complex64;
 
 // Re-exported for the always-compiled default UI (ui/mod.rs, ui_core.rs) which
 // cannot reach the gui-gated gui::compute version.
-pub(crate) use crate::ods::footer_row_agg_func;
 
 /// Compute a footer aggregate value across all main rows for a given column.
 /// Mirrors gui::compute::footer_special_col_aggregate but lives in this always
@@ -88,6 +87,17 @@ pub(crate) fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFu
 pub(crate) fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<AggFunc> {
     let key_col = MARGIN_COLS - 1;
     let val = grid.get(&CellAddr::Left { col: key_col, row: main_row })?;
+    crate::ops::margin_key_agg_func(&val)
+}
+
+/// Check if a footer row's key cell carries an aggregate marker.
+///
+/// The footer key column is the same left-margin column as
+/// [`left_margin_agg_func`], but addressed as a `Footer` cell (`[A_1`,
+/// `[A_2`, …) — the `[A_n` aggregate key column (see `ods`).
+pub(crate) fn footer_row_agg_func(grid: &Grid, footer_row: usize) -> Option<AggFunc> {
+    let key_col = crate::grid::ColumnAddr::Left(MARGIN_COLS - 1);
+    let val = grid.get(&CellAddr::Footer { row: footer_row as u32, col: key_col })?;
     crate::ops::margin_key_agg_func(&val)
 }
 

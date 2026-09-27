@@ -49,8 +49,8 @@ mod macos_adapter {
     use once_cell::sync::Lazy;
 
     use crate::backends::apple::{
-        self as core_apple, alloc_init, cls, msg0, msg0i, msg0v, msg1bv, msg1i, msg1iv, msg1v,
-        msg4cv, nsstring, nsstring_to_rust, own, Kind, WidgetMeta,
+        self as core_apple, alloc_init, cls, msg0, msg0i, msg0v, msg1bv, msg1cv, msg1i, msg1iv,
+        msg1v, msg4cv, nsstring, nsstring_to_rust, own, Kind, WidgetMeta,
     };
     use crate::core::{DrawContext, Error, Widget};
 
@@ -396,6 +396,112 @@ mod macos_adapter {
             self.set_text(&strip_markup(markup));
         }
 
+        /// Pin the label's width so changing its text never reflows the
+        /// siblings packed after it. `None` releases the pin.
+        ///
+        /// ## Why this is not a one-line forward to AppKit
+        ///
+        /// An `NSTextField` has no "fixed width". Its width comes from
+        /// Auto Layout resolving *two competing* constraints against its
+        /// intrinsic content size: an ordinary width constraint the stack view
+        /// adds (low priority) versus `-[NSView intrinsicContentSize]`, which
+        /// is computed from the current `stringValue` and has a hugging
+        /// priority of 250. The intrinsic side therefore wins, and the field
+        /// is exactly as shrink-to-fit as a `GtkLabel` is — the label resizes
+        /// on every text change and drags its neighbours with it.
+        ///
+        /// So the pin is built from the two things AppKit *does* honour:
+        ///
+        /// * `corroSetPinnedWidth:` — a host-shim method (generated; see
+        ///   `apple_generator::VIEW_CATEGORY_METHODS`) that installs a
+        ///   required width equality constraint. Required, not greater-than:
+        ///   a ">= w" constraint still loses to the intrinsic size when the
+        ///   text is wider, which is precisely the reflow we are stopping.
+        /// * `corroSetContentHugging:priority:` — raising the hugging
+        ///   priority above the intrinsic 250 so the pinned width beats the
+        ///   intrinsic content size in the first place.
+        ///
+        /// Together those make the slot constant, which is the same
+        /// fixed-slot trade GTK (width request) and NWG (`SetWindowPos`)
+        /// make: text wider than the pin clips rather than growing the slot.
+        /// The caller must size the pin for the widest text the label will
+        /// ever show, exactly as the GTK docs say.
+        ///
+        /// The pin is also recorded in [`WidgetMeta`] so it survives even
+        /// when the shim is missing (headless, tests, a host that has not
+        /// yet installed the category): a later `append` can re-assert it.
+        pub fn set_fixed_width(&self, w: Option<i32>) {
+            core_apple::with_meta_mut(self.0, |m| m.fixed_width = w);
+            if self.0.is_null() {
+                return;
+            }
+            match w {
+                Some(w) => {
+                    // NSLayoutPriority: 1000 is "required", 999 one step
+                    // below. Either beats the intrinsic 250.
+                    unsafe {
+                        msg1iv(self.0, "corroSetPinnedWidth:", w as isize);
+                        msg1iv(self.0, "corroSetContentHugging:", 1000);
+                    }
+                }
+                None => {
+                    // Release: drop the constraint and let the intrinsic size
+                    // size the field again (hugging back to the default 250).
+                    unsafe {
+                        msg1iv(self.0, "corroSetPinnedWidth:", -1);
+                        msg1iv(self.0, "corroSetContentHugging:", 250);
+                    }
+                }
+            }
+            // The constraint is only meaningful once the view is in a
+            // hierarchy, so ask AppKit to re-run layout.
+            unsafe { msg0v(self.0, "setNeedsLayout") };
+        }
+
+        /// Left margin of the label's contents, in points. Pairs with
+        /// [`Label::set_fixed_width`]: a pinned, left-aligned label sits flush
+        /// against its slot's edge, and this restores the inset the
+        /// shrink-to-fit label had.
+        pub fn set_margin_start(&self, px: i32) {
+            core_apple::with_meta_mut(self.0, |m| m.margin_start = px);
+            if self.0.is_null() {
+                return;
+            }
+            // `headIndent` is NSTextField's left inset (points), and unlike a
+            // constraint it needs no superview to take effect.
+            unsafe { msg1cv(self.0, "setHeadIndent:", px as f64) };
+        }
+
+        /// Set the x alignment of the label's text (0.0 left .. 1.0 right).
+        ///
+        /// `NSTextField` centres its text by default (`NSTextAlignmentCenter`,
+        /// 1), which is why this is not a no-op on a pinned slot: with the
+        /// width pinned and the text centred, the address would float in the
+        /// middle of its slot and drift as the text changes width.
+        ///
+        /// `NSTextAlignment` is the same integer scale as AppKit's
+        /// `NSTextAlignment` enum — 0 left, 1 centre, 2 right, 3 justified,
+        /// 4 natural — so the 0.0..1.0 range is mapped onto the three real
+        /// anchors by nearest third, the same mapping NWG uses for
+        /// `SS_CENTER`/`SS_RIGHT`.
+        pub fn set_xalign(&self, x: f32) {
+            core_apple::with_meta_mut(self.0, |m| m.xalign = x);
+            if self.0.is_null() {
+                return;
+            }
+            const ALIGN_LEFT: isize = 0;
+            const ALIGN_CENTER: isize = 1;
+            const ALIGN_RIGHT: isize = 2;
+            let align = if x < 1.0 / 3.0 {
+                ALIGN_LEFT
+            } else if x < 2.0 / 3.0 {
+                ALIGN_CENTER
+            } else {
+                ALIGN_RIGHT
+            };
+            unsafe { msg1iv(self.0, "setAlignment:", align) };
+        }
+
         pub fn raw_handle(&self) -> *mut c_void {
             self.0
         }
@@ -410,7 +516,16 @@ mod macos_adapter {
     /// Flatten a Pango-style markup string to plain text (`<b>x</b>` → `x`).
     /// Deliberately minimal: it removes `<...>` spans and unescapes the three
     /// entities the shared code actually emits.
-    fn strip_markup(markup: &str) -> String {
+    ///
+    /// `pub(crate)` rather than private because this module's test block is a
+    /// *sibling*, not a child: the iOS adapter nests its `mod tests` inside
+    /// `mod ios_adapter` and reaches the same function through `super::`, but
+    /// here `mod macos_adapter` closes first. The two layouts are equivalent to
+    /// the compiler and not to a reader, and the difference was invisible until
+    /// a macOS test binary was actually built — nothing compiled these tests,
+    /// because every check so far used `cargo check`, which does not build test
+    /// targets. `test_strip_markup` was a hard E0425 for the whole module.
+    pub(crate) fn strip_markup(markup: &str) -> String {
         let mut out = String::with_capacity(markup.len());
         let mut in_tag = false;
         for ch in markup.chars() {
@@ -886,7 +1001,14 @@ mod macos_adapter {
 
     impl Canvas {
         /// Canvas id for this view (0 = unknown; registry lookups miss).
-        fn canvas_id(&self) -> u64 {
+        ///
+        /// `pub` because the shared GUI code publishes it to the platform
+        /// host *before* any gesture can arrive: the Apple hosts pass the id
+        /// on every mouse/key callback (`corro_macos_canvas_click(canvas_id,
+        /// x, y)`), so it has to be read out at tree-build time rather than
+        /// from inside the adapter. `common::Canvas` re-exposes it, which is
+        /// the same access the GTK backend offers.
+        pub fn canvas_id(&self) -> u64 {
             core_apple::canvas_id_for_view(self.0)
         }
 
@@ -961,6 +1083,45 @@ mod macos_adapter {
             map.insert(self.canvas_id(), SendClickCallback(Box::into_raw(cb)));
         }
 
+        /// Button/modifier-aware click. See the GTK3 backend's
+        /// `on_click_button`.
+        ///
+        /// The AppKit responder currently forwards only the press location, so
+        /// this registers the callback for parity but does not yet fire it with
+        /// a real button number; `on_click` remains the working path.
+        pub fn on_click_button(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            let mut map = CLICK_BUTTON_CALLBACKS.lock().unwrap();
+            map.insert(
+                self.canvas_id(),
+                SendClickButtonCallback(Box::into_raw(cb)),
+            );
+        }
+
+        /// Pointer motion over the canvas; see the GTK3 backend's `on_motion`.
+        pub fn on_motion(&self, cb: Box<dyn FnMut(f64, f64, u32)>) {
+            let mut map = MOTION_CALLBACKS.lock().unwrap();
+            map.insert(self.canvas_id(), SendMotionCallback(Box::into_raw(cb)));
+        }
+
+        /// This canvas's top-left in screen coordinates, or `None` when the
+        /// backend cannot report one.
+        ///
+        /// Not implemented for the AppKit backend: the caller opens the context
+        /// menu unpositioned instead of guessing an origin. See the GTK
+        /// backend's `screen_origin`.
+        pub fn screen_origin(&self) -> Option<(i32, i32)> {
+            None
+        }
+
+        /// Pointer release; see the GTK3 backend's `on_release`.
+        pub fn on_release(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            let mut map = RELEASE_CALLBACKS.lock().unwrap();
+            map.insert(
+                self.canvas_id(),
+                SendClickButtonCallback(Box::into_raw(cb)),
+            );
+        }
+
         pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) {
             let mut boxed = cb;
             self.on_key_raw(Box::new(move |k: u32, _s: u32| -> bool { boxed(k) }));
@@ -1002,6 +1163,28 @@ mod macos_adapter {
         Lazy::new(|| Mutex::new(HashMap::new()));
     static KEY_CALLBACKS: Lazy<Mutex<HashMap<u64, SendKeyCallback>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
+    // Button/modifier-aware registries. Declared alongside the plain click map
+    // so the richer API has somewhere to live on this backend without changing
+    // the `on_click` signature the AppKit host already calls.
+    //
+    // A DISTINCT type from `SendClickCallback`, not an alias: the plain click
+    // carries `(x, y)` and the button-aware one carries `(x, y, button, mods)`.
+    // Aliasing the two made `on_click_button`/`on_release` store a
+    // `Box<dyn FnMut(f64,f64,u32,u32)>` into a `Box<dyn FnMut(f64,f64)>` slot,
+    // which did not compile (E0308) — and had it, the extra register-file
+    // mismatch is the classic arm64 ABI crash `backends/apple.rs` warns about.
+    struct SendClickButtonCallback(*mut dyn FnMut(f64, f64, u32, u32));
+    // SAFETY: guarded by the registry mutex; same pattern as SendClickCallback.
+    unsafe impl Send for SendClickButtonCallback {}
+    static CLICK_BUTTON_CALLBACKS: Lazy<Mutex<HashMap<u64, SendClickButtonCallback>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    struct SendMotionCallback(*mut dyn FnMut(f64, f64, u32));
+    // SAFETY: guarded by the registry mutex; same pattern as SendClickCallback.
+    unsafe impl Send for SendMotionCallback {}
+    static MOTION_CALLBACKS: Lazy<Mutex<HashMap<u64, SendMotionCallback>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    static RELEASE_CALLBACKS: Lazy<Mutex<HashMap<u64, SendClickButtonCallback>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
 
     struct SendDrawCallback(*mut dyn FnMut(&mut dyn DrawContext, i32, i32));
     // SAFETY: guarded by the registry mutex; same pattern as the iOS and
@@ -1026,6 +1209,53 @@ mod macos_adapter {
         if let Some(raw) = raw {
             // SAFETY: registry-owned closure, single-threaded dispatch.
             unsafe { (*raw)(x, y) };
+        }
+    }
+
+    /// Dispatch a button/modifier-aware click from the host sheet view, for
+    /// canvases registered through `on_click_button`. Mirrors
+    /// [`dispatch_canvas_click`]; `button` is 1 = left, 3 = right.
+    pub fn dispatch_canvas_click_button(canvas_id: u64, x: f64, y: f64, button: u32, mods: u32) {
+        let raw = {
+            let mut map = CLICK_BUTTON_CALLBACKS.lock().unwrap();
+            match map.get_mut(&canvas_id) {
+                Some(SendClickButtonCallback(p)) => Some(*p),
+                None => None,
+            }
+        };
+        if let Some(raw) = raw {
+            // SAFETY: registry-owned closure, single-threaded dispatch.
+            unsafe { (*raw)(x, y, button, mods) };
+        }
+    }
+
+    /// Dispatch pointer motion; `mods` is the platform modifier mask.
+    pub fn dispatch_canvas_motion(canvas_id: u64, x: f64, y: f64, mods: u32) {
+        let raw = {
+            let mut map = MOTION_CALLBACKS.lock().unwrap();
+            match map.get_mut(&canvas_id) {
+                Some(SendMotionCallback(p)) => Some(*p),
+                None => None,
+            }
+        };
+        if let Some(raw) = raw {
+            // SAFETY: registry-owned closure, single-threaded dispatch.
+            unsafe { (*raw)(x, y, mods) };
+        }
+    }
+
+    /// Dispatch a pointer release, ending a drag.
+    pub fn dispatch_canvas_release(canvas_id: u64, x: f64, y: f64, button: u32, mods: u32) {
+        let raw = {
+            let mut map = RELEASE_CALLBACKS.lock().unwrap();
+            match map.get_mut(&canvas_id) {
+                Some(SendClickButtonCallback(p)) => Some(*p),
+                None => None,
+            }
+        };
+        if let Some(raw) = raw {
+            // SAFETY: registry-owned closure, single-threaded dispatch.
+            unsafe { (*raw)(x, y, button, mods) };
         }
     }
 
@@ -1533,6 +1763,15 @@ mod macos_adapter {
 
     impl MenuBar {
         pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool {
+            false
+        }
+
+        /// Open the submenu whose mnemonic is `keyval` at a screen position.
+        ///
+        /// Not implemented for the AppKit backend (no programmatic
+        /// popup-at-position call); reports `false`, and the caller shows an
+        /// "unavailable" status instead of a menu that never appears.
+        pub fn popup_submenu_by_mnemonic_at(&self, _keyval: u32, _x: i32, _y: i32) -> bool {
             false
         }
         pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool {
@@ -2339,12 +2578,34 @@ mod tests {
 
     #[test]
     fn test_menu_submenu_clone_keeps_items() {
-        let mut sub = super::Menu { items: Vec::new() };
+        // Built through the public factory rather than `Menu { items: .. }`:
+        // `items`/`MenuItem` are private to `mod macos_adapter`, and this test
+        // block is a *sibling* of it (see `strip_markup` for why the two
+        // adapters differ here). `create_menu` is the supported way to get a
+        // menu, and going through it is what the shared code does — so the test
+        // now exercises the real construction path instead of a literal that
+        // would break again the moment a field was added.
+        //
+        // The assertions are on what the *outer* module can see — the model is
+        // Clone, and `MenuBar` is Clone — because the contents are private.
+        // What is actually being protected here is that the construction and
+        // the clone do not panic on a submenu, which is the real risk: a
+        // macOS host builds an `NSMenu` from this model, and a clone that
+        // dropped a submenu would present an empty File menu.
+        let mut sub = super::create_menu().unwrap();
         sub.append("Open", "app.open");
-        let mut root = super::Menu { items: Vec::new() };
+        let mut root = super::create_menu().unwrap();
         root.append_submenu("File", &sub);
+
+        // Cloning a model with a nested submenu must not panic.
+        let _clone = root.clone();
+        // ...and so must building a menubar from it.
         let bar = super::create_menubar(&root, std::ptr::null_mut()).unwrap();
-        let _ = bar.menu_active();
+        // `menu_active` is a no-op on AppKit, but calling it is the documented
+        // "the menubar exists" probe and must not panic.
+        assert!(!bar.menu_active());
+        // The menubar is itself Clone, and cloning must not panic either.
+        let _bar_clone = bar.clone();
     }
 
     #[test]

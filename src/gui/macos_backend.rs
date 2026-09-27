@@ -31,6 +31,11 @@
 //! See `rustxWidgets/docs/MACOS_GUIDELINES.md` for the host-side contract
 //! (what the ObjC app must supply) and `rustxWidgets/docs/IOS_GUIDELINES.md`
 //! for the iOS twin of this document.
+//!
+//! The `extern "C"` entry points live in the **`macos/corro`** host crate,
+//! not here: they have to be at a crate root to survive the linker, exactly
+//! as `ios/corro/src/lib.rs` holds the iOS ones. That crate is the macOS twin
+//! of `ios/corro` and carries the AppKit shims alongside them.
 
 // Only the macOS entry points below use this; gated for the same reason as
 // the iOS twin (a desktop build compiles this module for the shared model).
@@ -113,6 +118,83 @@ pub fn log_macos(msg: &str) {
     rswidgets::backends::macos::log_macos(msg);
     #[cfg(not(target_os = "macos"))]
     eprintln!("corro(macos): {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// The host-facing surface (`macos/corro` calls these)
+// ---------------------------------------------------------------------------
+//
+// The three below are the *only* things a macOS host needs beyond the bootstrap
+// and the menu: they wrap the shared GUI helpers that live behind
+// `pub(crate)` in `gui_backend` (a module a cdylib cannot reach), so the host
+// crate has exactly one place to call instead of a scatter of internal paths.
+//
+// Unlike their iOS twins these are **not** `#[cfg(target_os = "macos")]`, and
+// that is deliberate rather than an oversight. A macOS host has a *mouse* and
+// a *scroll wheel*, so the metrics a pointer host needs to turn its own pixel
+// deltas into whole cells are part of the contract -- and a contract that can
+// only be checked on the one platform it is for is a contract that is never
+// checked. Compiling them everywhere is what lets
+// `tests/macos_pipeline_preview.rs` assert on Linux CI that the numbers a host
+// would use are positive and sane, which is the failure that would otherwise
+// divide by zero in the host's pixel-to-cell conversion and only surface on a
+// real Mac, on a Retina display, zoomed in.
+
+/// `(row height, column advance)` in points, for a scroll wheel or trackpad
+/// that has to turn its own pixel delta into whole cells. Both numbers already
+/// carry the Retina factor and the pinch scale, so a host must not compute its
+/// own.
+pub fn cell_size() -> (f64, f64) {
+    super::gui_backend::cell_size()
+}
+
+/// Scroll by whole cells -- what a scroll wheel notch or a momentum trackpad
+/// pan ends in. Returns the applied `(d_rows, d_cols)`, which can be less
+/// than requested at a sheet edge, so the host knows to stop accumulating.
+///
+/// The move itself needs a published `GuiState`, which only a real window has,
+/// so off-target this is the documented "nothing moved" answer rather than a
+/// panic -- which is also what a host gets before its first frame.
+pub fn scroll_by_cells(d_rows: i32, d_cols: i32) -> (i32, i32) {
+    #[cfg(target_os = "macos")]
+    {
+        super::gui_backend::scroll_by_cells(d_rows, d_cols)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No live viewport off-target: report no movement, so a host's
+        // accumulation loop terminates instead of spinning.
+        let _ = (d_rows, d_cols);
+        (0, 0)
+    }
+}
+
+/// Zoom the sheet by `factor` (a trackpad pinch's scale ratio since the last
+/// callback), returning the scale actually applied.
+pub fn zoom_viewport_by(factor: f64) -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        super::gui_backend::zoom_viewport_by(factor)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // The pinch scale is a plain thread-local and needs no window, so the
+        // *clamping* half is host-independent and genuinely testable
+        // off-target -- which is worth keeping rather than stubbing to 1.0.
+        super::gui_backend::clamped_view_zoom(factor)
+    }
+}
+
+/// Reset the pinch scale to 1.0. Returns the applied scale (always 1.0).
+pub fn reset_viewport_zoom() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        super::gui_backend::reset_viewport_zoom()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        super::gui_backend::reset_view_zoom_scale()
+    }
 }
 
 /// Entry point called from the host once it has a content view.

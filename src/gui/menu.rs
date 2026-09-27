@@ -51,6 +51,10 @@ pub enum MenuActionKind {
     InsertDate,
     InsertTime,
     InsertHyperlink,
+    /// Display: flip between the light and night palettes. A pure view
+    /// setting — it touches no cell and writes nothing to the log, so it is
+    /// not undoable and not persisted (matching the other display toggles).
+    ToggleNightMode,
     // Format menu
     FormatApplyAll,
     FormatApplyFullColumn,
@@ -92,6 +96,10 @@ pub enum MenuActionKind {
     CopySheet,
     MoveSheet,
     GoToCell,
+    // Sheet ▸ Freeze: pin a row/column so it stays visible while scrolling.
+    // Same edit as clicking the gutter padlock, without a mouse.
+    ColLock,
+    RowLock,
     // Help menu (ratatui parity)
     HelpRows,
     HelpCols,
@@ -137,6 +145,7 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
         MenuActionKind::InsertDate => "insert_date",
         MenuActionKind::InsertTime => "insert_time",
         MenuActionKind::InsertHyperlink => "insert_hyperlink",
+        MenuActionKind::ToggleNightMode => "toggle_night_mode",
         MenuActionKind::FormatApplyAll => "format_apply_all",
         MenuActionKind::FormatApplyFullColumn => "format_apply_full_column",
         MenuActionKind::FormatApplyData => "format_apply_data",
@@ -173,6 +182,8 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
         MenuActionKind::CopySheet => "copy_sheet",
         MenuActionKind::MoveSheet => "move_sheet",
         MenuActionKind::GoToCell => "go_to_cell",
+        MenuActionKind::ColLock => "col_lock",
+        MenuActionKind::RowLock => "row_lock",
         MenuActionKind::HelpRows => "help_rows",
         MenuActionKind::HelpCols => "help_cols",
         MenuActionKind::HelpFull => "help_full",
@@ -387,6 +398,15 @@ pub fn menu_bar() -> Vec<MenuAction> {
             "Default" => FormatAlignDefault ("D"),
         ],
         "Reset"  => FormatReset ("R"),
+        // Night mode is a *display* setting, so it lives beside the other
+        // appearance controls rather than under File. A mnemonic only has to
+        // be unique among its siblings: at this level those are Scope (S),
+        // Number (N), Align (A) and Reset (R), so the obvious "N" collides
+        // with Number. "K" is unused here. (Deliberately NOT "G": the TUI's
+        // Alt block already spends G on the generic number format, and a
+        // mnemonic that meant two things on two backends would be worse than
+        // an arbitrary letter.)
+        "Night mode" => ToggleNightMode ("K"),
     ],
     "Sheet" => [
         "Prev sheet"    => SheetPrev ("["),
@@ -397,6 +417,15 @@ pub fn menu_bar() -> Vec<MenuAction> {
         "Move sheet"    => MoveSheet ("M"),
         "Go"            => GoToCell ("G"),
         "Balance books" => BalanceBooks ("B"),
+        // Freeze panes: pin the cursor's row/column so it stays put while the
+        // sheet scrolls — the keyboard route to the gutter padlock. The
+        // mnemonics avoid the TUI's vim keys (h/j/k/l), which its menu
+        // handler consumes before the shortcut lookup, so X-Lock could not be
+        // "K" and still be reachable.
+        "Freeze" => ("Z") [
+            "Col Lock" => ColLock ("C"),
+            "X-Lock"   => RowLock ("W"),
+        ],
     ],
     "Help" => [
         "About"     => About ("A"),

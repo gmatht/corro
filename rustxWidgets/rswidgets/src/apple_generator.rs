@@ -299,6 +299,46 @@ pub const VIEW_CATEGORY_METHODS: &[ShimMethod] = &[
         body_elsewhere: false,
     },
     ShimMethod {
+        // `Label::set_fixed_width`. A real width pin, so the body is
+        // BEHAVIOUR and cannot be a generated no-op: an NSTextField sizes
+        // itself from `-intrinsicContentSize` (hugging priority 250), so a
+        // stub that records nothing leaves the label shrink-to-fit and the
+        // formula bar's address slot still slides every sibling on each
+        // cursor move. The host installs a required width equality
+        // constraint; a negative width releases it.
+        selector: "corroSetPinnedWidth:",
+        args: &[ArgKind::Integer],
+        ret: ArgKind::Void,
+        class_method: false,
+        hand_written_note: Some(
+            "installs (or, for a negative width, removes) a required width \
+             constraint; see Label::set_fixed_width in the macOS adapter",
+        ),
+        body_elsewhere: true,
+    },
+    ShimMethod {
+        // `Label::set_fixed_width`'s second half. Raising the content-hugging
+        // priority above the intrinsic 250 is what makes the pinned width win
+        // the constraint conflict in the first place; a generated no-op there
+        // silently leaves the intrinsic size in charge.
+        //
+        // ONE argument, matching the `msg1iv` the adapters send. A
+        // two-argument `corroSetContentHugging:priority:` was tried first and
+        // is wrong twice over: it is a different selector, so `msg1iv` on a
+        // 1-arg declaration leaves the second register undefined, and the
+        // declared signature in the generated header would not match what the
+        // host implements.
+        selector: "corroSetContentHugging:",
+        args: &[ArgKind::Integer],
+        ret: ArgKind::Void,
+        class_method: false,
+        hand_written_note: Some(
+            "sets the view's horizontal content-hugging priority; see \
+             Label::set_fixed_width in the macOS adapter",
+        ),
+        body_elsewhere: true,
+    },
+    ShimMethod {
         // Marked hand-written even though the generated category is a natural
         // home: the generated stub body returns 0, and the adapter uses these
         // to size children to their parent. A 0 return reintroduces the 0x0
@@ -554,12 +594,34 @@ pub struct CanvasView {
     pub required_overrides: &'static [&'static str],
 }
 
+impl CanvasView {
+    /// The canvas class contract for a platform.
+    ///
+    /// Per-platform, not one shared constant, because the class *name* is not
+    /// shared: the iOS app registers `SheetView` and the macOS app registers
+    /// `CorroSheetView` (the `Corro*` prefix is what every other macOS shim
+    /// uses, so a host can resolve them all with one convention). A single
+    /// constant put `SheetView` in the *macOS* generated header, which would
+    /// have declared a class no macOS host implements — and the mismatch
+    /// between that declaration and the host's actual class is precisely the
+    /// silent ABI drift the generator exists to prevent, reintroduced through
+    /// the generator itself.
+    pub fn for_platform(p: Platform) -> Self {
+        CanvasView {
+            class_name: match p {
+                Platform::Ios => "SheetView",
+                Platform::Macos => "CorroSheetView",
+            },
+            required_overrides: &["drawRect:", "corroSetCanvasId:"],
+        }
+    }
+}
+
+/// The iOS canvas class contract, kept as a named constant because the iOS host
+/// (`ios/corro`) refers to it by this name.
 pub const CANVAS_VIEW: CanvasView = CanvasView {
     class_name: "SheetView",
-    required_overrides: &[
-        "drawRect:",
-        "corroSetCanvasId:",
-    ],
+    required_overrides: &["drawRect:", "corroSetCanvasId:"],
 };
 
 /// Write `content` to `path` only when the file does not exist yet, creating
@@ -615,13 +677,15 @@ impl ShimConfig {
     pub fn for_platform(p: Platform) -> Self {
         match p {
             Platform::Ios => ShimConfig {
-                canvas: CanvasViewConfig::ios(CANVAS_VIEW.class_name),
+                canvas: CanvasViewConfig::ios(CanvasView::for_platform(Platform::Ios).class_name),
                 text: TextShimConfig::ios("CorroIosText"),
                 emit_canvas: true,
                 emit_text: true,
             },
             Platform::Macos => ShimConfig {
-                canvas: CanvasViewConfig::macos(CANVAS_VIEW.class_name),
+                canvas: CanvasViewConfig::macos(
+                    CanvasView::for_platform(Platform::Macos).class_name,
+                ),
                 text: TextShimConfig::macos("CorroMacText"),
                 emit_canvas: true,
                 emit_text: true,
@@ -802,7 +866,11 @@ fn render_header(p: Platform, _cfg: &ShimConfig) -> String {
         s,
         "@end\n\n/// The canvas view the host must ship (see the backend's\n/// `set_sheet_view_class`). Hand-written: `drawRect:` reports the laid-out\n/// size before replaying Rust's draw closure, and the input methods convert\n/// coordinates.\n///\n/// Required overrides:\n",
     );
-    for ov in CANVAS_VIEW.required_overrides {
+    // Per-platform: the class NAME is not shared (see `CanvasView::for_platform`),
+    // so hardcoding the iOS one here would declare a class the macOS host does
+    // not implement.
+    let canvas_view = CanvasView::for_platform(p);
+    for ov in canvas_view.required_overrides {
         let _ = writeln!(s, "///   * `{ov}`");
     }
     if !p.view_is_top_left_origin() {
@@ -811,7 +879,7 @@ fn render_header(p: Platform, _cfg: &ShimConfig) -> String {
     let _ = write!(
         s,
         "@interface {} : {base}\n@end\n\n#endif /* {guard} */\n",
-        CANVAS_VIEW.class_name,
+        canvas_view.class_name,
         base = p.base_view_class(),
         guard = guard,
     );
@@ -1729,6 +1797,8 @@ pub const IOS_ADAPTER_SENDS: &[RustSideSelector] = &[
     RustSideSelector { class: "CorroIosAlert", selector: "corroNewAlert", source: "create_dialog" },
     RustSideSelector { class: "CorroIosAlert", selector: "corroAddAction:", source: "Dialog::add_button" },
     RustSideSelector { class: "UIViewController", selector: "corroPresentDialog:", source: "Dialog::present" },
+    RustSideSelector { class: "UIView", selector: "corroSetPinnedWidth:", source: "Label::set_fixed_width" },
+    RustSideSelector { class: "UIView", selector: "corroSetContentHugging:", source: "Label::set_fixed_width" },
 ];
 
 /// The same for the macOS adapter.
@@ -1740,6 +1810,8 @@ pub const MACOS_ADAPTER_SENDS: &[RustSideSelector] = &[
     RustSideSelector { class: "CorroMacAlert", selector: "corroNewAlert", source: "create_dialog" },
     RustSideSelector { class: "CorroMacAlert", selector: "corroAddAction:", source: "Dialog::add_button" },
     RustSideSelector { class: "NSWindowController", selector: "corroPresentDialog:", source: "Dialog::present" },
+    RustSideSelector { class: "NSView", selector: "corroSetPinnedWidth:", source: "Label::set_fixed_width" },
+    RustSideSelector { class: "NSView", selector: "corroSetContentHugging:", source: "Label::set_fixed_width" },
 ];
 
 #[cfg(test)]
@@ -1839,6 +1911,84 @@ mod tests {
     fn flipped_hint_only_on_appkit() {
         assert!(!render_header(Platform::Ios, &ShimConfig::for_platform(Platform::Ios)).contains("isFlipped"));
         assert!(render_header(Platform::Macos, &ShimConfig::for_platform(Platform::Macos)).contains("isFlipped"));
+    }
+
+    /// The canvas class *name* is per-platform, because the two hosts do not
+    /// agree on it: iOS registers `SheetView`, macOS registers
+    /// `CorroSheetView` (matching the `Corro*` prefix every other macOS shim
+    /// uses, so a host resolves them all with one convention).
+    ///
+    /// This was a single shared `CANVAS_VIEW` constant, which put `SheetView`
+    /// into the *macOS* generated header. The host would then have been told
+    /// to implement a class the generated header declares under a different
+    /// name than the one it looks for — a silent ABI drift, reintroduced
+    /// through the very generator meant to prevent it. The header must name
+    /// the class the backend actually resolves.
+    #[test]
+    fn the_declared_canvas_class_is_the_one_the_backend_resolves() {
+        assert_eq!(CanvasView::for_platform(Platform::Ios).class_name, "SheetView");
+        assert_eq!(
+            CanvasView::for_platform(Platform::Macos).class_name,
+            "CorroSheetView"
+        );
+        for p in [Platform::Ios, Platform::Macos] {
+            let header = render_header(p, &ShimConfig::for_platform(p));
+            assert!(
+                header.contains(&format!(
+                    "@interface {} : {}",
+                    CanvasView::for_platform(p).class_name,
+                    p.base_view_class()
+                )),
+                "{} header does not declare its own canvas class ({})",
+                p.name(),
+                CanvasView::for_platform(p).class_name
+            );
+            // ...and must NOT declare the other platform's, which is what the
+            // shared constant did.
+            let other = match p {
+                Platform::Ios => "CorroSheetView",
+                Platform::Macos => "SheetView",
+            };
+            assert!(
+                !header.contains(&format!("@interface {other} :")),
+                "{} header wrongly declares the other platform's canvas class {other}",
+                p.name()
+            );
+        }
+    }
+
+    /// A selector the adapters send with ONE argument must be declared with
+    /// one. `corroSetContentHugging:priority:` was declared for a
+    /// `corroSetContentHugging:` call: a different selector, so the host
+    /// implements a method the adapter never messages, and the message itself
+    /// leaves the host reading a register the sender never set.
+    ///
+    /// Checked against the *adapters' own strings* rather than a restated
+    /// list, because the restatement is what drifted.
+    #[test]
+    fn hugging_selector_takes_the_one_argument_the_adapter_sends() {
+        for p in [Platform::Ios, Platform::Macos] {
+            let header = render_header(p, &ShimConfig::for_platform(p));
+            assert!(
+                header.contains("corroSetContentHugging:"),
+                "{} header must declare corroSetContentHugging:",
+                p.name()
+            );
+            assert!(
+                !header.contains("corroSetContentHugging:priority:"),
+                "{} header declares a two-argument hugging selector the \
+                 adapters never send (they send one argument)",
+                p.name()
+            );
+        }
+        // The table entry itself must carry the one-argument spelling, or the
+        // emitter would regenerate the header the assertion just rejected.
+        let entry = VIEW_CATEGORY_METHODS
+            .iter()
+            .find(|m| m.selector.starts_with("corroSetContentHugging"))
+            .expect("no hugging entry in VIEW_CATEGORY_METHODS");
+        assert_eq!(entry.selector, "corroSetContentHugging:");
+        assert_eq!(entry.args, &[ArgKind::Integer]);
     }
 
     /// CGFloat is spelled as the typedef so no 32/64 branch is needed.

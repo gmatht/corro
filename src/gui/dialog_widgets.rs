@@ -1,0 +1,26 @@
+//! Native dialog widget types, resolved to the right backend once.
+//!
+//! Every dialog in [`super::dialogs`] builds the same handful of native
+//! widgets (`DropDown`, `CheckButton`, `RadioButton`, `Entry`). Under the
+//! combined-gui feature the crate root's `prelude` is flipped to the
+//! pancurses adapter's types, so a dialog that just says `use
+//! rswidgets::prelude::DropDown` would get the wrong (terminal) widget on
+//! Linux/Windows — the dialogs must always use the *native* backend's types.
+//!
+//! That choice is a three-branch `cfg` (gtk on Linux, nwg on Windows, the
+//! prelude elsewhere) and used to be repeated verbatim at every dialog
+//! construction site. Naming the aliases once here means a new dialog cannot
+//! pick the wrong backend's widget, and the platform mapping lives in one
+//! place.
+
+#[cfg(all(feature = "gui", target_os = "linux"))]
+pub use rswidgets::backends_gtk_adapter::{CheckButton, DropDown, RadioButton};
+
+#[cfg(all(feature = "gui", windows))]
+pub use rswidgets::backends_nwg_adapter::{CheckButton, DropDown, RadioButton};
+
+#[cfg(all(
+    feature = "gui",
+    not(any(target_os = "linux", windows))
+))]
+pub use rswidgets::prelude::{CheckButton, DropDown, RadioButton};

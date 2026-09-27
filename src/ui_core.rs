@@ -731,6 +731,212 @@ pub const NAV_BLANK_ROWS: usize = 2;
 /// the last content column.
 pub const NAV_BLANK_COLS: usize = 2;
 
+/// Whether a main column's header cell carries a visible label.
+///
+/// Any non-empty header text counts, not only a formula "template": the user
+/// must see e.g. a Column D header even when every data cell is blank.
+pub fn header_template_applies(grid: &crate::grid::GridBox, main_col: usize) -> bool {
+    grid.get(&CellAddr::Header {
+        row: (HEADER_ROWS - 1) as u32,
+        col: crate::grid::ColumnAddr::Main(main_col as u32),
+    })
+    .as_deref()
+    .is_some()
+}
+
+/// Whether a main row's left-margin key cell holds a formula (the per-row
+/// template marker). Such a row is "content" for trailing-blank counting:
+/// the template generates visible values even while the data cells are blank.
+pub fn left_margin_template_applies(grid: &crate::grid::GridBox, main_row: usize) -> bool {
+    grid.get(&CellAddr::Left {
+        col: MARGIN_COLS - 1,
+        row: main_row as u32,
+    })
+    .as_deref()
+    .is_some_and(crate::formula::is_formula)
+}
+
+/// Count trailing blank main columns (a column is non-blank when it has any
+/// content, a header label, or a right-margin aggregate key).
+///
+/// Single source of truth for the navigation/export trailing-blank rule:
+/// the ratatui reference and both GUIs count them the same way, so the grid
+/// grows at the same point everywhere.
+pub fn trailing_blank_main_cols(grid: &crate::grid::GridBox) -> usize {
+    let lm = MARGIN_COLS;
+    let mc = grid.main_cols();
+    match (0..mc).rev().find(|&c| {
+        grid.logical_col_has_content(lm + c)
+            || header_template_applies(grid, c)
+            || crate::agg::helpers::right_col_agg_func(grid, lm + c).is_some()
+    }) {
+        None => mc,
+        Some(last) => mc.saturating_sub(last + 1),
+    }
+}
+
+/// Count trailing blank main rows (a row is non-blank when it has any content
+/// or its left-margin key holds a row template).
+pub fn trailing_blank_main_rows(grid: &crate::grid::GridBox) -> usize {
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    match (0..mr)
+        .rev()
+        .find(|&r| grid.logical_row_has_content(hr + r) || left_margin_template_applies(grid, r))
+    {
+        None => mr,
+        Some(last) => mr.saturating_sub(last + 1),
+    }
+}
+
+/// Grow the grid when the cursor sits on the last main row or column and
+/// trailing blanks are below the navigation threshold.
+///
+/// Both the GUI and pancurses backends call this before updating the cursor
+/// position so the grid extends naturally as the user navigates into the
+/// trailing blank area. Growth is ephemeral (never logged) — matching
+/// ratatui's `move_cursor_one_row_vertical` / `move_cursor_one_col_horizontal`.
+pub fn grow_grid_for_cursor(grid: &mut crate::grid::GridBox, cursor_row: usize, cursor_col: usize) {
+    let hr = HEADER_ROWS;
+    let lm = MARGIN_COLS;
+    let mr = grid.main_rows();
+    let mc = grid.main_cols();
+    if cursor_row == hr + mr.saturating_sub(1) && trailing_blank_main_rows(grid) < NAV_BLANK_ROWS {
+        grid.grow_main_row_at_bottom();
+    }
+    if cursor_col == lm + mc.saturating_sub(1) && trailing_blank_main_cols(grid) < NAV_BLANK_COLS {
+        grid.grow_main_col_at_right();
+    }
+}
+
+/// One selection-extension (Shift+arrow) step, as `(row, col)`, mirroring the
+/// ratatui reference exactly.
+///
+/// Unlike plain navigation ([`grow_grid_for_cursor`], which only grows while
+/// trailing blanks are below the navigation threshold), an extending selection
+/// **always grows** at the bottom/right edge of the main area, so it can never
+/// walk out of the body into the footer rows or the right margin. At the
+/// top/left edge the step is refused for the same reason (no header/left-margin
+/// entry), and a step that is not a straight move is a no-op.
+///
+/// This is the shared rule for the GUI/pancurses backends; keeping it next to
+/// the ratatui reference (and locking it with an equivalence test) is what
+/// stops the two from drifting.
+pub fn grow_grid_for_selection_edge(
+    grid: &mut crate::grid::GridBox,
+    cursor_row: usize,
+    cursor_col: usize,
+    dr: isize,
+    dc: isize,
+) -> (usize, usize) {
+    let hr = HEADER_ROWS;
+    let lm = MARGIN_COLS;
+    let mut row = cursor_row;
+    let mut col = cursor_col;
+    if dc < 0 {
+        // Stay inside the body: no left-margin entry.
+        if col > lm {
+            col = col.saturating_sub(1);
+            let mut c = crate::grid::SheetCursor { row, col };
+            c.clamp(grid);
+            return (c.row, c.col);
+        }
+        return (row, col);
+    }
+    if dc > 0 {
+        // At the last main column, grow instead of stepping into the right
+        // margin (unconditional, unlike plain navigation).
+        let mc = grid.main_cols();
+        if col < lm + mc.saturating_sub(1) {
+            col = col.saturating_add(1);
+        } else {
+            grid.grow_main_col_at_right();
+            col = col.saturating_add(1);
+        }
+    } else if dr < 0 {
+        // Stay inside the body: no header entry.
+        if row > hr {
+            row = row.saturating_sub(1);
+            let mut c = crate::grid::SheetCursor { row, col };
+            c.clamp(grid);
+            return (c.row, c.col);
+        }
+        return (row, col);
+    } else if dr > 0 {
+        // At the last main row, grow instead of stepping into the footer.
+        let mr = grid.main_rows();
+        if row < hr + mr.saturating_sub(1) {
+            row = row.saturating_add(1);
+        } else {
+            grid.grow_main_row_at_bottom();
+            row = row.saturating_add(1);
+        }
+    }
+    let mut cursor = crate::grid::SheetCursor { row, col };
+    cursor.clamp(grid);
+    grid.ensure_extent_for_cursor(cursor.row, cursor.col);
+    (cursor.row, cursor.col)
+}
+
+/// Anchor↔cursor span selecting the whole main-body **row** `logical_row`,
+/// i.e. every main column of that row.
+///
+/// This is the shared rule behind "select this row": ratatui's `r` command
+/// ([`crate::ui`]'s `expand_selection_to_rows`) and a GUI click on the row
+/// gutter both go through it, so the two can never disagree about which cells
+/// a selected row covers. `None` when the sheet has no main columns.
+///
+/// The return value is `(anchor, cursor)` in that order: the anchor at the
+/// leftmost main column, the cursor at the rightmost — the same span ratatui
+/// renders. The caller decides which row (ratatui clamps its body cursor; a
+/// gutter click passes the clicked label's row verbatim).
+pub fn main_row_selection_span(
+    grid: &crate::grid::GridBox,
+    logical_row: usize,
+) -> Option<(SheetCursor, SheetCursor)> {
+    let lm = MARGIN_COLS;
+    let mc = grid.main_cols();
+    if mc == 0 {
+        return None;
+    }
+    Some((
+        SheetCursor {
+            row: logical_row,
+            col: lm,
+        },
+        SheetCursor {
+            row: logical_row,
+            col: lm + mc - 1,
+        },
+    ))
+}
+
+/// Anchor↔cursor span selecting the whole main-body **column** `global_col`,
+/// i.e. every main row of that column.
+///
+/// Twin of [`main_row_selection_span`] for the column header. `None` when the
+/// sheet has no main rows.
+pub fn main_col_selection_span(
+    grid: &crate::grid::GridBox,
+    global_col: usize,
+) -> Option<(SheetCursor, SheetCursor)> {
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    if mr == 0 {
+        return None;
+    }
+    Some((
+        SheetCursor {
+            row: hr,
+            col: global_col,
+        },
+        SheetCursor {
+            row: hr + mr - 1,
+            col: global_col,
+        },
+    ))
+}
+
 /// Width reserved for the row-label gutter on the left side of the grid
 /// (enough for `~N`, ` N`, `_N` with a little padding).
 pub const ROW_LABEL_CHARS: usize = 5;
@@ -938,8 +1144,24 @@ pub fn format_cell_display(grid: &Grid, addr: &CellAddr, text: String) -> String
 /// Normalise whitespace for inline (single-line) display: collapse runs of
 /// whitespace into a single space, trim leading/trailing whitespace, and
 /// replace newlines/carriage-returns with spaces.
-pub fn normalize_inline_text(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// Insert `text` into `buffer` at char index `caret` (which must be a char
+/// index, never a byte offset), returning the caret after the insertion.
+///
+/// The multi-char counterpart of `gui::text_edit::insert_char`, shared so the
+/// ratatui reference, the GUIs and the special-character splice all insert
+/// at a caret the same way and multibyte text can never split a codepoint.
+pub fn insert_str_at_char(buffer: &mut String, caret: usize, text: &str) -> usize {
+    let at = caret.min(buffer.chars().count());
+    let byte = buffer
+        .char_indices()
+        .nth(at)
+        .map(|(b, _)| b)
+        .unwrap_or(buffer.len());
+    buffer.insert_str(byte, text);
+    at + text.chars().count()
+}
+
+pub fn normalize_inline_text(text: &str) -> String {    let mut out = String::with_capacity(text.len());
     let mut prev_was_space = false;
     for ch in text.chars() {
         if ch.is_whitespace() {
@@ -2270,6 +2492,43 @@ mod tests {
         );
         std::env::remove_var("CORRO_URL_OPENER");
     }
+
+    /// A row-selection span covers every main column of the named row and
+    /// nothing else — the rule a gutter click and ratatui's `r` share.
+    #[test]
+    fn main_row_selection_span_covers_the_whole_main_row() {
+        let g = crate::grid::GridBox::from(crate::grid::Grid::new(3, 4));
+        let row = HEADER_ROWS + 1;
+        let (anchor, cursor) = main_row_selection_span(&g, row).expect("main columns exist");
+        assert_eq!(anchor, SheetCursor { row, col: MARGIN_COLS });
+        assert_eq!(
+            cursor,
+            SheetCursor { row, col: MARGIN_COLS + 4 - 1 },
+            "the span must end on the last main column"
+        );
+    }
+
+    /// A column-selection span covers every main row of the named column.
+    #[test]
+    fn main_col_selection_span_covers_the_whole_main_column() {
+        let g = crate::grid::GridBox::from(crate::grid::Grid::new(3, 4));
+        let col = MARGIN_COLS + 2;
+        let (anchor, cursor) = main_col_selection_span(&g, col).expect("main rows exist");
+        assert_eq!(anchor, SheetCursor { row: HEADER_ROWS, col });
+        assert_eq!(
+            cursor,
+            SheetCursor { row: HEADER_ROWS + 3 - 1, col },
+            "the span must end on the last main row"
+        );
+    }
+
+    /// A 1x1 body is still a body: both spans exist and are single-cell.
+    #[test]
+    fn selection_spans_exist_even_for_a_one_by_one_body() {
+        let g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        assert!(main_row_selection_span(&g, HEADER_ROWS).is_some());
+        assert!(main_col_selection_span(&g, MARGIN_COLS).is_some());
+    }
 }
 
 #[cfg(test)]
@@ -2349,4 +2608,213 @@ mod resolve_tests {
         assert_eq!(key2, left_key);
         assert_eq!(func2, AggFunc::Max);
     }
+}
+
+// ---------------------------------------------------------------------------
+// "Go to" target resolution
+// ---------------------------------------------------------------------------
+
+/// Where a `go to` prompt wants the cursor, plus any grid growth the target
+/// needs before the cursor can land there.
+///
+/// One resolver feeds every backend, so the typed TUI path and the GUI's
+/// Sheet▸Go dialog accept exactly the same inputs and cannot drift — the GUI
+/// used to accept only a bare `A1`-style main cell, and for a target past the
+/// grid edge it placed the cursor in margin space, where the address resolved
+/// to a different cell entirely (e.g. `C999` read back as `]B_998`), so the
+/// selection appeared not to move at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GoTarget {
+    /// Cursor to move to (logical row, global column).
+    pub cursor: SheetCursor,
+    /// Main rows the grid must have at least, or `None` to leave it alone.
+    pub min_main_rows: Option<usize>,
+    /// Main columns the grid must have at least, or `None` to leave it alone.
+    pub min_main_cols: Option<usize>,
+}
+
+impl GoTarget {
+    fn plain(cursor: SheetCursor) -> Self {
+        GoTarget {
+            cursor,
+            min_main_rows: None,
+            min_main_cols: None,
+        }
+    }
+}
+
+/// Resolve a `go to` prompt's text against a grid.
+///
+/// Accepts everything the ratatui reference's `go_to_cell` accepts, in the same
+/// order:
+///
+/// | Input                | Meaning                                        |
+/// |----------------------|------------------------------------------------|
+/// | `C12`                | main cell (row 12, column C); grows the grid   |
+/// | `C~1`, `C_1`         | a header-band / footer-band cell               |
+/// | `[A1`, `]A1`         | left/right margin mirror cell                  |
+/// | `5`                  | row 5 of the current column                    |
+/// | `C`                  | column C of the current row                    |
+///
+/// A leading `$` is a *sheet* qualifier here (as in the TUI: `$1`, `$Sheet1`,
+/// `$Sheet1:B2`), NOT a cell lock — so `$C$12` is a sheet named `C$12` and is
+/// refused, while `C$12`/`$A1` are ordinary refs.
+///
+/// Returns `Err(message)` with a user-facing reason when the text names
+/// nothing: the caller shows it as status text, so a typo is answered rather
+/// than silently ignored.
+pub fn resolve_go_target(grid: &Grid, current: SheetCursor, raw: &str) -> Result<GoTarget, String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err("Cell address required".into());
+    }
+
+    // `$`-qualified refs (`$Sheet1`, `$2:B2`, `$C$12`) go through the shared
+    // sheet-qualified parser first, exactly as the TUI does.
+    if text.starts_with('$') {
+        if let Some(t) = resolve_dollar_qualified(grid, text) {
+            return Ok(t);
+        }
+        // A `$`-qualified *cell* (`$C$12`) is also a normal `CellRef`; fall
+        // through to the ref parser below rather than failing outright.
+    }
+
+    let upper = text.to_ascii_uppercase();
+
+    // A full cell reference (`C12`, `[A1`, `]AA3`, `C~1`, `C_1`), which also
+    // covers multi-letter margin names.
+    if let Some((cref, len)) = crate::celladdr::CellRef::parse_at(&upper) {
+        if len == upper.len() {
+            if let Some(t) = go_target_from_ref(grid, cref) {
+                return Ok(t);
+            }
+            return Err(format!("Unknown cell '{text}'"));
+        }
+    }
+
+    // Bare digits: a main data row (1-based), the current column.
+    if upper.chars().all(|c| c.is_ascii_digit()) {
+        return match upper.parse::<u32>() {
+            Ok(row) if row > 0 => {
+                let row = row as usize;
+                let data_row = HEADER_ROWS + row - 1;
+                let max_row = HEADER_ROWS + grid.main_rows().saturating_sub(1);
+                if data_row > max_row {
+                    Ok(GoTarget {
+                        cursor: SheetCursor { row: data_row, col: current.col },
+                        min_main_rows: Some(row),
+                        min_main_cols: None,
+                    })
+                } else {
+                    Ok(GoTarget::plain(SheetCursor { row: data_row, col: current.col }))
+                }
+            }
+            _ => Err("Bad cell address".into()),
+        };
+    }
+
+    // A bare column fragment (`C`, `[A`, `]A`): column of the current row.
+    // A plain fragment may grow the main area; a margin fragment names a fixed
+    // margin column and must not.
+    if let Some((global_col, len)) = crate::addr::parse_ui_column_fragment(&upper, grid.main_cols()) {
+        if len == upper.len() {
+            let global_col = global_col as usize;
+            if global_col >= grid.total_cols() {
+                return Err("Bad cell address".into());
+            }
+            let can_grow = !upper.starts_with('[') && !upper.starts_with(']');
+            let mut target = GoTarget::plain(SheetCursor { row: current.row, col: global_col });
+            if can_grow && global_col >= MARGIN_COLS {
+                let main_col = global_col - MARGIN_COLS;
+                if main_col >= grid.main_cols() {
+                    target.min_main_cols = Some(main_col + 1);
+                }
+            }
+            return Ok(target);
+        }
+    }
+
+    Err("Bad cell address".into())
+}
+
+/// A `$`-qualified reference (`$Sheet1`, `$2:B2`, `$C$12`), if it parses.
+///
+/// Only the row/column parts are honoured here (a sheet selector is a
+/// navigation across sheets, which the GUI prompt does not offer); a reference
+/// that names a different sheet returns `None` so the caller reports a bad
+/// address rather than silently jumping within the wrong sheet.
+fn resolve_dollar_qualified(grid: &Grid, text: &str) -> Option<GoTarget> {
+    let upper = text.to_ascii_uppercase();
+    // `$<digits>` is a sheet id, not a cell.
+    if let Some((_id, len)) = crate::addr::parse_sheet_id_prefix_at(&upper) {
+        if len == upper.len() {
+            return None; // a bare sheet id is not a cell address
+        }
+    }
+    // `$2:B2` style ranges: take the first endpoint (the TUI's go-to lands on
+    // the start of a range).
+    let head = upper.split(':').next().unwrap_or(&upper);
+    let stripped = head.trim_start_matches('$');
+    // Re-parse the `$`-stripped remainder as a cell ref.
+    if let Some((cref, len)) = crate::celladdr::CellRef::parse_at(stripped) {
+        if len == stripped.len() {
+            return go_target_from_ref(grid, cref);
+        }
+    }
+    None
+}
+
+/// Convert a parsed [`CellRef`](crate::celladdr::CellRef) into a cursor,
+/// growing the main area when the reference names a main cell beyond it.
+fn go_target_from_ref(grid: &Grid, cref: crate::celladdr::CellRef) -> Option<GoTarget> {
+    use crate::celladdr::{ColRegion, RowRegion};
+
+    // Bounds the reference's band actually has, matching the TUI's
+    // `cell_ref_is_in_supported_bounds`.
+    match cref.row {
+        RowRegion::Header(row) => {
+            if row == 0 || row as usize > HEADER_ROWS {
+                return None;
+            }
+        }
+        RowRegion::Data(row) => {
+            if row == 0 {
+                return None;
+            }
+        }
+        RowRegion::Footer(row) => {
+            if row == 0 || row as usize > FOOTER_ROWS {
+                return None;
+            }
+        }
+    }
+
+    let mut min_main_rows = None;
+    let mut min_main_cols = None;
+    if let RowRegion::Data(row) = cref.row {
+        if row as usize > grid.main_rows() {
+            min_main_rows = Some(row as usize);
+        }
+    }
+    if let ColRegion::Data(col) = cref.col {
+        if col as usize > grid.main_cols() {
+            min_main_cols = Some(col as usize);
+        }
+    }
+
+    // Resolve against the *grown* sizes so a reference past the current edge
+    // (e.g. `D9` on a 2x2 sheet) maps to the right margin/main column.
+    let main_rows = min_main_rows.unwrap_or_else(|| grid.main_rows());
+    let main_cols = min_main_cols.unwrap_or_else(|| grid.main_cols());
+    let addr = cref.to_grid_addr(main_cols);
+    let (row, col) = crate::addr::addr_to_sheet_cursor(
+        &addr,
+        crate::addr::MainRows(main_rows),
+        crate::addr::MainCols(main_cols),
+    );
+    Some(GoTarget {
+        cursor: SheetCursor { row: row.0, col: col.0 },
+        min_main_rows,
+        min_main_cols,
+    })
 }

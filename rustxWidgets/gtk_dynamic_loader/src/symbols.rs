@@ -14,6 +14,17 @@ pub type GObjectRefSink = unsafe extern "C" fn(obj: *mut c_void) -> *mut c_void;
 pub type GSignalConnectData = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const i8, c_handler: *mut c_void, data: *mut c_void, destroy_data: Option<unsafe extern "C" fn(data: *mut c_void, closure: *mut c_void)>, connect_flags: u32) -> u64;
 pub type GSignalConnect = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const i8, c_handler: *mut c_void, data: *mut c_void) -> u64;
 pub type GSignalEmitByName = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const i8) -> u64;
+/// `g_signal_emit_by_name` for `GtkEventControllerKey::key-pressed` /
+/// `key-released`, whose C signature is (keyval, keycode, state) -> bool.
+/// The symbol itself is variadic, so the same pointer is reinterpreted with
+/// the three-argument shape rather than declared twice.
+pub type GSignalEmitKeyByName = unsafe extern "C" fn(
+    instance: *mut c_void,
+    detailed_signal: *const i8,
+    keyval: u32,
+    keycode: u32,
+    state: u32,
+) -> u64;
 
 pub type GtkWindowNew = unsafe extern "C" fn(window_type: i32) -> *mut c_void;
 pub type GtkWindowSetTitle = unsafe extern "C" fn(window: *mut c_void, title: *const i8);
@@ -231,6 +242,22 @@ pub type GtkContainerForeach =
     unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void, *mut c_void), *mut c_void);
 /// `void gtk_menu_item_activate(GtkMenuItem*)`.
 pub type GtkMenuItemActivate = unsafe extern "C" fn(*mut c_void);
+/// `gboolean gtk_widget_translate_coordinates(GtkWidget *src, GtkWidget *dest,
+/// gint src_x, gint src_y, gint *dest_x, gint *dest_y)`.
+pub type GtkWidgetTranslateCoordinates = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    i32,
+    i32,
+    *mut i32,
+    *mut i32,
+) -> i32;
+/// `GdkWindow *gtk_widget_get_window(GtkWidget*)`.
+pub type GtkWidgetGetWindow = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+/// `gint gdk_window_get_origin(GdkWindow*, gint *x, gint *y)` — window origin
+/// in root/screen coordinates.
+pub type GdkWindowGetOrigin = unsafe extern "C" fn(*mut c_void, *mut i32, *mut i32) -> i32;
+
 /// `void gtk_menu_popup(GtkMenu*, GtkWidget*, GtkWidget*, GtkMenuPositionFunc,
 /// gpointer, guint, guint32)`.
 pub type GtkMenuPopup = unsafe extern "C" fn(
@@ -600,6 +627,11 @@ pub struct Symbols {
     /// that submenu `visible=0 mapped=0` - nothing appears on screen and no
     /// error is raised. `gtk_menu_popup` on the same menu gives `1/1`.
     pub gtk_menu_popup: Option<GtkMenuPopup>,
+    /// Coordinates of a widget's top-left in screen space. Used to place a
+    /// context menu (a right-click on a sheet tab) at the pointer.
+    pub gtk_widget_translate_coordinates: Option<GtkWidgetTranslateCoordinates>,
+    pub gtk_widget_get_window: Option<GtkWidgetGetWindow>,
+    pub gdk_window_get_origin: Option<GdkWindowGetOrigin>,
     pub gtk_menu_item_activate: Option<GtkMenuItemActivate>,
     pub gtk_widget_get_next_sibling: Option<GtkWidgetGetNextSibling>,
 
@@ -940,6 +972,15 @@ impl Symbols {
         let gtk_menu_item_activate = unsafe { sym::<GtkMenuItemActivate>(gtk, "gtk_menu_item_activate") };
         let gtk_menu_popup = unsafe { sym::<GtkMenuPopup>(gtk, "gtk_menu_popup") };
         let gtk_widget_get_next_sibling = unsafe { sym::<GtkWidgetGetNextSibling>(gtk, "gtk_widget_get_next_sibling") };
+        // Screen-space placement of a context menu. `gtk_widget_get_window`
+        // and `gdk_window_get_origin` live in different libraries, like the
+        // other Gdk calls, so each is resolved with a fallback.
+        let gtk_widget_translate_coordinates =
+            unsafe { sym::<GtkWidgetTranslateCoordinates>(gtk, "gtk_widget_translate_coordinates") };
+        let gtk_widget_get_window = unsafe { sym::<GtkWidgetGetWindow>(gtk, "gtk_widget_get_window") };
+        // All three resolve from libgtk-3 (verified with nm -D): GTK3 links
+        // against GDK directly, so there is no separate libgdk to search.
+        let gdk_window_get_origin = unsafe { sym::<GdkWindowGetOrigin>(gtk, "gdk_window_get_origin") };
 
         // GtkPopoverMenuBarItem
         let gtk_popover_menu_bar_item_get_popover = unsafe { sym::<GtkPopoverMenuBarItemGetPopover>(gtk, "gtk_popover_menu_bar_item_get_popover") };
@@ -1036,6 +1077,7 @@ impl Symbols {
             gtk_widget_unparent, gtk_widget_get_parent,
             gtk_widget_get_first_child, gtk_widget_get_next_sibling,
             gtk_container_get_children, gtk_container_foreach, gtk_menu_item_activate, g_list_free, gtk_menu_item_get_submenu, gtk_widget_is_visible, gtk_menu_popup,
+            gtk_widget_translate_coordinates, gtk_widget_get_window, gdk_window_get_origin,
             gtk_popover_menu_bar_item_get_popover, gtk_popover_get_child, gtk_popover_new, gtk_popover_set_child,
             gtk_menu_button_get_label, gtk_menu_button_set_active,
             gtk_menu_button_new, gtk_menu_button_set_popover, gtk_menu_button_set_label,

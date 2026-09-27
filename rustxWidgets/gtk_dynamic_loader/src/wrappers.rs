@@ -602,6 +602,12 @@ impl Label {
             unsafe { sr(self.inner, w, h); }
         }
     }
+    pub fn set_margin_start(&self, margin: i32) {
+        guard_widget!(self, "Label", "set_margin_start");
+        if let Some(set_margin) = self.loader.symbols.gtk_widget_set_margin_start {
+            unsafe { set_margin(self.inner, margin); }
+        }
+    }
 }
 
 impl AsRef<*mut c_void> for Label { fn as_ref(&self) -> &*mut c_void { &self.inner } }
@@ -1320,6 +1326,37 @@ impl EventControllerKey {
         match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
     }
 
+    /// Connect GTK4 `GtkEventControllerKey::key-released`.
+    ///
+    /// A physical key produces BOTH a `key-pressed` and a `key-released` signal
+    /// from the same controller. A host that hooks only `key-pressed` therefore
+    /// sees some keys twice on the GTK4/WSLg versions where the release is
+    /// routed through the pressed handler. Register this to observe releases
+    /// separately (the adapter swallows them, so hosts get a pure press
+    /// stream), instead of deduping by keyval in application code.
+    pub fn connect_key_released<F: FnMut(u32, u32) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
+        guard_widget_or!(self, "EventControllerKey", "connect_key_released", Err(Error::Other("key controller dropped".into())));
+        let boxed: Box<Box<dyn FnMut(u32, u32) -> i32>> = Box::new(Box::new(f));
+        let raw = Box::into_raw(boxed) as *mut c_void;
+        unsafe { self.connect_key_released_raw(raw) }
+    }
+
+    unsafe fn connect_key_released_raw(&self, raw: *mut c_void) -> Result<u64, Error> {
+        let sig_name = std::ffi::CString::new("key-released").unwrap();
+        if let Some(gscd) = self.loader.symbols.g_signal_connect_data {
+            let handler_ptr = crate::signals::gtk_compat_trampoline_key_released as *const () as *mut c_void;
+            let destroy_ptr = Some(crate::signals::gtk_compat_destroy_notify_key_released as unsafe extern "C" fn(*mut c_void, *mut c_void));
+            let id = gscd(self.inner, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+            Ok(id)
+        } else if let Some(gsc) = self.loader.symbols.g_signal_connect {
+            let handler_ptr = crate::signals::gtk_compat_trampoline_key_released as *const () as *mut c_void;
+            let id = gsc(self.inner, sig_name.as_ptr(), handler_ptr, raw);
+            Ok(id)
+        } else {
+            Err(Error::Other("no g_signal_connect available".into()))
+        }
+    }
+
     pub fn add_to_widget(&self, widget: &impl GtkWidget) {
         guard_widget!(self, "EventControllerKey", "add_to_widget");
         if let Some(add_ctrl) = self.loader.symbols.gtk_widget_add_controller {
@@ -1336,6 +1373,33 @@ impl EventControllerKey {
         guard_widget!(self, "EventControllerKey", "set_propagation_phase");
         if let Some(f) = self.loader.symbols.gtk_event_controller_set_propagation_phase {
             unsafe { f(self.inner, 1); }
+        }
+    }
+
+    /// Emit `key-pressed`/`key-released` on this controller with a synthetic
+    /// keyval and modifier state.
+    ///
+    /// Lets a test drive the key pipeline without a real input device (and
+    /// without a compositor able to deliver synthetic keys): the adapter's
+    /// release filter and a host's key callback are both ordinary signal
+    /// handlers, so emitting the signal exercises exactly the code a physical
+    /// key would.
+    pub fn emit_key(&self, signal: &str, keyval: u32, state: u32) -> Result<u64, Error> {
+        guard_widget_or!(self, "EventControllerKey", "emit_key", Err(Error::Other("key controller dropped".into())));
+        if signal != "key-pressed" && signal != "key-released" {
+            return Err(Error::Other(format!("emit_key: unexpected signal {signal:?}")));
+        }
+        if let Some(emit) = self.loader.symbols.g_signal_emit_by_name {
+            let name = CString::new(signal).unwrap();
+            // `g_signal_emit_by_name` is variadic; the stored symbol is typed
+            // for the two-argument shape, so reinterpret it for
+            // GtkEventControllerKey's (keyval, keycode, state) signature.
+            let emit_key: crate::symbols::GSignalEmitKeyByName =
+                unsafe { std::mem::transmute(emit) };
+            let id = unsafe { emit_key(self.inner, name.as_ptr(), keyval, 0u32, state) };
+            Ok(id)
+        } else {
+            Err(Error::MissingSymbol("g_signal_emit_by_name".into()))
         }
     }
 
@@ -2183,6 +2247,88 @@ pub unsafe fn gdk_event_get_coords(loader: &Arc<Loader>, event: *mut c_void) -> 
     None
 }
 
+/// The mouse button that generated a GDK event (1 = left, 2 = middle,
+/// 3 = right). Returns `None` when the symbol or the button is unavailable.
+///
+/// This is what lets a canvas distinguish a right-click from a left-click: the
+/// GTK3 handler used to read only `gdk_event_get_coords` and return, so the
+/// button number never left the backend. Needed for LibreOffice-style sheet-tab
+/// behaviour (right-click opens the Sheet menu, left-click selects).
+pub unsafe fn gdk_event_get_button(loader: &Arc<Loader>, event: *mut c_void) -> Option<u32> {
+    type GetEventButton = unsafe extern "C" fn(*mut std::ffi::c_void, *mut u32) -> i32;
+
+    let get_button = loader.libs.get("libgdk").and_then(|gdk_lib| {
+        unsafe { gdk_lib.get::<GetEventButton>(b"gdk_event_get_button").ok().map(|s| *s) }
+    }).or_else(|| {
+        loader.libs.get("libgtk").and_then(|gtk_lib| {
+            unsafe { gtk_lib.get::<GetEventButton>(b"gdk_event_get_button").ok().map(|s| *s) }
+        })
+    });
+
+    if let Some(get_button) = get_button {
+        let mut button: u32 = 0;
+        if unsafe { get_button(event, &mut button as *mut u32) } != 0 && button != 0 {
+            return Some(button);
+        }
+    }
+    None
+}
+
+/// Keyboard/modifier state mask of a GDK event
+/// (`GdkModifierType`: bit 0 = Shift, bit 2 = Control, bit 3 = Alt).
+///
+/// `None` when unavailable, so callers treat "unknown" as "no modifiers"
+/// rather than inventing one.
+pub unsafe fn gdk_event_get_state(loader: &Arc<Loader>, event: *mut c_void) -> Option<u32> {
+    type GetState =
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::os::raw::c_int) -> i32;
+
+    let get_state = loader.libs.get("libgdk").and_then(|gdk_lib| {
+        // GTK3's gdk_event_get_state returns void and fills the out-param;
+        // treat a successful call as "we have it" and ignore the return.
+        unsafe { gdk_lib.get::<GetState>(b"gdk_event_get_state").ok().map(|s| *s) }
+    }).or_else(|| {
+        loader.libs.get("libgtk").and_then(|gtk_lib| {
+            unsafe { gtk_lib.get::<GetState>(b"gdk_event_get_state").ok().map(|s| *s) }
+        })
+    });
+
+    if let Some(get_state) = get_state {
+        let mut state: std::os::raw::c_int = 0;
+        unsafe { get_state(event, &mut state as *mut std::os::raw::c_int) };
+        return Some(state as u32);
+    }
+    None
+}
+
+/// Screen-space origin of `widget`'s top-left corner, as `(x, y)`.
+///
+/// Needed to turn a widget-relative click position (what GTK hands an event
+/// handler) into the root coordinates `gtk_menu_popup` positions a context menu
+/// with. Returns `None` when the widget is not yet realized (no `GdkWindow`) or
+/// the symbols are missing, so a caller can fall back to an unpositioned popup
+/// instead of guessing an origin.
+pub unsafe fn widget_screen_origin(loader: &Arc<Loader>, widget: *mut c_void) -> Option<(i32, i32)> {
+    let get_window = loader.symbols.gtk_widget_get_window?;
+    let get_origin = loader.symbols.gdk_window_get_origin?;
+    // gtk_widget_translate_coordinates is not used directly: the widget's own
+    // GdkWindow already reports its origin in root coordinates, which is
+    // exactly the space gtk_menu_popup wants. Translating to the toplevel and
+    // adding the frame extents would be a second, more fragile route to the
+    // same number.
+    let window = unsafe { get_window(widget) };
+    if window.is_null() {
+        return None;
+    }
+    let mut x: i32 = 0;
+    let mut y: i32 = 0;
+    let ok = unsafe { get_origin(window, &mut x as *mut i32, &mut y as *mut i32) };
+    if ok == 0 {
+        return None;
+    }
+    Some((x, y))
+}
+
 /// Destroy a widget (remove from parent) and release the reference held by
 /// [`take_ownership`] (via `g_object_ref_sink`).  Without the extra unref the
 /// widget is never freed and a later reuse of the pointer causes a segfault.
@@ -2690,6 +2836,149 @@ impl MenuBar {
             }
             unsafe { activate(child) };
             true
+        }
+    }
+
+    /// Open the submenu for the top-level menu whose mnemonic is `keyval`,
+    /// with its top-left corner at the given **screen** coordinates.
+    ///
+    /// This is what makes a right-click on a sheet tab behave like LibreOffice
+    /// Calc: the Sheet menu appears under the pointer instead of under the menu
+    /// bar's Sheet button. `activate_submenu_by_mnemonic` is the same open
+    /// action without a position, and stays the one the keyboard/movie paths
+    /// use.
+    ///
+    /// Positioning is GTK3-only. GTK3's `gtk_menu_popup` takes a
+    /// `GtkMenuPositionFunc` that GTK calls to ask "where should I go?"; GTK4's
+    /// `GtkPopoverMenuBar` has no equivalent hook on this path, so on GTK4 this
+    /// degrades to an unpositioned popup rather than failing.
+    pub fn popup_submenu_by_mnemonic_at(&self, keyval: u32, screen_x: i32, screen_y: i32) -> bool {
+        if self.loader.version != crate::loader::Version::Gtk3 {
+            return self.activate_submenu_by_mnemonic(keyval);
+        }
+        let symbols = &self.loader.symbols;
+        let key_upper = char::from_u32(keyval)
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('\0');
+        let &idx = match self.mnemonic_index.get(&key_upper) {
+            Some(i) => i,
+            None => return false,
+        };
+        let child = match self.gtk3_bar_child(idx) {
+            Some(c) => c,
+            None => return false,
+        };
+        let submenu = symbols
+            .gtk_menu_item_get_submenu
+            .map(|f| unsafe { f(child) })
+            .unwrap_or(std::ptr::null_mut());
+        if submenu.is_null() {
+            return false;
+        }
+        if let Some(show_all) = symbols.gtk_widget_show_all {
+            unsafe { show_all(submenu) };
+        }
+        let Some(popup) = symbols.gtk_menu_popup else { return false };
+
+        // The position function is invoked by GTK while it lays the menu out.
+        // `data` carries the requested corner; the callback must not unwind,
+        // so every failure path just leaves the coordinates untouched.
+        struct Wanted { x: i32, y: i32 }
+        unsafe extern "C" fn place(
+            menu: *mut c_void,
+            x: *mut i32,
+            y: *mut i32,
+            _push_in: *mut i32,
+            data: *mut c_void,
+        ) {
+            if data.is_null() {
+                return;
+            }
+            let w = unsafe { &*(data as *const Wanted) };
+            // Clamp so the menu is never asked to draw off the top-left; the
+            // bottom-right overflow is GTK's problem (it repositions).
+            if !x.is_null() {
+                unsafe { *x = w.x.max(0) };
+            }
+            if !y.is_null() {
+                unsafe { *y = w.y.max(0) };
+            }
+            let _ = menu;
+        }
+
+        // GTK does not call the position function during `gtk_menu_popup`; it
+        // calls it later, while positioning the menu. The data pointer must
+        // therefore stay valid until then, which a stack local would not
+        // promise — the menu was unclickable when this was a local, because the
+        // callback read a stale frame. A boxed value is handed to GTK and
+        // reclaimed by the menu's `destroy` signal, so it lives exactly as long
+        // as the menu that references it.
+        let wanted = Box::into_raw(Box::new(Wanted { x: screen_x, y: screen_y }));
+        unsafe extern "C" fn free_wanted(data: *mut c_void, _closure: *mut c_void) {
+            if !data.is_null() {
+                drop(unsafe { Box::from_raw(data as *mut Wanted) });
+            }
+        }
+        if let Some(connect) = symbols.g_signal_connect_data {
+            // Reclaim the box when the menu dies; without this the box leaks
+            // once per context-menu open. The destroy notifier runs with the
+            // data pointer, which is exactly the allocation to free.
+            let sig = CString::new("destroy").unwrap();
+            unsafe {
+                connect(
+                    submenu,
+                    sig.as_ptr(),
+                    free_wanted as *const () as *mut c_void,
+                    wanted as *mut c_void,
+                    Some(free_wanted),
+                    0,
+                );
+            }
+        }
+        unsafe {
+            popup(
+                submenu,
+                std::ptr::null_mut(),
+                child,
+                place as *mut c_void,
+                wanted as *mut c_void,
+                0,
+                gtk_current_time_ok(),
+            );
+        }
+        true
+    }
+
+    /// The `idx`-th direct child of a GTK3 menu bar, or `None`.
+    fn gtk3_bar_child(&self, idx: usize) -> Option<*mut c_void> {
+        if self.loader.version != crate::loader::Version::Gtk3 {
+            return None;
+        }
+        let symbols = &self.loader.symbols;
+        let get_children = symbols.gtk_container_get_children?;
+        let free_list = symbols.g_list_free;
+        let list = unsafe { get_children(self.inner) } as *mut crate::symbols::GListC;
+        if list.is_null() {
+            return None;
+        }
+        let mut node = list;
+        let mut i = 0usize;
+        while !node.is_null() && i < idx {
+            node = unsafe { (*node).next };
+            i += 1;
+        }
+        let child = if node.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { (*node).data }
+        };
+        if let Some(free) = free_list {
+            unsafe { free(list) };
+        }
+        if child.is_null() {
+            None
+        } else {
+            Some(child)
         }
     }
 

@@ -145,6 +145,52 @@ Sort order uses Excel-style main-column letters.
 | `Q` | Confirm quit | Quit prompt only |
 | `B`, `Esc` | Cancel quit prompt | Quit prompt only |
 
+## Mouse (opt-in)
+
+The pancurses (terminal) backend can report pointer input, but **mouse capture
+is off by default**: turning it on makes the terminal swallow drag events and
+breaks its native text selection, so the application must ask for it.
+
+| Gesture | Action |
+| --- | --- |
+| Click a cell | Moves the cursor to that cell (commits an in-progress edit first, like `Enter`) |
+| Click a row label | Selects that row's margin cell |
+| Click a column header | Selects the first row of that column |
+| Wheel up / down | Scrolls the focused grid by three rows |
+| Click a button | Activates it (`OK`, `Apply`, …) |
+| Click a checkbox / radio | Toggles it (radio selection follows its group) |
+| Click a text field | Focuses it |
+
+Enabling it (host application code):
+
+```rust
+use rswidgets::backends::pancurses::{set_mouse_enabled, set_mouse_hook};
+
+set_mouse_enabled(true);                 // opt in
+set_mouse_hook(Some(Box::new(|ev| {      // optional: observe raw events
+    eprintln!("{:?} at {},{}", ev.action, ev.x, ev.y);
+    false                                // true = consume, skip default handling
+})));
+```
+
+`set_mouse_enabled(false)` restores the terminal's own selection behavior.
+
+### The same API on every backend
+
+A widget's pointer API is identical whether it is a terminal canvas or a GTK
+one — the terminal simply converts its cell hit into the pixel coordinates
+`DrawContext` uses, so a host's click math never branches on backend:
+
+```rust
+canvas.on_click(|x, y| { /* pixel coordinates */ });
+canvas.on_click_button(|x, y, button, state| { /* button 1 = primary */ });
+canvas.on_motion(|x, y, button| { /* button 0 = hover */ });
+```
+
+On GTK these become real GTK signals; on pancurses they are invoked from the
+decoded mouse event once the app enables capture. `on_click_button` takes
+precedence when both are registered (as on GTK, where they share one signal).
+
 ## Common Spreadsheet Shortcuts
 
 These are common spreadsheet keys from Excel and Google Sheets.
@@ -173,3 +219,20 @@ They are documented here as the preferred long-term direction, but they are not 
 | Undo | Replays the inverse op as a new log entry when a file is open |
 | Clipboard fallback | Blank export filename copies to clipboard when a clipboard tool is available |
 | Menu mode | Internal command-menu state; Alt accelerators jump straight to actions |
+
+## Night mode
+
+`Format ▸ Night mode` (mnemonic **K**; root shortcut `Alt+R`) flips the GUI
+between the light and dark palettes. It is a per-session *display* setting: it
+records no op, appears in no undo stack, and is not written to the document
+log, so it never travels with a `.corro` file.
+
+To start a session in the dark palette, set the environment before launch:
+
+```
+CORRO_NIGHT_MODE=1 corro sheet.corro     # or =true
+```
+
+The terminal frontends (ratatui, pancurses) paint with the terminal's own
+palette, so the menu item reports its state there but the visible change comes
+from your terminal's theme rather than from corro.

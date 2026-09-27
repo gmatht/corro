@@ -1,3 +1,6 @@
+// Win95/rust9x custom target_family gates are intentional
+#![cfg_attr(windows, allow(unexpected_cfgs))]
+
 #[cfg(windows)]
 mod nwg_adapter {
     use native_windows_gui as nwg;
@@ -490,7 +493,39 @@ mod nwg_adapter {
             std::mem::forget(cb);
             Ok(())
         }
-        pub fn queue_redraw(&self) {}
+        /// Repaint the toplevel AND its children.
+        ///
+        /// corro repaints a cursor move by calling `canvas.queue_redraw()`
+        /// then `window.queue_redraw()`. On Win32 the canvas is a child
+        /// window, and `Canvas::queue_redraw`'s bare `InvalidateRect` only
+        /// marks its update region — nothing pumps the child to completion,
+        /// and a child gets `WM_PAINT` when its *parent* paints. With no
+        /// cascade here, every arrow press moved the cursor in state while
+        /// the grid kept showing the old highlight for the whole time the
+        /// key was held, then caught up on the next full-window repaint.
+        ///
+        /// `RDW_UPDATENOW` paints immediately rather than deferring, so each
+        /// auto-repeat press is visible on its own; `RDW_ALLCHILDREN` carries
+        /// the repaint down to the canvas.
+        pub fn queue_redraw(&self) {
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                if hwnd.is_null() {
+                    return;
+                }
+                unsafe {
+                    winapi::um::winuser::RedrawWindow(
+                        hwnd as _,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        winapi::um::winuser::RDW_INVALIDATE
+                            | winapi::um::winuser::RDW_UPDATENOW
+                            | winapi::um::winuser::RDW_ERASE
+                            | winapi::um::winuser::RDW_ALLCHILDREN
+                            | winapi::um::winuser::RDW_FRAME,
+                    );
+                }
+            }
+        }
         pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
         pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) {
             *self.event_key_cb.borrow_mut() = Some(cb);
@@ -698,7 +733,7 @@ mod nwg_adapter {
                     winapi::um::winuser::SetWindowPos(
                         hwnd as _,
                         std::ptr::null_mut(), 0, 0, w, h,
-                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_SHOWWINDOW,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
                     );
                 }
             }
@@ -791,9 +826,55 @@ mod nwg_adapter {
         pub(crate) inner: Rc<nwg::Label>,
         // Stable hwnd snapshot for AsRef (see Window).
         hwnd: *mut c_void,
+        /// Set by `set_fixed_width`. A fixed label keeps this width through
+        /// every `set_text`, so a changing value can never reflow the siblings
+        /// packed after it. `None` keeps the shrink-to-fit behaviour.
+        fixed_w: Rc<std::cell::Cell<Option<i32>>>,
     }
 
     impl Label {
+        /// Pin this label's laid-out width.
+        ///
+        /// A plain Win32 STATIC auto-sizes to its text, and `set_text` posts a
+        /// `WM_SIZE` to the parent box so the parent re-fits it — so a label
+        /// whose *content* changes (an address that goes from `A1` to `A100`)
+        /// grows or shrinks and shifts every sibling packed after it. Pinning
+        /// the width makes the label's slot stable instead. Fixing a width
+        /// that is too narrow only clips the text, so pick the widest value
+        /// the field can ever need.
+        pub fn set_fixed_width(&self, w: Option<i32>) {
+            self.fixed_w.set(w);
+            self.apply_fixed_width();
+        }
+
+        /// Re-assert the pinned width on the widget.
+        ///
+        /// `SetWindowText` makes a STATIC resize itself, so the pin has to be
+        /// pushed back after every write, and the parent box has to re-run its
+        /// layout to place the (now constant) width.
+        fn apply_fixed_width(&self) {
+            let Some(w) = self.fixed_w.get() else { return };
+            let Some(hwnd) = self.inner.handle.hwnd() else { return };
+            unsafe {
+                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                if winapi::um::winuser::GetClientRect(hwnd as _, &mut rect) != 0 {
+                    let h = rect.bottom - rect.top;
+                    winapi::um::winuser::SetWindowPos(
+                        hwnd as _, std::ptr::null_mut(), 0, 0, w, h,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
+                    );
+                }
+                let parent = winapi::um::winuser::GetParent(hwnd as _);
+                if !parent.is_null() {
+                    let mut prect: winapi::shared::windef::RECT = std::mem::zeroed();
+                    winapi::um::winuser::GetClientRect(parent, &mut prect);
+                    let l = (((prect.bottom & 0xFFFF) << 16) | (prect.right & 0xFFFF)) as isize;
+                    winapi::um::winuser::PostMessageW(
+                        parent, winapi::um::winuser::WM_SIZE, 0, l as _);
+                }
+            }
+        }
+
         pub fn set_text(&self, text: &str) {
             self.inner.set_text(text);
             // Nudge the parent to re-run its layout (if it has a WM_SIZE
@@ -801,6 +882,13 @@ mod nwg_adapter {
             // from text at layout time, so a text change must re-layout
             // to keep the label fitted (parity with GTK auto-sizing).
             // Harmless when the parent has no such handler.
+            //
+            // A fixed-width label must NOT re-fit: that is the whole point of
+            // pinning it, so its siblings stay put as the text changes.
+            if self.fixed_w.get().is_some() {
+                self.apply_fixed_width();
+                return;
+            }
             if let Some(hwnd) = self.inner.handle.hwnd() {
                 unsafe {
                     let parent = winapi::um::winuser::GetParent(hwnd as _);
@@ -817,6 +905,27 @@ mod nwg_adapter {
         pub fn get_text(&self) -> Option<String> { Some(self.inner.text()) }
         pub fn set_visible(&self, visible: bool) { self.inner.set_visible(visible); }
         pub fn set_markup(&self, markup: &str) { self.inner.set_text(markup); }
+        /// Set the x alignment of the label's text (0.0 left .. 1.0 right).
+        /// Win32 STATIC uses SS_CENTER/SS_RIGHT rather than a float, so map
+        /// the three ranges onto those styles.
+        pub fn set_xalign(&self, x: f32) {
+            const SS_LEFT: u32 = 0x0000;
+            const SS_CENTER: u32 = 0x0001;
+            const SS_RIGHT: u32 = 0x0002;
+            // SS_CENTER/SS_RIGHT are type bits (0..2), not the 0x1F mask.
+            const TYPE_MASK: u32 = 0x1F;
+            let style = if x < 1.0 / 3.0 { SS_LEFT } else if x < 2.0 / 3.0 { SS_CENTER } else { SS_RIGHT };
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                unsafe {
+                    let cur = winapi::um::winuser::GetWindowLongW(hwnd as _, winapi::um::winuser::GWL_STYLE) as u32;
+                    winapi::um::winuser::SetWindowLongW(
+                        hwnd as _,
+                        winapi::um::winuser::GWL_STYLE,
+                        ((cur & !TYPE_MASK) | style) as i32,
+                    );
+                }
+            }
+        }
         pub fn set_margin_start(&self, _px: i32) {}
         pub fn set_margin_top(&self, _px: i32) {}
         pub fn set_halign(&self, _align: i32) {}
@@ -841,7 +950,7 @@ mod nwg_adapter {
     pub fn create_label(parent: *mut c_void) -> Result<Label, Error> {
         crate::backends::nwg::create_label(parent).map(|l| {
             let hwnd = l.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void;
-            Label { inner: Rc::new(l), hwnd }
+            Label { inner: Rc::new(l), hwnd, fixed_w: Rc::new(std::cell::Cell::new(None)) }
         }).map_err(|e| Error::Backend(format!("{}", e)))
     }
 
@@ -984,6 +1093,12 @@ mod nwg_adapter {
                 }
             };
             let mut desired_sizes: Vec<i32> = Vec::with_capacity(n);
+            // Children that were deliberately hidden (set_visible(false)).
+            // `set_window_pos` below passes SWP_SHOWWINDOW for every child,
+            // so a hidden child would be resurrected by the very layout pass
+            // that is meant to honour the hide. Remember them and re-hide
+            // after positioning.
+            let mut hidden_children: Vec<*mut c_void> = Vec::new();
             for i in 0..n {
                 // Hidden children take no space (e.g. the sheet tab strip
                 // with a single sheet): hiding alone would otherwise leave
@@ -993,6 +1108,7 @@ mod nwg_adapter {
                 };
                 if hidden {
                     desired_sizes.push(0);
+                    hidden_children.push(children[i]);
                     continue;
                 }
                 let is_expand = match self.orientation {
@@ -1090,6 +1206,16 @@ mod nwg_adapter {
                             l as _,
                         );
                     }
+                }
+            }
+            // Re-hide the children that were hidden on entry: the
+            // SWP_SHOWWINDOW in `set_window_pos` above showed them again.
+            for &child in &hidden_children {
+                unsafe {
+                    winapi::um::winuser::ShowWindow(
+                        child as _,
+                        winapi::um::winuser::SW_HIDE,
+                    );
                 }
             }
         }
@@ -1312,7 +1438,7 @@ mod nwg_adapter {
                         let h = rect.bottom - rect.top;
                         winapi::um::winuser::SetWindowPos(
                             hwnd as _, std::ptr::null_mut(), 0, 0, n * 8, h,
-                            winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_SHOWWINDOW,
+                            winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
                         );
                     }
                 }
@@ -1323,7 +1449,7 @@ mod nwg_adapter {
                 unsafe {
                     winapi::um::winuser::SetWindowPos(
                         hwnd as _, std::ptr::null_mut(), 0, 0, w, h,
-                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_SHOWWINDOW,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
                     );
                 }
             }
@@ -2306,7 +2432,7 @@ mod nwg_adapter {
                     winapi::um::winuser::SetWindowPos(
                         self.hwnd as _,
                         std::ptr::null_mut(), 0, 0, w, h,
-                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_SHOWWINDOW,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
                     );
                 }
             }
@@ -2323,6 +2449,35 @@ mod nwg_adapter {
             }
         }
         pub fn set_content_size(&self, _w: i32, _h: i32) {}
+        /// Button/modifier-aware click. See the GTK backend's
+        /// `on_click_button`: added alongside `on_click` so the signature change
+        /// does not ripple through every backend, and so a backend that cannot
+        /// report a button (a terminal, which has the plain `on_click`) stays
+        /// compilable. The NWG canvas currently maps only the plain contract.
+        pub fn on_click_button(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            // NWG/Win32: button and motion are not plumbed through this path yet.
+        }
+
+        /// Pointer motion over the canvas; see the GTK backend's `on_motion`.
+        /// The NWG canvas currently reports presses only.
+        pub fn on_motion(&self, _cb: Box<dyn FnMut(f64, f64, u32)>) {
+            // NWG/Win32: button and motion are not plumbed through this path yet.
+        }
+
+        /// Pointer release; see the GTK backend's `on_release`.
+        pub fn on_release(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            // NWG/Win32: button and motion are not plumbed through this path yet.
+        }
+
+        /// This canvas's top-left in screen coordinates, or `None`.
+        ///
+        /// Not implemented for the NWG backend: the caller then opens a context
+        /// menu unpositioned instead of guessing an origin. See the GTK
+        /// backend's `screen_origin`.
+        pub fn screen_origin(&self) -> Option<(i32, i32)> {
+            None
+        }
+
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
             *self.click_cb.borrow_mut() = Some(cb);
         }
@@ -2462,6 +2617,26 @@ mod nwg_adapter {
                                     let bmp = winapi::um::wingdi::CreateCompatibleBitmap(hdc, w, h);
                                     if !bmp.is_null() {
                                         let old = winapi::um::wingdi::SelectObject(mem_dc, bmp as _);
+                                        // Paint the buffer with a neutral
+                                        // chrome colour before the callback
+                                        // runs. CreateCompatibleBitmap hands
+                                        // back uninitialised memory (black on
+                                        // Win9x), so a callback that draws
+                                        // nothing — or returns early because
+                                        // the widget has nothing to show —
+                                        // would BitBlt that garbage onto the
+                                        // window as a black band.
+                                        {
+                                            let color = winapi::um::wingdi::RGB(240, 240, 240);
+                                            let brush = winapi::um::wingdi::CreateSolidBrush(color);
+                                            if !brush.is_null() {
+                                                let mut rect = winapi::shared::windef::RECT {
+                                                    left: 0, top: 0, right: w, bottom: h,
+                                                };
+                                                winapi::um::winuser::FillRect(mem_dc, &mut rect, brush);
+                                                winapi::um::wingdi::DeleteObject(brush as _);
+                                            }
+                                        }
                                         if let Some(ref mut draw_fn) = *cb.borrow_mut() {
                                             let mut ctx = NwgDrawContext { hdc: mem_dc, w, h };
                                             draw_fn(&mut ctx, w, h);
@@ -2589,7 +2764,7 @@ mod nwg_adapter {
                     winapi::um::winuser::SetWindowPos(
                         self.hwnd as _,
                         std::ptr::null_mut(), 0, 0, w, h,
-                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_SHOWWINDOW,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
                     );
                 }
             }
@@ -2973,6 +3148,15 @@ mod nwg_adapter {
         pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool {
             false
         }
+        /// Open the submenu whose mnemonic is `keyval` at a screen position.
+        ///
+        /// The NWG backend builds real Win32 menus but exposes no programmatic
+        /// popup-at-position call, so this reports "not opened" rather than
+        /// pretending: the caller shows an "unavailable" status. `activate_submenu_by_mnemonic`
+        /// above is already a no-op on this backend for the same reason.
+        pub fn popup_submenu_by_mnemonic_at(&self, _keyval: u32, _x: i32, _y: i32) -> bool {
+            false
+        }
         pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool {
             false
         }
@@ -3290,6 +3474,49 @@ mod nwg_adapter {
             enum_cb(root as _, &mut ctx as *mut Ctx as _);
             winapi::um::winuser::EnumChildWindows(root as _, Some(enum_cb), &mut ctx as *mut Ctx as _);
             let _ = std::fs::write(path, ctx.lines.join("\n") + "\n");
+        }
+    }
+    #[cfg(test)]
+    mod window_redraw_tests {
+        /// `Window::queue_redraw` must cascade to every child, not just
+        /// invalidate the frame.
+        ///
+        /// corro's `update_state_cursor` repaints a cursor move by calling
+        /// BOTH `canvas.queue_redraw()` and `window.queue_redraw()`, and the
+        /// comment there names this exact symptom: "a canvas-only queue_draw
+        /// may not trigger the toplevel's frame clock ... leaving pure cursor
+        /// moves invisible — the state advances but the grid keeps showing the
+        /// old highlight."
+        ///
+        /// On Win32 that means: `Canvas::queue_redraw` only calls
+        /// `InvalidateRect`, which marks the update region and returns — the
+        /// canvas is a child window, and nothing there pumps it to
+        /// completion. Windows sends `WM_PAINT` for a child when the parent
+        /// paints, so a cursor move stayed invisible for the whole time a key
+        /// was held and only caught up when the next full-window repaint
+        /// arrived (which is why it looked like "nothing moves, then one
+        /// jump"). The window cascade has to `RedrawWindow` the parent with
+        /// `RDW_ALLCHILDREN` so the child actually repaints.
+        #[test]
+        fn window_queue_redraw_cascades_to_children() {
+            let src = include_str!("backends_nwg_adapter.rs");
+            // Split so this literal does not match itself: the test file
+            // contains the very text it searches for.
+            let noop = concat!("pub fn queue_redraw(&self) ", "{}");
+            if let Some(start) = src.find(noop) {
+                panic!(
+                    "Window::queue_redraw is an empty no-op at byte {start}: cursor moves \
+                     call it expecting a toplevel repaint, but nothing is invalidated, so a \
+                     held arrow key updates state without ever repainting. It must \
+                     RedrawWindow the parent with RDW_ALLCHILDREN."
+                );
+            }
+            // And the cascade it promises must actually be present.
+            assert!(
+                src.contains("RDW_ALLCHILDREN"),
+                "Window::queue_redraw must cascade with RDW_ALLCHILDREN so the canvas \
+                 child window repaints too"
+            );
         }
     }
 }

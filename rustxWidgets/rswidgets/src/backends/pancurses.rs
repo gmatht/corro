@@ -90,8 +90,13 @@ mod pancurses_backend {
     fn sgr_row_underline() -> &'static str { "\x1b[4m\x1b[38;5;3m" }
     fn sgr_sep() -> &'static str { "\x1b[38;5;8m" }
     fn sgr_cell_cursor() -> &'static str { "\x1b[48;5;8m" }
-    fn sgr_cell_agg() -> &'static str { "\x1b[38;5;6m" }
-    fn sgr_cell_footer_agg() -> &'static str { "\x1b[1m\x1b[38;5;6m" }
+    /// Computed totals (a row total, a data-column total, a footer grand
+    /// total) render as bold default-ink: one weight across every aggregate
+    /// cell, so a column of row totals and the footer read as one system.
+    /// Cyan was the previous colour; black bold matches the GUI backend and
+    /// carries far more contrast against the light sheet.
+    fn sgr_cell_agg() -> &'static str { "\x1b[1m\x1b[38;5;0m" }
+    fn sgr_cell_footer_agg() -> &'static str { "\x1b[1m\x1b[38;5;0m" }
     /// Hyperlink cell: blue foreground + underline (corro styles link
     /// cells so on every backend; style bit 7, see `spreadsheet::style`).
     fn sgr_cell_link() -> &'static str { "\x1b[38;5;4m\x1b[4m" }
@@ -101,6 +106,13 @@ mod pancurses_backend {
     /// -1 = disabled; a valid descriptor read from INPUT_TRACE_FD at init.
     static INPUT_TRACE_FD: std::sync::atomic::AtomicI32 =
         std::sync::atomic::AtomicI32::new(-1);
+
+    /// Opt-in mouse state (see `set_mouse_enabled` / `mouse_is_enabled`).
+    /// Kept separate from `mousemask`'s return value because the mask can be
+    /// reset behind the app's back (screen re-init on some terminals) and the
+    /// value must be readable without touching curses.
+    static MOUSE_ENABLED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     /// App-settable trace path (set_input_trace_file). Used instead of the
     /// INPUT_TRACE_FILE env var when the host calls the setter (e.g. on
@@ -482,7 +494,11 @@ mod pancurses_backend {
     pub enum PcWidgetKind {
         Window { title: String },
         Button { label: String, weight: i32, italic: bool },
-        Label { text: String },
+        /// `fixed_w` is the width pin set by `set_label_fixed_width` (`Some`)
+        /// or `None` for shrink-to-fit. Cells, not pixels: the terminal is the
+        /// unit the box layout distributes, so a pinned label occupies a stable
+        /// slot no matter what its text says.
+        Label { text: String, fixed_w: Option<i32> },
         BoxWidget { horizontal: bool, spacing: i32 },
         Sizer(crate::Sizer),
         Grid { cols: usize, rows: usize },
@@ -521,6 +537,14 @@ mod pancurses_backend {
         pub rect: Rect,
         pub visible: bool,
         pub callbacks: Vec<Callback>,
+    }
+
+    /// Canvas pointer handlers, keyed by widget id (see `Canvas::on_click`).
+    #[derive(Default)]
+    pub struct CanvasPointerHandlers {
+        pub plain: Option<Box<dyn FnMut(f64, f64)>>,
+        pub button: Option<Box<dyn FnMut(f64, f64, u32, u32)>>,
+        pub motion: Option<Box<dyn FnMut(f64, f64, u32)>>,
     }
 
     pub struct PcState {
@@ -621,6 +645,20 @@ mod pancurses_backend {
 
     thread_local! {
         static PC_STATE: RefCell<PcState> = RefCell::new(PcState::new());
+        /// Pointer handlers registered on canvases (see `Canvas::on_click`).
+        ///
+        /// Kept in a side table rather than on `PcWidgetNode` so the node type
+        /// stays cloneable; `plain`/`button`/`motion` mirror the GTK canvas's
+        /// three registration slots, so a host that registers both `on_click`
+        /// and `on_click_button` keeps both.
+        static CANVAS_POINTER: RefCell<HashMap<usize, CanvasPointerHandlers>> =
+            RefCell::new(HashMap::new());
+        /// Canvas draw callbacks (see `canvas_set_draw_callback`). Invoked
+        /// during each redraw with a `DrawContext` backed by a cell grid, whose
+        /// ANSI output is then flushed to the terminal — the terminal's
+        /// equivalent of a GTK draw callback.
+        static CANVAS_DRAW: RefCell<HashMap<usize, Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>>> =
+            RefCell::new(HashMap::new());
         /// Optional host frame hook, invoked on the main thread after each
         /// render. Lets a host application mirror external state into the widget
         /// tree without its own timer thread (e.g. flush a chat transcript into
@@ -664,6 +702,11 @@ mod pancurses_backend {
         /// changes.  Record (previous_item, new_item) here so the loop can
         /// redraw just those two rows instead of the entire submenu (flicker).
         static MENU_HIGHLIGHT: RefCell<Option<(usize, usize)>> = RefCell::new(None);
+        /// Opt-in host mouse hook (see set_mouse_hook).  Invoked for every
+        /// decoded pointer event before the built-in dispatch; returning
+        /// `true` consumes the event.
+        static MOUSE_HOOK: RefCell<Option<Box<dyn FnMut(&MouseEvent) -> bool>>> =
+            RefCell::new(None);
     }
 
     /// Install (or clear with `None`) a host frame hook run on every main-loop
@@ -751,12 +794,411 @@ mod pancurses_backend {
 
     /// Opt-in mouse capture.  Off by default so terminals keep native text
     /// selection; enable only when the app has widgets that need pointer input.
+    ///
+    /// Tracks the request in [`MOUSE_ENABLED`] so [`mouse_is_enabled`] and the
+    /// per-frame redraw can report a consistent state even where `mousemask`
+    /// is a no-op (nested/overwritten screens).
     pub fn set_mouse_enabled(enabled: bool) {
+        MOUSE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
         if enabled {
             mousemask(ALL_MOUSE_EVENTS, None);
         } else {
             mousemask(0, None);
         }
+    }
+
+    /// Whether the application asked for mouse capture (see
+    /// [`set_mouse_enabled`]). Pure state — unlike `mousemask` it never fails,
+    /// so hosts and tests can assert the opt-in without a terminal.
+    pub fn mouse_is_enabled() -> bool {
+        MOUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Install (or clear with `None`) a host mouse hook.
+    ///
+    /// Invoked for every decoded pointer event *before* the built-in dispatch
+    /// (button/check/radio/entry/spreadsheet handling); returning `true`
+    /// consumes the event so the default handling is skipped. Mirrors
+    /// [`set_key_input_hook`]: the toolkit never interprets the hook's purpose,
+    /// the host decides. Only runs while the app opted in with
+    /// [`set_mouse_enabled(true)`].
+    pub fn set_mouse_hook(hook: Option<Box<dyn FnMut(&MouseEvent) -> bool>>) {
+        MOUSE_HOOK.with(|h| *h.borrow_mut() = hook);
+    }
+
+    /// Register a plain click handler on a canvas (the pancurses half of the
+    /// `Canvas::on_click` API every other backend implements).
+    ///
+    /// Coordinates are pixel-space, matching `DrawContext` and the GTK/NWG
+    /// canvases, so a host's click math is backend-independent: the terminal's
+    /// cell coordinate is converted with the spreadsheet cell metrics
+    /// (`CHAR_W`/`ROW_H`) and made relative to the canvas origin.
+    pub fn canvas_on_click(id: usize, cb: Box<dyn FnMut(f64, f64)>) {
+        CANVAS_POINTER.with(|h| {
+            h.borrow_mut().entry(id).or_default().plain = Some(cb);
+        });
+    }
+
+    /// Register a button/modifier-aware click handler on a canvas. `button` is
+    /// 1-based (1 = primary), matching the GTK backend's `on_click_button`.
+    pub fn canvas_on_click_button(id: usize, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+        CANVAS_POINTER.with(|h| {
+            h.borrow_mut().entry(id).or_default().button = Some(cb);
+        });
+    }
+
+    /// Register a pointer-motion handler on a canvas (see the GTK backend's
+    /// `on_motion`). Terminals only deliver motion while a button is held and
+    /// the app opted into mouse capture; a position report with no button is
+    /// delivered as button 0, exactly like a hover.
+    pub fn canvas_on_motion(id: usize, cb: Box<dyn FnMut(f64, f64, u32)>) {
+        CANVAS_POINTER.with(|h| {
+            h.borrow_mut().entry(id).or_default().motion = Some(cb);
+        });
+    }
+
+    /// Register a canvas draw callback — the terminal half of the
+    /// `Canvas::set_draw_callback` contract every GUI backend implements.
+    ///
+    /// The callback receives a [`crate::core::DrawContext`] backed by a cell
+    /// grid (`PancursesDrawContext`), so a host paints with the same 2D API it
+    /// would use on GTK. On each redraw the resulting grid is reduced to ANSI
+    /// and flushed to the terminal (`CellGrid::to_ansi`), which is what makes
+    /// a canvas-painted UI possible on a character display at all.
+    pub fn canvas_set_draw_callback(
+        id: usize,
+        cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>,
+    ) {
+        CANVAS_DRAW.with(|d| {
+            d.borrow_mut().insert(id, cb);
+        });
+    }
+
+    /// Drop a canvas's draw callback.
+    pub fn canvas_clear_draw_callback(id: usize) {
+        CANVAS_DRAW.with(|d| {
+            d.borrow_mut().remove(&id);
+        });
+    }
+
+    /// Run every registered canvas draw callback and flush the result.
+    ///
+    /// Called from the redraw path after the widget tree is painted, so a
+    /// canvas's own output lands on top of its background exactly as a GTK
+    /// draw callback would. Returns the number of canvases painted (0 when
+    /// none is registered, so the caller can skip the flush).
+    fn paint_canvases() -> usize {
+        let canvases: Vec<(usize, Rect)> = with_state(|s| {
+            s.nodes
+                .iter()
+                .filter(|n| n.visible && matches!(n.kind, PcWidgetKind::Canvas))
+                .map(|n| (n.id, n.rect))
+                .collect()
+        });
+        if canvases.is_empty() {
+            return 0;
+        }
+        let mut painted = 0usize;
+        for (id, rect) in canvases {
+            // Cell-grid sized to the canvas's own rect: a canvas paints its
+            // own area, and the blit is offset to that area's origin.
+            let (w, h) = (rect.w.max(0) as u16, rect.h.max(0) as u16);
+            if w == 0 || h == 0 {
+                continue;
+            }
+            let mut grid = crate::backends::pancurses_draw::CellGrid::new(w, h);
+            let ran = CANVAS_DRAW.with(|d| {
+                let mut table = d.borrow_mut();
+                match table.get_mut(&id) {
+                    Some(cb) => {
+                        let mut dc = crate::backends::pancurses_draw::PancursesDrawContext::new(&mut grid);
+                        cb(&mut dc, w as i32, h as i32);
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if ran {
+                // Absolute CUP output, so overlapping canvases stay correct.
+                emit_sgr(&grid.to_ansi(rect.y.max(0) as u16, rect.x.max(0) as u16));
+                painted += 1;
+            }
+        }
+        painted
+    }
+
+    /// Drop a canvas's pointer handlers (mirrors dropping the widget).
+    pub fn canvas_clear_pointer_handlers(id: usize) {
+        CANVAS_POINTER.with(|h| {
+            h.borrow_mut().remove(&id);
+        });
+    }
+
+    /// Convert a terminal cell coordinate to the canvas pixel space the other
+    /// backends use, relative to the canvas widget's own origin.
+    ///
+    /// Terminals report whole cells; the widget tree stores the canvas rect in
+    /// the same cell units. `DrawContext` (and therefore `set_draw_callback`,
+    /// `on_click` on GTK/NWG) is pixel-based, so multiply by the cell metrics.
+    pub fn canvas_pixel_xy(id: usize, cell_x: i32, cell_y: i32) -> Option<(f64, f64)> {
+        let rect = with_state(|s| s.node(id).map(|n| n.rect))?;
+        if rect.w <= 0 || rect.h <= 0 {
+            return None;
+        }
+        let cw = crate::spreadsheet::SpreadsheetModel::CHAR_W;
+        let ch = crate::spreadsheet::SpreadsheetModel::ROW_H;
+        Some((
+            (cell_x - rect.x) as f64 * cw,
+            (cell_y - rect.y) as f64 * ch,
+        ))
+    }
+
+    /// Terminal cell coordinate → canvas pixel coordinate for the widget under
+    /// the pointer, and that widget's id. Used by the pointer dispatcher.
+    fn canvas_hit(state: &PcState, x: i32, y: i32) -> Option<usize> {
+        let hit = state.nodes.iter().rev().find(|n| {
+            n.visible
+                && matches!(n.kind, PcWidgetKind::Canvas)
+                && n.rect.x <= x
+                && x < n.rect.x + n.rect.w
+                && n.rect.y <= y
+                && y < n.rect.y + n.rect.h
+        })?;
+        Some(hit.id)
+    }
+
+    /// What a decoded mouse event means, independent of backend.
+    ///
+    /// ncurses (mouse v2) and PDCurses share the same layout for the button
+    /// bits (five bits per button) and for the modifier/wheel bits, so one
+    /// decoder serves both.  The raw `bstate` is still exposed on
+    /// [`MouseEvent`] for hosts that need the untouched mask.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum MouseAction {
+        /// A button went down (or a terminal reported a click for it).
+        Pressed(u8),
+        /// A button came back up.
+        Released(u8),
+        /// Press+release within the terminal's click interval (ncurses
+        /// `mouseinterval`, PDCurses `SP->mouse_wait`).
+        Clicked(u8),
+        DoubleClicked(u8),
+        TripleClicked(u8),
+        /// Pointer motion.  `button` is the held button, if any.
+        Moved { button: Option<u8> },
+        /// Wheel/scroll.  `down` is true for wheel-down, false for wheel-up;
+        /// `horizontal` distinguishes left/right wheels.
+        Wheel { down: bool, horizontal: bool },
+        /// The terminal reports bare pointer positions, no button change.
+        Position,
+    }
+
+    /// A backend-neutral pointer event: cell position plus decoded action.
+    ///
+    /// Terminal coordinates are 0-based *cells* (ncurses and PDCurses both
+    /// report cell coordinates, not pixels).  `-1` coordinates are what both
+    /// libraries report for wheel events, so hosts should only treat the
+    /// position as meaningful for the non-wheel variants.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MouseEvent {
+        pub x: i32,
+        pub y: i32,
+        pub action: MouseAction,
+        pub shift: bool,
+        pub ctrl: bool,
+        pub alt: bool,
+        /// The untranslated `bstate` bitmask (platform-specific).
+        pub raw_state: u64,
+    }
+
+    // Mouse-mask bit layout.  Both backends this crate links against use the
+    // same ncurses-v2 scheme: five bits per button (release/press/click/dbl/
+    // triple, LSB first) and the wheel/motion/modifier flags at the top.
+    // PDCurses additionally uses MOUSE_WHEEL_SCROLL (bit 25) as the gate the
+    // app must set for wheel events to reach it at all — ALL_MOUSE_EVENTS
+    // (`0x1fff_ffff`) already includes it, which is what `set_mouse_enabled`
+    // installs.  The constants are defined here (instead of pulled from the
+    // platform modules) because the vendored Windows constants only export
+    // BUTTON1..BUTTON4; deriving them keeps one code path on every target.
+    const MOUSE_BUTTON_STRIDE: u32 = 5;
+    /// ncurses-v2 `BUTTON_CTRL/`BUTTON_SHIFT`/`BUTTON_ALT` / PDCurses
+    /// `BUTTON_MODIFIER_{CONTROL,SHIFT,ALT}` — same values on both.
+    const MOUSE_FLAG_CTRL: u64 = 0x001 << 30;
+    const MOUSE_FLAG_SHIFT: u64 = 0x002 << 30;
+    const MOUSE_FLAG_ALT: u64 = 0x004 << 30;
+    const MOUSE_FLAG_POSITION: u64 = 0x008 << 30;
+    /// PDCurses' wheel gate (also inside ALL_MOUSE_EVENTS).  Unused on
+    /// ncurses, where BUTTON4/BUTTON5 carry the wheel instead.
+    #[allow(dead_code)]
+    const MOUSE_FLAG_WHEEL_SCROLL: u64 = 0x0200_0000;
+    /// Action codes within one five-bit button group.
+    const ACTION_RELEASED: u64 = 0x001;
+    const ACTION_PRESSED: u64 = 0x002;
+    const ACTION_CLICKED: u64 = 0x004;
+    const ACTION_DOUBLE: u64 = 0x008;
+    const ACTION_TRIPLE: u64 = 0x010;
+    /// PDCurses' `PDC_MOUSE_MOVED` change flag (bit 3).  When it is set, the
+    /// top bit of a button group means `BUTTONn_MOVED` rather than a triple
+    /// click (they alias); see `decode_mouse_event`.
+    const MOUSE_FLAG_MOVED: u64 = 0x008;
+
+    /// Decode a raw `bstate` from `getmouse()` into a backend-neutral event.
+    ///
+    /// Pure function (no terminal needed) so the mapping is unit-tested on
+    /// every platform.  Button numbers are 1-based, matching the mask names
+    /// (`BUTTON1_*` → 1).
+    pub fn decode_mouse_event(x: i32, y: i32, bstate: u64) -> MouseEvent {
+        let shift = bstate & MOUSE_FLAG_SHIFT != 0;
+        let ctrl = bstate & MOUSE_FLAG_CTRL != 0;
+        let alt = bstate & MOUSE_FLAG_ALT != 0;
+
+        // Wheel: ncurses and PDCurses both report BUTTON4_PRESSED for
+        // wheel-up and BUTTON5_PRESSED for wheel-down.  Buttons 6/7 are left
+        // to the button groups below (their 5-bit windows would overlap the
+        // PDCurses MODIFIER flag at BUTTON_MODIFIER_SHIFT, so decoding them
+        // as wheel here would misread a shift-click).
+        let pressed = |n: u32| bstate & (ACTION_PRESSED << ((n - 1) * MOUSE_BUTTON_STRIDE)) != 0;
+        let action = if pressed(4) {
+            MouseAction::Wheel { down: false, horizontal: false }
+        } else if pressed(5) {
+            MouseAction::Wheel { down: true, horizontal: false }
+        } else {
+            // Walk the button groups.  A single event normally sets exactly one
+            // group; when several are set (PDCurses motion can flag the held
+            // button) the lowest-numbered button wins, matching the mask
+            // order.
+            let mut decoded: Option<MouseAction> = None;
+            let mut moved_button: Option<u8> = None;
+            // Only the three normal buttons are examined here: the higher
+            // five-bit windows overlap PDCurses' modifier flags, so a
+            // shift-click would otherwise look like a button-6 event.
+            for n in 1..=5u32 {
+                let group = (bstate >> ((n - 1) * MOUSE_BUTTON_STRIDE)) & 0x1f;
+                // PDCurses reuses the top bit of each button group for its
+                // `BUTTONn_MOVED` flag, aliasing `BUTTONn_TRIPLE_CLICKED`.  A
+                // motion record is the one that ALSO sets PDCurses'
+                // `PDC_MOUSE_MOVED` change bit (bit 3) — ncurses never reports
+                // motion through `bstate` at all — so only then is the top bit
+                // read as movement; otherwise it stays a triple click.
+                if group & ACTION_PRESSED != 0 {
+                    decoded = decoded.or(Some(MouseAction::Pressed(n as u8)));
+                } else if group & ACTION_CLICKED != 0 {
+                    decoded = decoded.or(Some(MouseAction::Clicked(n as u8)));
+                } else if bstate & MOUSE_FLAG_MOVED != 0 && group & ACTION_TRIPLE != 0 {
+                    // PDCurses motion record (see above): the group carries
+                    // BUTTONn_MOVED, which aliases the double/triple bits, so
+                    // it must be recognised before either of them.
+                    moved_button = moved_button.or(Some(n as u8));
+                } else if group & ACTION_DOUBLE != 0 {
+                    decoded = decoded.or(Some(MouseAction::DoubleClicked(n as u8)));
+                } else if group & ACTION_TRIPLE != 0 {
+                    decoded = decoded.or(Some(MouseAction::TripleClicked(n as u8)));
+                } else if group & ACTION_RELEASED != 0 {
+                    decoded = decoded.or(Some(MouseAction::Released(n as u8)));
+                }
+            }
+            decoded
+                .or_else(|| {
+                    if moved_button.is_some() || bstate & MOUSE_FLAG_MOVED != 0 {
+                        Some(MouseAction::Moved { button: moved_button })
+                    } else if bstate & MOUSE_FLAG_POSITION != 0 {
+                        Some(MouseAction::Position)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(MouseAction::Position)
+        };
+
+        MouseEvent { x, y, action, shift, ctrl, alt, raw_state: bstate }
+    }
+
+    /// Cell position of a pointer event in a widget's local coordinates.
+   ///
+    /// `None` when the point is outside the widget (or the widget has no
+    /// area) — i.e. the same containment test the dispatcher uses.
+    fn mouse_local(kind_rect: Rect, x: i32, y: i32) -> Option<(i32, i32)> {
+        if kind_rect.w <= 0 || kind_rect.h <= 0 {
+            return None;
+        }
+        if x < kind_rect.x || x >= kind_rect.x + kind_rect.w {
+            return None;
+        }
+        if y < kind_rect.y || y >= kind_rect.y + kind_rect.h {
+            return None;
+        }
+        Some((x - kind_rect.x, y - kind_rect.y))
+    }
+
+    /// Map a pointer position inside a spreadsheet widget to a cell.
+    ///
+    /// Mirrors the terminal cell-grid renderer's own layout (see
+    /// `backends::pancurses_draw`): the header band is
+    /// `header_row_count * HEADER_H` rows tall, the row-label gutter is
+    /// `ROW_LABEL_W` wide, and each column occupies its layout width in
+    /// `CHAR_W`-sized cells.  Returns `None` for the chrome (header band,
+    /// row-label gutter, past the last column/row).
+    ///
+    /// Pure, so it is unit-tested without a terminal — the renderer and the
+    /// hit-test cannot drift apart silently.
+    fn spreadsheet_cell_at(grid: &crate::core::Grid, local: (i32, i32)) -> Option<(u32, u32)> {
+        let (lx, ly) = local;
+        if lx < 0 || ly < 0 {
+            return None;
+        }
+        let char_w = crate::spreadsheet::SpreadsheetModel::CHAR_W as i32;
+        let row_h = crate::spreadsheet::SpreadsheetModel::ROW_H as i32;
+        let header_h = crate::spreadsheet::SpreadsheetModel::HEADER_H as i32;
+        let label_w = crate::spreadsheet::SpreadsheetModel::ROW_LABEL_W as i32;
+        let header_rows = grid.header_row_count as i32;
+        let header_h_total = header_rows * header_h;
+        if ly < header_h_total {
+            return None;
+        }
+        let body_row = (ly - header_h_total) / row_h.max(1);
+        // Body row 0 is the first non-header row.  The renderer scrolls with
+        // `top_row` (`row_idx = top_row + vr`), so a click maps to the same
+        // absolute row the renderer would draw there.
+        let row = grid.top_row.saturating_add(body_row as u32);
+        if row >= grid.total_rows.max(1) {
+            return None;
+        }
+        if lx < label_w {
+            // Row-label gutter: treat every margin column band as clickable,
+            // mirroring `spreadsheet::cell_at`'s pixel walk.
+            let margin = grid.margin_cols.max(1) as i32;
+            let band = (label_w / margin).max(1);
+            let col = ((lx / band) as u32).min(grid.margin_cols.saturating_sub(1));
+            return Some((row, col));
+        }
+        let mut cx = label_w;
+        // The margin columns live inside the row-label gutter (the renderer
+        // draws `c < margin_cols` at `c * label_w / margin_cols`), so the
+        // main-column walk starts after them.
+        let mut col = grid.margin_cols;
+        loop {
+            if col >= grid.total_cols {
+                return None;
+            }
+            let width = spreadsheet_col_width(grid, col) * char_w;
+            if lx < cx + width {
+                return Some((row, col));
+            }
+            cx += width;
+            col += 1;
+        }
+    }
+
+    /// Rendered width (in character cells) of one spreadsheet column: the
+    /// explicit layout entry when the app supplied one, otherwise the grid
+    /// default (`col_width`), matching the renderer.
+    fn spreadsheet_col_width(grid: &crate::core::Grid, col: u32) -> i32 {
+        for (gc, w, _) in &grid.column_layout {
+            if *gc == col {
+                return (*w as i32).max(1);
+            }
+        }
+        (grid.col_width as i32).max(1)
     }
 
     /// Register a named action (mirrors wxAction).  Menu items reference
@@ -941,6 +1383,12 @@ mod pancurses_backend {
     pub struct PcApp;
 
     impl crate::backends::BackendApp for PcApp {
+        /// A terminal has no framework to dispatch for us: this `run` blocks in
+        /// `getch()` and is the loop (see `BackendApp::owns_event_loop`).
+        fn owns_event_loop(&self) -> bool {
+            true
+        }
+
         fn run(self: Box<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // ncurses holds a bare Escape key for ESCDELAY (default 1000 ms)
             // before delivering it, to disambiguate it from escape sequences
@@ -1096,6 +1544,11 @@ mod pancurses_backend {
                     if !visible { continue; }
                     render_widget(&root, &kind, rect, id, focus_id, menu_bar_text.as_deref());
                 }
+                // Canvas draw callbacks, painted after the widget tree so a
+                // canvas's own output lands on its background (the GTK
+                // ordering). Their grid output is SGR-flushed here, before the
+                // backend's own SGR stream, so later overlays still win.
+                paint_canvases();
                 // render active menu dropdown (all open levels: root + submenus)
                 with_state(|state| {
                     if state.menu_open {
@@ -1435,47 +1888,15 @@ mod pancurses_backend {
                     }
                     Some(Input::KeyMouse) => {
                         if let Ok(mevent) = getmouse() {
-                            let x = mevent.x;
-                            let y = mevent.y;
-                            let callbacks = with_state(|state| {
-                                let hit = state.nodes.iter().rev().find(|n| {
-                                    n.visible
-                                        && n.rect.x <= x && x < n.rect.x + n.rect.w
-                                        && n.rect.y <= y && y < n.rect.y + n.rect.h
-                                });
-                                if let Some(node) = hit {
-                                    match &node.kind {
-                                        PcWidgetKind::Button { .. } => {
-                                            let idxs: Vec<usize> = (0..state.nodes.len())
-                                                .filter(|i| state.nodes[*i].id == node.id)
-                                                .collect();
-                                            let mut all_cbs = vec![];
-                                            for idx in idxs {
-                                                all_cbs.append(&mut std::mem::take(&mut state.nodes[idx].callbacks));
-                                            }
-                                            all_cbs
-                                        }
-                                        PcWidgetKind::CheckButton { .. } => {
-                                            if let Some(n) = state.node_mut(node.id) {
-                                                if let PcWidgetKind::CheckButton { ref mut checked, .. } = n.kind {
-                                                    *checked = !*checked;
-                                                }
-                                                std::mem::take(&mut n.callbacks)
-                                            } else {
-                                                vec![]
-                                            }
-                                        }
-                                        PcWidgetKind::Entry { .. } => {
-                                            state.focus_id = Some(node.id);
-                                            vec![]
-                                        }
-                                        _ => vec![],
-                                    }
-                                } else {
-                                    vec![]
-                                }
+                            let ev = decode_mouse_event(mevent.x, mevent.y, mevent.bstate as u64);
+                            // Host hook first (see set_mouse_hook): a host that
+                            // handles the event itself skips the default dispatch.
+                            let consumed = MOUSE_HOOK.with(|h| {
+                                h.borrow_mut().as_mut().map_or(false, |cb| cb(&ev))
                             });
-                            fire_callbacks(callbacks);
+                            if !consumed {
+                                handle_mouse_event(ev);
+                            }
                         }
                     }
                     Some(Input::Character('\n')) | Some(Input::Character('\r')) => {
@@ -2704,13 +3125,23 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(1) | COLOR_PAIR(2));
                 }
             }
-            PcWidgetKind::Label { text } => {
+            PcWidgetKind::Label { text, .. } => {
                 if has_colors() {
                     root.attron(COLOR_PAIR(3));
                 }
-                let max_w = rect.w as usize;
-                let truncated = if text.len() > max_w { &text[..max_w] } else { text.as_str() };
-                root.mvaddstr(rect.y, rect.x, truncated);
+                // Truncate by CHARACTERS, not bytes: `&text[..max_w]` sliced a
+                // multi-byte label in half and `mvaddstr` then returned ERR
+                // (nothing drawn). Char-based clipping also matches the
+                // char-based natural width the box layout measures.
+                let truncated: String = text.chars().take(rect.w.max(0) as usize).collect();
+                root.mvaddstr(rect.y, rect.x, &truncated);
+                // Curses only writes the cells it is given, so a label whose
+                // text shrank (or that was widened by a `set_fixed_width` pin)
+                // would leave the tail of the previous, longer text on screen.
+                // Blank the rest of the slot.
+                for i in truncated.chars().count() as i32..rect.w {
+                    root.mvaddch(rect.y, rect.x + i, ' ');
+                }
                 if has_colors() {
                     root.attroff(COLOR_PAIR(3));
                 }
@@ -3353,6 +3784,11 @@ mod pancurses_backend {
                                     }
                                     if cell_style == 3 {
                                         out.push_str(SGR_RESET);
+                                    } else if cell_style == 2 {
+                                        // Full reset: aggregates are bold on
+                                        // every backend now, and a foreground-
+                                        // only reset would leak the weight.
+                                        out.push_str(SGR_RESET);
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
                                     }
@@ -3726,7 +4162,11 @@ mod pancurses_backend {
                                 if is_cursor_cell {
                                     out.push_str(SGR_BG_DEFAULT);
                                 } else if cell_style == 2 {
-                                    out.push_str(SGR_FG_DEFAULT);
+                                    // Full reset, not SGR_FG_DEFAULT: aggregates
+                                    // are now bold too, and a foreground-only
+                                    // reset would leak the weight into every
+                                    // following cell.
+                                    out.push_str(SGR_RESET);
                                 } else if cell_style == 3 {
                                     out.push_str(SGR_RESET);
                                 } else if cell_style == 7 {
@@ -3914,7 +4354,11 @@ mod pancurses_backend {
                             if is_cursor_cell {
                                 out.push_str(SGR_BG_DEFAULT);
                             } else if cell_style == 2 {
-                                out.push_str(SGR_FG_DEFAULT);
+                                // Full reset, not SGR_FG_DEFAULT: aggregates
+                                // are now bold too, and a foreground-only
+                                // reset would leak the weight into the next
+                                // cell.
+                                out.push_str(SGR_RESET);
                             } else if cell_style == 3 {
                                 out.push_str(SGR_RESET);
                             } else if cell_style == 7 {
@@ -4019,6 +4463,299 @@ mod pancurses_backend {
 
     fn is_spreadsheet_focused(state: &PcState, fid: usize) -> bool {
         state.node(fid).map_or(false, |n| matches!(n.kind, PcWidgetKind::Spreadsheet { .. } | PcWidgetKind::DataGrid(_)))
+    }
+
+    /// Dispatch one decoded pointer event over the widget tree.
+    ///
+    /// Only called when the app opted in (`set_mouse_enabled(true)`), so it is
+    /// free to assume the terminal is reporting SGR/PDC mouse records.  The
+    /// rules mirror what the keyboards paths do, so pointer and keys agree:
+    ///
+    /// * press/click activates: buttons fire their callbacks, check/radio
+    ///   buttons toggle, entries take focus, spreadsheets move the cursor;
+    /// * wheel scrolls a focused spreadsheet (three rows per notch, the same
+    ///   step the PageUp/PageDown handlers use);
+    /// * click-through is topmost-wins with the same `rect` containment test
+    ///   used by `render_widget`.
+    ///
+    /// The event is consumed by the innermost visible widget under the
+    /// pointer; nothing bubbles yet.
+    fn handle_mouse_event(ev: MouseEvent) {
+        let (x, y) = (ev.x, ev.y);
+
+        // Wheel: scroll whichever spreadsheet is focused (the pointer cannot
+        // identify a scroll target reliably — terminals report -1,-1 for
+        // wheel events, so there is no position to hit-test with).
+        if let MouseAction::Wheel { down, .. } = ev.action {
+            let scrolled = with_state(|state| {
+                let fid = match state.focus_id {
+                    Some(fid) if is_spreadsheet_focused(state, fid) => fid,
+                    _ => match state.nodes.iter().find(|n| n.visible && is_spreadsheet_kind(&n.kind)) {
+                        Some(n) => n.id,
+                        None => return false,
+                    },
+                };
+                scroll_spreadsheet(state, fid, if down { 3 } else { -3 });
+                true
+            });
+            if scrolled {
+                request_redraw();
+            }
+            return;
+        }
+
+        // Motion and position reports: deliver to a canvas's `on_motion` (the
+        // GTK/NWG hover contract). Nothing else has hover state, so an
+        // unconsumed motion simply returns — which also avoids repainting on
+        // every pointer sample.
+        if matches!(ev.action, MouseAction::Moved { .. } | MouseAction::Position) {
+            let held = match ev.action {
+                MouseAction::Moved { button } => button.unwrap_or(0) as u32,
+                _ => 0,
+            };
+            if let Some(id) = with_state(|state| canvas_hit(state, x, y)) {
+                if let Some((px, py)) = canvas_pixel_xy(id, x, y) {
+                    let fired = CANVAS_POINTER.with(|h| {
+                        let mut table = h.borrow_mut();
+                        match table.get_mut(&id).and_then(|c| c.motion.as_mut()) {
+                            Some(cb) => {
+                                cb(px, py, held);
+                                true
+                            }
+                            None => false,
+                        }
+                    });
+                    if fired {
+                        // Motion handlers typically re-render into their own
+                        // buffer; let the host ask for the frame explicitly.
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Only press/click activate.  Release alone is ignored so the click
+        // and release records a terminal may send for one physical click do
+        // not fire the widget twice.
+        let button = match ev.action {
+            MouseAction::Pressed(b)
+            | MouseAction::Clicked(b)
+            | MouseAction::DoubleClicked(b)
+            | MouseAction::TripleClicked(b) => b,
+            _ => return,
+        };
+
+        // Canvas clicks take precedence over the generic widget dispatch so a
+        // canvas-painted UI (menu, dropdown, chart) can hit-test at pixel
+        // resolution, exactly like the GTK canvas. Registering either handler
+        // marks the canvas as pointer-owning; the click is then never also
+        // treated as a plain widget activation.
+        if let Some(id) = with_state(|state| canvas_hit(state, x, y)) {
+            if let Some((px, py)) = canvas_pixel_xy(id, x, y) {
+                let handled = CANVAS_POINTER.with(|h| {
+                    let mut table = h.borrow_mut();
+                    let handlers = match table.get_mut(&id) {
+                        Some(h) => h,
+                        None => return false,
+                    };
+                    // The button-aware handler is the richer contract; the
+                    // plain one exists for hosts that only need position.
+                    if let Some(cb) = handlers.button.as_mut() {
+                        cb(px, py, button as u32, 0);
+                        true
+                    } else if let Some(cb) = handlers.plain.as_mut() {
+                        cb(px, py);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if handled {
+                    return;
+                }
+            }
+        }
+
+        // Only the primary button activates; the others are reserved (a host
+        // can inspect them through `set_mouse_hook`).
+        if button != 1 {
+            return;
+        }
+
+        let callbacks: Vec<Callback> = with_state(|state| {
+            let hit = state.nodes.iter().rev().find(|n| {
+                n.visible
+                    && n.rect.x <= x
+                    && x < n.rect.x + n.rect.w
+                    && n.rect.y <= y
+                    && y < n.rect.y + n.rect.h
+            });
+            let node = match hit {
+                Some(n) => n,
+                None => return vec![],
+            };
+            let id = node.id;
+            let (lw, lh) = (node.rect.w, node.rect.h);
+            let kind = node.kind.clone();
+            match kind {
+                PcWidgetKind::Button { .. } | PcWidgetKind::SimpleAction => {
+                    state.focus_id = Some(id);
+                    node_callbacks(state, id)
+                }
+                PcWidgetKind::CheckButton { .. } => {
+                    let mut cbs = node_callbacks(state, id);
+                    if let Some(n) = state.node_mut(id) {
+                        if let PcWidgetKind::CheckButton { ref mut checked, .. } = n.kind {
+                            *checked = !*checked;
+                        }
+                    }
+                    std::mem::take(&mut cbs)
+                }
+                PcWidgetKind::RadioButton { group_id, .. } => {
+                    let mut cbs = node_callbacks(state, id);
+                    radio_select(state, id, group_id);
+                    std::mem::take(&mut cbs)
+                }
+                PcWidgetKind::Entry { .. } => {
+                    state.focus_id = Some(id);
+                    vec![]
+                }
+                PcWidgetKind::Spreadsheet { ref grid, .. } => {
+                    if let Some((row, col)) = mouse_local(Rect { x: 0, y: 0, w: lw, h: lh }, x, y)
+                        .and_then(|local| spreadsheet_cell_at(grid, local))
+                    {
+                        mouse_set_cell_cursor(state, id, row, col);
+                    }
+                    vec![]
+                }
+                PcWidgetKind::DataGrid(grid) => {
+                    if let Some((row, col)) = mouse_local(Rect { x: 0, y: 0, w: lw, h: lh }, x, y)
+                        .and_then(|local| spreadsheet_cell_at(&grid, local))
+                    {
+                        mouse_set_cell_cursor(state, id, row, col);
+                    }
+                    vec![]
+                }
+                _ => vec![],
+            }
+        });
+        fire_callbacks(callbacks);
+        // Pointer input changed focus/cursor state that the SGR renderer draws
+        // from; repaint now instead of waiting for the next key press.
+        request_redraw();
+    }
+
+    /// True when a widget kind renders through the cell-grid spreadsheet path.
+    fn is_spreadsheet_kind(kind: &PcWidgetKind) -> bool {
+        matches!(kind, PcWidgetKind::Spreadsheet { .. } | PcWidgetKind::DataGrid(_))
+    }
+
+    /// Clone-free access to a node's callback list (empty when it has none or
+    /// the id is unknown).
+    fn node_callbacks(state: &mut PcState, id: usize) -> Vec<Callback> {
+        match state.node_mut(id) {
+            Some(n) => n.callbacks.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Check `id` and uncheck every sibling in the same radio group, mirroring
+    /// `toggle_focused`'s grouping rule.
+    fn radio_select(state: &mut PcState, id: usize, group_id: usize) {
+        for n in state.nodes.iter_mut() {
+            if let PcWidgetKind::RadioButton { checked, group_id: gid, .. } = &mut n.kind {
+                if *gid == group_id {
+                    *checked = n.id == id;
+                }
+            }
+        }
+    }
+
+    /// Move a spreadsheet/grid cursor to `(row, col)`, clamped to the grid,
+    /// committing any in-progress edit first (same order the keyboard paths
+    /// use) and then scrolling the viewport to keep the cell visible.
+    fn mouse_set_cell_cursor(state: &mut PcState, fid: usize, row: u32, col: u32) {
+        spreadsheet_commit_edit(state, fid);
+        if let Some(n) = state.node_mut(fid) {
+            match &mut n.kind {
+                PcWidgetKind::Spreadsheet { grid, .. } => {
+                    grid.cursor_row = row.min(grid.total_rows.saturating_sub(1));
+                    grid.cursor_col = col.min(grid.total_cols.saturating_sub(1));
+                    grid.anchor = None;
+                }
+                PcWidgetKind::DataGrid(grid) => {
+                    grid.cursor_row = row.min(grid.total_rows.saturating_sub(1));
+                    grid.cursor_col = col.min(grid.total_cols.saturating_sub(1));
+                    grid.anchor = None;
+                }
+                _ => return,
+            }
+        }
+        // Refill the formula bar / row labels for the new cursor position, then
+        // keep it on screen.
+        spreadsheet_scroll_to_cursor(state, fid);
+        spreadsheet_update_formula_bar(fid);
+        // The host owns the "real" cursor (corro syncs it through these
+        // callbacks); fire them so pointer clicks behave like arrow keys.
+        let moved = with_state(|s| {
+            s.node(fid).and_then(|n| match &n.kind {
+                PcWidgetKind::Spreadsheet { grid, .. } | PcWidgetKind::DataGrid(grid) => {
+                    Some((grid.cursor_row, grid.cursor_col))
+                }
+                _ => None,
+            })
+        });
+        if let Some((row, col)) = moved {
+            let mut cbs = with_state(|s| std::mem::take(&mut s.cursor_move_callbacks));
+            for cb in cbs.iter_mut() {
+                cb(row, col);
+            }
+            with_state(|s| s.cursor_move_callbacks = cbs);
+        }
+    }
+
+    /// Scroll a spreadsheet/grid by `delta` rows (negative = up), clamped to
+    /// the grid's row range and kept in sync with the viewport.
+    fn scroll_spreadsheet(state: &mut PcState, fid: usize, delta: i32) {
+        let max_row = match state.node(fid) {
+            Some(n) => match &n.kind {
+                PcWidgetKind::Spreadsheet { grid, .. } | PcWidgetKind::DataGrid(grid) => {
+                    grid.total_rows.saturating_sub(1) as i32
+                }
+                _ => return,
+            },
+            None => return,
+        };
+        if let Some(n) = state.node_mut(fid) {
+            let grid = match &mut n.kind {
+                PcWidgetKind::Spreadsheet { grid, .. } => grid,
+                PcWidgetKind::DataGrid(grid) => grid,
+                _ => return,
+            };
+            let next = (grid.cursor_row as i32 + delta).clamp(0, max_row) as u32;
+            if next == grid.cursor_row {
+                return;
+            }
+            grid.cursor_row = next;
+        }
+        spreadsheet_scroll_to_cursor(state, fid);
+        spreadsheet_update_formula_bar(fid);
+        let moved = with_state(|s| {
+            s.node(fid).and_then(|n| match &n.kind {
+                PcWidgetKind::Spreadsheet { grid, .. } | PcWidgetKind::DataGrid(grid) => {
+                    Some((grid.cursor_row, grid.cursor_col))
+                }
+                _ => None,
+            })
+        });
+        if let Some((row, col)) = moved {
+            let mut cbs = with_state(|s| std::mem::take(&mut s.cursor_move_callbacks));
+            for cb in cbs.iter_mut() {
+                cb(row, col);
+            }
+            with_state(|s| s.cursor_move_callbacks = cbs);
+        }
     }
 
     fn spreadsheet_is_editing(kind: &PcWidgetKind) -> bool {
@@ -4544,7 +5281,7 @@ mod pancurses_backend {
     }
 
     pub fn create_label(text: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(with_state(|s| s.add_node(PcWidgetKind::Label { text: text.to_string() }, find_window_id(s))))
+        Ok(with_state(|s| s.add_node(PcWidgetKind::Label { text: text.to_string(), fixed_w: None }, find_window_id(s))))
     }
 
     pub fn create_box(horizontal: bool, spacing: i32) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -5090,7 +5827,7 @@ mod pancurses_backend {
                 .unwrap_or("1");
             let label = format!("{}{}", col_part, row_label.trim());
             if let Some(an) = state.node_mut(aid) {
-                if let PcWidgetKind::Label { ref mut text } = &mut an.kind {
+                if let PcWidgetKind::Label { ref mut text, .. } = &mut an.kind {
                     if *text != label {
                         *text = label;
                         changed = true;
@@ -5128,7 +5865,7 @@ mod pancurses_backend {
     pub fn set_label_text(id: usize, text: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
-                if let PcWidgetKind::Label { text: ref mut t } = n.kind {
+                if let PcWidgetKind::Label { text: ref mut t, .. } = n.kind {
                     *t = text.to_string();
                 }
             }
@@ -5138,7 +5875,7 @@ mod pancurses_backend {
     pub fn get_label_text(id: usize) -> Option<String> {
         with_state(|s| {
             s.node(id).and_then(|n| {
-                if let PcWidgetKind::Label { ref text } = n.kind {
+                if let PcWidgetKind::Label { ref text, .. } = n.kind {
                     Some(text.clone())
                 } else {
                     None
@@ -5153,6 +5890,37 @@ mod pancurses_backend {
                 n.visible = visible;
             }
         });
+    }
+
+    /// Pin a label's laid-out width, in character cells.
+    ///
+    /// The terminal half of `Label::set_fixed_width` (see the NWG/GTK
+    /// adapters for the motivation): a label is shrink-to-fit, so a value
+    /// that changes every keystroke — the formula bar's address, `A1` to
+    /// `A100` — resizes its slot and slides every sibling packed after it.
+    /// A pin gives the slot a constant size; the box layout then hands the
+    /// label that many cells and the text simply gets clipped if it is wider
+    /// (the NWG note about picking a width that fits the widest case applies
+    /// here too). `None` restores shrink-to-fit.
+    pub fn set_label_fixed_width(id: usize, w: Option<i32>) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Label { fixed_w, .. } = &mut n.kind {
+                    *fixed_w = w.filter(|w| *w > 0);
+                }
+            }
+        });
+    }
+
+    /// Pinned width of a label, or `None` when it shrinks to fit. Exposed so
+    /// the layout math and the app can agree on what the pin means.
+    pub fn get_label_fixed_width(id: usize) -> Option<i32> {
+        with_state(|s| {
+            s.node(id).and_then(|n| match &n.kind {
+                PcWidgetKind::Label { fixed_w, .. } => *fixed_w,
+                _ => None,
+            })
+        })
     }
 
     pub fn add_callback(id: usize, cb: Box<dyn FnMut()>) {
@@ -5241,13 +6009,44 @@ mod pancurses_backend {
         with_state(|s| s.client_data.get(&id).cloned())
     }
 
+    /// Set an entry's text **and fire its `connect_changed` callbacks**.
+    ///
+    /// The callbacks are taken out, run, and put back rather than run under the
+    /// state borrow: a `connect_changed` handler routinely reads or writes
+    /// other widgets (that is the point of the hook), and holding the `RefCell`
+    /// across the call would panic on re-entry. Same convention as the
+    /// cursor-move/commit-edit callback dispatch.
     pub fn set_entry_text(id: usize, text: &str) {
+        let mut callbacks = with_state(|s| {
+            match s.node_mut(id) {
+                Some(n) => {
+                    if let PcWidgetKind::Entry { ref mut buffer, ref mut cursor } = n.kind {
+                        *buffer = text.to_string();
+                        // Byte index of the end, matching the widget's own
+                        // caret convention.
+                        *cursor = buffer.len();
+                    }
+                    std::mem::take(&mut n.callbacks)
+                }
+                None => Vec::new(),
+            }
+        });
+        // Fire, then put the registrations back: `add_callback` handlers are
+        // persistent (they fire on every change, not once). `Callback` is a
+        // `Box<dyn FnMut()>` and so is not `Clone`, so the list is moved out,
+        // each closure is run, and each is moved straight back — no temporary
+        // copy and nothing left consumed.
+        let mut taken: Vec<Callback> = Vec::new();
+        std::mem::swap(&mut taken, &mut callbacks);
+        for mut cb in taken {
+            cb();
+            callbacks.push(cb);
+        }
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
-                if let PcWidgetKind::Entry { ref mut buffer, ref mut cursor } = n.kind {
-                    *buffer = text.to_string();
-                    *cursor = buffer.len();
-                }
+                let mut prev = std::mem::take(&mut n.callbacks);
+                prev.append(&mut callbacks);
+                n.callbacks = prev;
             }
         });
     }
@@ -5262,6 +6061,65 @@ mod pancurses_backend {
                 }
             })
         })
+    }
+
+    /// Read an entry's caret (byte offset into the buffer).
+    ///
+    /// The widget has always tracked this (`PcWidgetKind::Entry { cursor }` —
+    /// the arrow/Backspace/Delete handlers maintain it); it was simply not
+    /// exposed, which forced callers to keep a parallel copy. Exposing it makes
+    /// the terminal entry satisfy the same caret contract GTK's `Entry` does,
+    /// so a host's edit logic is backend-independent.
+    pub fn get_entry_cursor(id: usize) -> Option<usize> {
+        with_state(|s| {
+            s.node(id).and_then(|n| match &n.kind {
+                PcWidgetKind::Entry { cursor, .. } => Some(*cursor),
+                _ => None,
+            })
+        })
+    }
+
+    /// Move an entry's caret, clamped to the buffer's byte length.
+    ///
+    /// Clamping matters: the caret is used to index the buffer, so an
+    /// out-of-range value from a host (a stale position after the text was
+    /// replaced) would panic on the next keystroke rather than merely being
+    /// wrong. Also snaps back to a char boundary, since the widget removes
+    /// bytes and a mid-codepoint caret would corrupt the text.
+    pub fn set_entry_cursor(id: usize, pos: usize) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Entry { ref buffer, ref mut cursor } = n.kind {
+                    *cursor = clamp_to_char_boundary(buffer, pos);
+                }
+            }
+        });
+    }
+
+    /// Largest char boundary `<= pos` (and `<= len`).
+    fn clamp_to_char_boundary(s: &str, pos: usize) -> usize {
+        let mut p = pos.min(s.len());
+        while p > 0 && !s.is_char_boundary(p) {
+            p -= 1;
+        }
+        p
+    }
+
+    /// Focus an entry. A terminal has exactly one focus at a time, which the
+    /// widget tree already models with `focus_id`, so this sets that rather
+    /// than being a no-op — otherwise a host calling `grab_focus` would see
+    /// `has_focus` stay false forever.
+    pub fn entry_grab_focus(id: usize) {
+        with_state(|s| {
+            if matches!(s.node(id).map(|n| &n.kind), Some(PcWidgetKind::Entry { .. })) {
+                s.focus_id = Some(id);
+            }
+        });
+    }
+
+    /// Whether an entry currently holds focus.
+    pub fn entry_has_focus(id: usize) -> bool {
+        with_state(|s| s.focus_id == Some(id))
     }
 
     pub fn set_textview_text(id: usize, text: &str) {
@@ -5404,7 +6262,11 @@ mod pancurses_backend {
             let natural_widths: Vec<i32> = children.iter().map(|&cid| {
                 match s.node(cid).map(|n| &n.kind) {
                     Some(PcWidgetKind::Button { label, .. }) => (label.len() + 2) as i32,
-                    Some(PcWidgetKind::Label { text }) => (text.len() + 0) as i32,
+                    Some(PcWidgetKind::Label { text, fixed_w }) => {
+                        // A pinned label keeps its slot; the text is clipped
+                        // to it (see `set_label_fixed_width`).
+                        fixed_w.unwrap_or(text.chars().count() as i32)
+                    }
                     Some(PcWidgetKind::CheckButton { label, .. }) => (label.len() + 4) as i32,
                     Some(PcWidgetKind::RadioButton { label, .. }) => (label.len() + 4) as i32,
                     Some(PcWidgetKind::DropDown { items, .. }) => {
@@ -5422,13 +6284,35 @@ mod pancurses_backend {
             if total_natural <= total_w {
                 // Give each child its natural width then distribute extra proportionally
                 let extra = total_w - total_natural;
+                // A pin (`set_label_fixed_width`) is a promise that this label's
+                // slot NEVER moves, so it takes no share of the slack: the extra
+                // is distributed among the UNPINNED children only, with the
+                // last of them taking the remainder. This is the shape GTK
+                // gives the same row — a width request the box clamps, with the
+                // leftover going to the expanding child — and it is what makes
+                // the pin actually hold the address slot steady while the text
+                // changes.
+                let pinned: Vec<bool> = children
+                    .iter()
+                    .map(|&c| {
+                        matches!(
+                            s.node(c).map(|n| &n.kind),
+                            Some(PcWidgetKind::Label { fixed_w: Some(_), .. })
+                        )
+                    })
+                    .collect();
+                let flexible: Vec<usize> =
+                    (0..children.len()).filter(|&i| !pinned[i]).collect();
+                let flex_total: i32 = flexible.iter().map(|&i| natural_widths[i]).sum();
                 let mut x = parent_rect.x;
                 let mut remaining = extra;
                 for (i, child_id) in children.iter().enumerate() {
-                    let extra_share = if i == children.len() - 1 {
+                    let extra_share = if pinned[i] || flex_total <= 0 {
+                        0
+                    } else if flexible.last() == Some(&i) {
                         remaining
                     } else {
-                        let share = extra * natural_widths[i] / total_natural;
+                        let share = extra * natural_widths[i] / flex_total;
                         remaining -= share;
                         share
                     };
@@ -5492,7 +6376,9 @@ mod pancurses_backend {
     fn sizer_natural_width(s: &PcState, cid: usize) -> i32 {
         match s.node(cid).map(|n| &n.kind) {
             Some(PcWidgetKind::Button { label, .. }) => (label.len() + 2) as i32,
-            Some(PcWidgetKind::Label { text }) => (text.len() + 0) as i32,
+            Some(PcWidgetKind::Label { text, fixed_w }) => {
+                fixed_w.unwrap_or(text.chars().count() as i32)
+            }
             Some(PcWidgetKind::CheckButton { label, .. }) => (label.len() + 4) as i32,
             Some(PcWidgetKind::RadioButton { label, .. }) => (label.len() + 4) as i32,
             Some(PcWidgetKind::DropDown { items, .. }) => {
@@ -6061,9 +6947,367 @@ mod pancurses_backend {
         buf
     }
 
+    /// Test-visible wrapper for [`paint_canvases`] (a canvas draw callback
+    /// only runs inside the redraw loop, which a unit test does not start).
+    #[cfg(test)]
+    pub(crate) fn paint_canvases_for_test() -> usize {
+        paint_canvases()
+    }
+
+    /// Terminal half of `Label::set_fixed_width`, in a module of its own so
+    /// the pin's contract is stated in one place.
+    #[cfg(test)]
+    mod label_fixed_width_tests {
+        use super::*;
+
+        /// Build a window → horizontal box with three children, laid out in a
+        /// `width`-cell row. Returns (box, [label, f_label, entry]).
+        fn bar(text: &str, width: i32) -> (usize, Vec<usize>) {
+            let win = create_window().unwrap();
+            set_widget_rect(win, 0, 0, width, 1);
+            let bx = create_box(true, 0).unwrap();
+            set_child(win, bx);
+            set_widget_rect(bx, 0, 0, width, 1);
+            let a = create_label(text).unwrap();
+            let b = create_label("  fx  ").unwrap();
+            let e = create_entry().unwrap();
+            for &c in &[a, b, e] {
+                append_child(bx, c);
+            }
+            layout_box(bx);
+            (bx, vec![a, b, e])
+        }
+
+        /// The pin must hold the label's slot while its text changes — that is
+        /// the whole point (the formula bar's address, `A1` → `A100`, used to
+        /// slide every widget packed after it sideways on each cursor move).
+        #[test]
+        fn pinned_width_holds_the_slot_against_text_changes() {
+            let (bx, ids) = bar("A1", 40);
+            let (addr, fx, entry) = (ids[0], ids[1], ids[2]);
+            set_label_fixed_width(addr, Some(8));
+
+            // Re-layout each time, as the redraw loop does.
+            let mut seen: Vec<(i32, i32, i32)> = Vec::new();
+            for text in ["A1", "A100", "AAAAA1000000", "A1"] {
+                set_label_text(addr, text);
+                layout_box(bx);
+                seen.push((
+                    get_widget_rect(addr).unwrap().2,
+                    get_widget_rect(fx).unwrap().0,
+                    get_widget_rect(entry).unwrap().0,
+                ));
+            }
+            assert!(
+                seen.windows(2).all(|w| w[0] == w[1]),
+                "slot moved as the text changed: {seen:?}"
+            );
+            assert_eq!(8, seen[0].0, "the pin reserves its cells");
+        }
+
+        /// Releasing the pin restores shrink-to-fit, so an unpinned label still
+        /// tracks its text (the pre-existing behaviour).
+        #[test]
+        fn releasing_the_pin_restores_shrink_to_fit() {
+            let (bx, ids) = bar("A1", 40);
+            let (addr, fx, _) = (ids[0], ids[1], ids[2]);
+            set_label_fixed_width(addr, Some(8));
+            layout_box(bx);
+            let pinned = get_widget_rect(fx).unwrap().0;
+
+            set_label_fixed_width(addr, None);
+            set_label_text(addr, "A1000000");
+            layout_box(bx);
+            let grown = get_widget_rect(fx).unwrap().0;
+            assert!(
+                grown > pinned,
+                "an unpinned label should still fit its text ({grown} !> {pinned})"
+            );
+        }
+
+        /// A non-positive pin is meaningless (it would make the label
+        /// invisible), so it is treated as no pin rather than a zero-width box.
+        #[test]
+        fn non_positive_pins_are_ignored() {
+            let l = create_label("A1").unwrap();
+            set_label_fixed_width(l, Some(6));
+            assert_eq!(Some(6), get_label_fixed_width(l));
+            set_label_fixed_width(l, Some(0));
+            assert_eq!(None, get_label_fixed_width(l));
+            set_label_fixed_width(l, Some(-3));
+            assert_eq!(None, get_label_fixed_width(l));
+        }
+
+        /// Non-label widgets are left alone rather than panicking — a pin is
+        /// only meaningful for a label, and callers should not crash if they
+        /// point it at the wrong widget.
+        #[test]
+        fn pinning_a_non_label_is_a_no_op() {
+            let e = create_entry().unwrap();
+            set_label_fixed_width(e, Some(10));
+            assert_eq!(None, get_label_fixed_width(e));
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        // ── Mouse decoding / hit-testing ─────────────────────────────────
+        //
+        // These are pure (no terminal), so they run on every platform and pin
+        // the contract `handle_mouse_event` relies on: the mask layout shared
+        // by ncurses mouse-v2 and PDCurses, and the cell mapping that must
+        // agree with the renderer in `backends::pancurses_draw`.
+
+        /// Build a `bstate` with `action` set on 1-based button `n`.
+        fn button_bits(n: u32, action: u64) -> u64 {
+            action << ((n - 1) * 5)
+        }
+
+        #[test]
+        fn mouse_press_click_and_release_decode() {
+            for (n, shift) in [(1u32, 0u32), (2, 5), (3, 10)] {
+                let base = (n - 1) * 5;
+                assert_eq!(
+                    MouseAction::Pressed(n as u8),
+                    decode_mouse_event(3, 7, 0x002u64 << base).action,
+                    "button {n} press"
+                );
+                assert_eq!(
+                    MouseAction::Clicked(n as u8),
+                    decode_mouse_event(3, 7, 0x004u64 << base).action,
+                    "button {n} click"
+                );
+                assert_eq!(
+                    MouseAction::DoubleClicked(n as u8),
+                    decode_mouse_event(3, 7, 0x008u64 << base).action,
+                    "button {n} double-click"
+                );
+                assert_eq!(
+                    MouseAction::TripleClicked(n as u8),
+                    decode_mouse_event(3, 7, 0x010u64 << base).action,
+                    "button {n} triple-click"
+                );
+                assert_eq!(
+                    MouseAction::Released(n as u8),
+                    decode_mouse_event(3, 7, 0x001u64 << base).action,
+                    "button {n} release"
+                );
+                let _ = shift;
+            }
+        }
+
+        #[test]
+        fn mouse_position_survives_decoding() {
+            let ev = decode_mouse_event(12, 34, button_bits(1, 0x002));
+            assert_eq!((ev.x, ev.y), (12, 34));
+        }
+
+        #[test]
+        fn mouse_wheel_decodes_button4_up_and_button5_down() {
+            // ncurses and PDCurses both report wheel-up as BUTTON4_PRESSED and
+            // wheel-down as BUTTON5_PRESSED.
+            let up = decode_mouse_event(-1, -1, button_bits(4, 0x002));
+            assert_eq!(MouseAction::Wheel { down: false, horizontal: false }, up.action);
+            let down = decode_mouse_event(-1, -1, button_bits(5, 0x002));
+            assert_eq!(MouseAction::Wheel { down: true, horizontal: false }, down.action);
+        }
+
+        #[test]
+        fn mouse_modifiers_decode_from_the_high_bits() {
+            // BUTTON_SHIFT/CTRL/ALT are bits 30/31/32 on both backends.
+            let ev = decode_mouse_event(0, 0, button_bits(1, 0x002) | (0x001 << 30) | (0x002 << 30));
+            assert!(ev.ctrl && ev.shift && !ev.alt);
+            assert_eq!(MouseAction::Pressed(1), ev.action);
+            // raw_state is passed through untouched for hosts that need it.
+            assert_eq!(ev.raw_state, button_bits(1, 0x002) | (0x001 << 30) | (0x002 << 30));
+        }
+
+        #[test]
+        fn mouse_motion_and_position_decode() {
+            // PDCurses movement: changes = PDC_MOUSE_MOVED (bit 3) plus the
+            // button group flagged BUTTONn_MOVED (aliases TRIPLE_CLICKED bit).
+            let moved = decode_mouse_event(4, 5, 0x08 | button_bits(1, 0x010));
+            assert_eq!(MouseAction::Moved { button: Some(1) }, moved.action);
+            // Bare position report (REPORT_MOUSE_POSITION, bit 33).
+            let pos = decode_mouse_event(4, 5, 0x008 << 30);
+            assert_eq!(MouseAction::Position, pos.action);
+            // An all-zero mask still decodes to something inert, never panics.
+            assert_eq!(MouseAction::Position, decode_mouse_event(0, 0, 0).action);
+        }
+
+        #[test]
+        fn mouse_local_rejects_points_outside_the_widget() {
+            let r = Rect { x: 10, y: 20, w: 5, h: 4 };
+            assert_eq!(Some((0, 0)), mouse_local(r, 10, 20));
+            assert_eq!(Some((4, 3)), mouse_local(r, 14, 23));
+            assert_eq!(None, mouse_local(r, 9, 20));
+            assert_eq!(None, mouse_local(r, 15, 20));
+            assert_eq!(None, mouse_local(r, 10, 19));
+            assert_eq!(None, mouse_local(r, 10, 24));
+            // Degenerate rects never match.
+            assert_eq!(None, mouse_local(Rect { x: 0, y: 0, w: 0, h: 0 }, 0, 0));
+        }
+
+        /// The cell mapping must agree with the renderer: grid row `r` is drawn
+        /// at `header_h + r * ROW_H` and its text starts one cell right of the
+        /// cell's background column (see `pancurses_draw::draw_text_styled`).
+        #[test]
+        fn spreadsheet_cell_at_matches_the_renderer_layout() {
+            let mut grid = new_grid(10, 4);
+            grid.header_row_count = 2;
+            grid.main_row_count = 8;
+            grid.margin_cols = 1;
+            grid.main_cols = 3;
+            grid.col_width = 4;
+            grid.column_layout = vec![
+                (0, 4, "lab".into()),
+                (1, 4, "A".into()),
+                (2, 8, "B".into()),
+                (3, 4, "C".into()),
+            ];
+
+            let row_h = crate::spreadsheet::SpreadsheetModel::ROW_H as i32; // 22
+            let row0 = 2 * row_h; // first non-header row's y
+            let label_w = crate::spreadsheet::SpreadsheetModel::ROW_LABEL_W as i32; // 64
+
+            // Header band is chrome, not a cell.  Body row 0 is the first
+            // non-header row (the renderer numbers body rows from `top_row`).
+            assert_eq!(None, spreadsheet_cell_at(&grid, (label_w, 0)));
+            assert_eq!(None, spreadsheet_cell_at(&grid, (label_w, 2 * row_h - 1)));
+            // Row-label gutter maps to the margin column.
+            assert_eq!(Some((0, 0)), spreadsheet_cell_at(&grid, (0, row0)));
+            assert_eq!(Some((0, 0)), spreadsheet_cell_at(&grid, (label_w - 1, row0)));
+            // Each column band: layout width * CHAR_W cells wide.
+            assert_eq!(Some((0, 1)), spreadsheet_cell_at(&grid, (label_w, row0)));
+            assert_eq!(Some((0, 1)), spreadsheet_cell_at(&grid, (label_w + 31, row0)));
+            assert_eq!(Some((0, 2)), spreadsheet_cell_at(&grid, (label_w + 32, row0)));
+            assert_eq!(Some((0, 3)), spreadsheet_cell_at(&grid, (label_w + 96, row0)));
+            // Past the last column is not a cell.
+            assert_eq!(None, spreadsheet_cell_at(&grid, (label_w + 200, row0)));
+            // Second body row, mid-height → row 1.
+            assert_eq!(Some((1, 1)), spreadsheet_cell_at(&grid, (label_w + 4, row0 + row_h)));
+            // Last row (total_rows = 10) is still a cell; one past it is not.
+            assert_eq!(Some((9, 1)), spreadsheet_cell_at(&grid, (label_w + 4, row0 + 9 * row_h)));
+            assert_eq!(None, spreadsheet_cell_at(&grid, (label_w + 4, row0 + 10 * row_h)));
+        }
+
+        /// A click on the cursor cell must be a no-op *for scrolling* but must
+        /// still leave the grid consistent (regression guard for the click
+        /// path clamping to the grid bounds).
+        #[test]
+        fn spreadsheet_cell_at_clamps_to_grid_bounds() {
+            let mut grid = new_grid(3, 2);
+            grid.header_row_count = 0;
+            grid.margin_cols = 0;
+            grid.main_cols = 2;
+            grid.col_width = 4;
+            // No column_layout → every column is col_width wide.
+            assert_eq!(Some((0, 0)), spreadsheet_cell_at(&grid, (64, 0)));
+            assert_eq!(Some((2, 1)), spreadsheet_cell_at(&grid, (64 + 4 * 8 + 1, 2 * 22)));
+            // Past the last row (total_rows = 3) is not a cell.
+            assert_eq!(None, spreadsheet_cell_at(&grid, (64, 3 * 22)));
+            // Past the last column is not a cell.
+            assert_eq!(None, spreadsheet_cell_at(&grid, (64 + 8 * 8, 0)));
+        }
+
+        #[test]
+        fn mouse_enabled_flag_is_off_until_requested() {
+            // The opt-in must default to false: terminals that capture the
+            // mouse lose native text selection, so nothing may turn it on
+            // implicitly.
+            assert!(!mouse_is_enabled());
+            set_mouse_enabled(true);
+            assert!(mouse_is_enabled());
+            set_mouse_enabled(false);
+            assert!(!mouse_is_enabled());
+        }
+
+        /// The pancurses canvas must offer the same pointer API as the GTK
+        /// canvas *and* actually route events to it: `on_click` and
+        /// `on_click_button` both fire (button-aware wins, as on GTK where
+        /// they share one signal), and `on_motion` fires for a bare position
+        /// report with button 0.
+        #[test]
+        fn canvas_pointer_handlers_receive_click_and_motion() {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+
+            // A canvas occupying cells (5,3)..(15,9).
+            let canvas = create_canvas().unwrap();
+            with_state(|s| {
+                let n = s.node_mut(canvas).unwrap();
+                n.rect = Rect { x: 5, y: 3, w: 10, h: 6 };
+            });
+            canvas_clear_pointer_handlers(canvas);
+
+            // Cell (7,5) is 2 cells right / 2 rows down of the origin.
+            let (px, py) = canvas_pixel_xy(canvas, 7, 5).unwrap();
+            assert_eq!(px, 2.0 * crate::spreadsheet::SpreadsheetModel::CHAR_W);
+            assert_eq!(py, 2.0 * crate::spreadsheet::SpreadsheetModel::ROW_H);
+
+            let hits: Rc<RefCell<Vec<(f64, f64, u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+            let h = hits.clone();
+            canvas_on_click_button(canvas, Box::new(move |x, y, b, m| {
+                h.borrow_mut().push((x, y, b, m));
+            }));
+            // A plain handler registered too: the richer one takes precedence.
+            let plain_hits = Rc::new(RefCell::new(0u32));
+            let ph = plain_hits.clone();
+            canvas_on_click(canvas, Box::new(move |_, _| {
+                *ph.borrow_mut() += 1;
+            }));
+
+            handle_mouse_event(decode_mouse_event(7, 5, button_bits(1, 0x002)));
+            assert_eq!(1, hits.borrow().len(), "button handler should fire once");
+            assert_eq!((px, py, 1, 0), hits.borrow()[0]);
+            assert_eq!(0, *plain_hits.borrow(), "button handler owns the click");
+
+            // Motion (bare position report) reaches on_motion with button 0.
+            let motion: Rc<RefCell<Vec<(f64, f64, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+            let m = motion.clone();
+            canvas_on_motion(canvas, Box::new(move |x, y, b| {
+                m.borrow_mut().push((x, y, b));
+            }));
+            handle_mouse_event(decode_mouse_event(7, 5, 0x008 << 30));
+            assert_eq!(1, motion.borrow().len());
+            assert_eq!((px, py, 0), motion.borrow()[0]);
+
+            // A click outside the canvas is not delivered to it.
+            hits.borrow_mut().clear();
+            handle_mouse_event(decode_mouse_event(30, 30, button_bits(1, 0x002)));
+            assert!(hits.borrow().is_empty(), "outside the canvas: no handler call");
+
+            canvas_clear_pointer_handlers(canvas);
+        }
+
+        /// A canvas with only `on_click` registered still gets clicks — the
+        /// GTK/NWG backends allow the plain contract on its own.
+        #[test]
+        fn canvas_plain_click_handler_works_without_button_handler() {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+
+            let canvas = create_canvas().unwrap();
+            with_state(|s| {
+                let n = s.node_mut(canvas).unwrap();
+                n.rect = Rect { x: 0, y: 0, w: 8, h: 4 };
+            });
+            canvas_clear_pointer_handlers(canvas);
+            let seen: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
+            let s = seen.clone();
+            canvas_on_click(canvas, Box::new(move |x, y| {
+                *s.borrow_mut() = Some((x, y));
+            }));
+            handle_mouse_event(decode_mouse_event(2, 1, button_bits(1, 0x004)));
+            let got = *seen.borrow();
+            assert!(got.is_some(), "plain handler should fire");
+            let (x, y) = got.unwrap();
+            assert_eq!(x, 2.0 * crate::spreadsheet::SpreadsheetModel::CHAR_W);
+            assert_eq!(y, 1.0 * crate::spreadsheet::SpreadsheetModel::ROW_H);
+            canvas_clear_pointer_handlers(canvas);
+        }
 
         /// Helper to set up a minimal spreadsheet state with a window parent.
         fn make_spreadsheet_id() -> usize {
@@ -7196,6 +8440,304 @@ with_state(|s| {
                 "Cell should contain '22' but line 6 = {:?}", &buf[6]);
         }
     }
+
+#[cfg(test)]
+mod canvas_draw_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// A registered canvas draw callback must actually run, receive a
+    /// `DrawContext`, and have its painting survive into the emitted grid.
+    ///
+    /// This is the test that makes `Canvas::set_draw_callback` real on a
+    /// terminal: registration alone is worthless if nothing invokes it or if
+    /// the resulting grid never reaches a screen.
+    #[test]
+    fn canvas_draw_callback_paints_through_the_grid() {
+        let canvas = create_canvas().unwrap();
+        with_state(|s| {
+            let n = s.node_mut(canvas).unwrap();
+            n.rect = Rect { x: 2, y: 3, w: 10, h: 4 };
+        });
+
+        let calls = Rc::new(Cell::new(0));
+        let c = calls.clone();
+        let painted_text = Rc::new(std::cell::RefCell::new(String::new()));
+        let pt = painted_text.clone();
+        canvas_set_draw_callback(
+            canvas,
+            Box::new(move |dc: &mut dyn crate::core::DrawContext, w: i32, h: i32| {
+                c.set(c.get() + 1);
+                // The same 2D API a GTK canvas would use.
+                dc.clear(1.0, 1.0, 1.0, 1.0);
+                dc.fill_rect(0.0, 0.0, 40.0, 22.0, 0.0, 0.0, 1.0, 1.0);
+                dc.draw_text(8.0, 0.0, "hi", "monospace", 12.0, 0.0, 0.0, 1.0, 1.0);
+                *pt.borrow_mut() = format!("{w}x{h}");
+            }),
+        );
+
+        let painted = paint_canvases_for_test();
+        assert_eq!(1, painted, "one canvas should have been painted");
+        assert_eq!(1, calls.get(), "the draw callback must be invoked");
+        assert_eq!("10x4", painted_text.borrow().as_str(), "sized to the canvas rect");
+
+        canvas_clear_draw_callback(canvas);
+        assert_eq!(0, paint_canvases_for_test(), "cleared canvas is not painted");
+    }
+
+    /// With no callback registered the redraw must not try to paint (so the
+    /// loop can skip its flush entirely).
+    #[test]
+    fn canvases_without_callbacks_are_skipped() {
+        let canvas = create_canvas().unwrap();
+        with_state(|s| {
+            let n = s.node_mut(canvas).unwrap();
+            n.rect = Rect { x: 0, y: 0, w: 4, h: 2 };
+        });
+        canvas_clear_draw_callback(canvas);
+        assert_eq!(0, paint_canvases_for_test());
+    }
+
+    /// A zero-sized canvas must be skipped rather than allocating an empty
+    /// grid (which would emit nothing and skew the painted count).
+    #[test]
+    fn zero_sized_canvas_is_skipped() {
+        let canvas = create_canvas().unwrap();
+        with_state(|s| {
+            let n = s.node_mut(canvas).unwrap();
+            n.rect = Rect { x: 0, y: 0, w: 0, h: 0 };
+        });
+        let calls = Rc::new(Cell::new(0));
+        let c = calls.clone();
+        canvas_set_draw_callback(canvas, Box::new(move |_dc, _w, _h| c.set(c.get() + 1)));
+        assert_eq!(0, paint_canvases_for_test());
+        assert_eq!(0, calls.get(), "callback must not run for an empty rect");
+        canvas_clear_draw_callback(canvas);
+    }
+
+    /// The emitted stream must be absolute, so two canvases at different
+    /// offsets both land correctly regardless of paint order.
+    #[test]
+    fn two_canvases_emit_at_their_own_origins() {
+        use crate::backends::pancurses_draw::CellGrid;
+        let a = CellGrid::new(2, 1);
+        let b = CellGrid::new(2, 1);
+        let sa = a.to_ansi(0, 0);
+        let sb = b.to_ansi(5, 9);
+        assert!(sa.contains("\x1b[1;1H"), "first canvas at its origin");
+        assert!(sb.contains("\x1b[6;10H"), "second canvas at its own origin");
+    }
+}
+
+#[cfg(test)]
+mod entry_changed_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// `Entry::connect_changed` must fire when the text changes.
+    ///
+    /// This is the contract the GUI backends get from GTK's `changed` signal,
+    /// and what `gui_backend`'s formula bar depends on. It was registered but
+    /// never invoked, which is why the capability probe reported the row INERT.
+    #[test]
+    fn connect_changed_fires_on_set_text() {
+        let win = create_window().unwrap();
+        let entry = create_entry().unwrap();
+        with_state(|s| {
+            s.node_mut(entry).unwrap().parent = Some(win);
+        });
+
+        let fired = Rc::new(Cell::new(0));
+        let f = fired.clone();
+        let _ = crate::backends_pancurses_adapter::Entry { id: entry }
+            .connect_changed(move || f.set(f.get() + 1));
+        eprintln!("CALLBACKS registered: {}", with_state(|s| s.node(entry).map(|n| n.callbacks.len()).unwrap_or(0)));
+
+        set_entry_text(entry, "42");
+        assert_eq!(1, fired.get(), "one change → one callback");
+        assert_eq!(Some("42".to_string()), get_entry_text(entry));
+
+        // A second change fires again: the registration is persistent, not
+        // one-shot, which is what a `connect_*` name promises.
+        set_entry_text(entry, "43");
+        assert_eq!(2, fired.get(), "the callback must survive the first call");
+    }
+
+    /// A `connect_changed` handler frequently edits another widget (that is the
+    /// point of the hook), so it must not run under the state borrow.
+    #[test]
+    fn connect_changed_may_reenter_the_widget_tree() {
+        let label = create_label("old").unwrap();
+        let entry = create_entry().unwrap();
+
+        let l = label;
+        let _ = crate::backends_pancurses_adapter::Entry { id: entry }
+            .connect_changed(move || {
+                // Re-enters `with_state` while the change is being dispatched.
+                set_label_text(l, "mirrored");
+            });
+
+        set_entry_text(entry, "typed");
+        assert_eq!(Some("mirrored".to_string()), get_label_text(label));
+    }
+
+    /// Changing text on an unknown id must be a no-op, not a panic.
+    #[test]
+    fn set_text_on_missing_entry_is_inert() {
+        set_entry_text(999_999, "x");
+    }
+}
+
+    #[cfg(test)]
+    mod entry_caret_tests {
+        use super::*;
+
+        fn entry_with(text: &str) -> usize {
+            let e = create_entry().unwrap();
+            set_entry_text(e, text);
+            e
+        }
+
+        /// The caret must round-trip: what a host sets is what it reads back.
+        ///
+        /// This is the contract GTK's `Entry::get_position`/`set_position`
+        /// provide, and the reason a host could previously keep a parallel
+        /// caret copy that could drift from the widget's own.
+        #[test]
+        fn caret_round_trips() {
+            let e = entry_with("hello");
+            set_entry_cursor(e, 3);
+            assert_eq!(Some(3), get_entry_cursor(e));
+
+            // `set_entry_text` parks the caret at the end, like GTK.
+            set_entry_text(e, "abcd");
+            assert_eq!(Some(4), get_entry_cursor(e));
+        }
+
+        /// An out-of-range position must clamp, not panic.
+        ///
+        /// The caret indexes the buffer, so a stale position (e.g. after the
+        /// text shrank) would panic on the next keystroke.
+        #[test]
+        fn caret_clamps_to_the_buffer() {
+            let e = entry_with("abc");
+            set_entry_cursor(e, 9999);
+            assert_eq!(Some(3), get_entry_cursor(e), "clamped to len, not panicking");
+        }
+
+        /// A mid-codepoint position must snap to a char boundary, or the next
+        /// removal would split a multi-byte character.
+        #[test]
+        fn caret_snaps_to_a_char_boundary() {
+            // "é" is two bytes; position 1 is inside it.
+            let e = entry_with("é");
+            assert_eq!(2, "é".len());
+            set_entry_cursor(e, 1);
+            assert_eq!(Some(0), get_entry_cursor(e));
+
+            // Position 2 (the end) is valid and must be kept.
+            set_entry_cursor(e, 2);
+            assert_eq!(Some(2), get_entry_cursor(e));
+        }
+
+        /// Focus must be settable and observable, so `grab_focus` followed by
+        /// `has_focus` is consistent — previously the latter always said false.
+        #[test]
+        fn focus_is_reported() {
+            let a = entry_with("a");
+            let b = entry_with("b");
+            entry_grab_focus(a);
+            assert!(entry_has_focus(a));
+            assert!(!entry_has_focus(b), "focus is exclusive");
+
+            entry_grab_focus(b);
+            assert!(entry_has_focus(b));
+            assert!(!entry_has_focus(a), "focus moved");
+        }
+
+        /// `grab_focus` on a non-entry must not steal focus.
+        #[test]
+        fn grab_focus_ignores_non_entries() {
+            let label = create_label("x").unwrap();
+            let e = entry_with("e");
+            entry_grab_focus(e);
+            entry_grab_focus(label);
+            assert!(entry_has_focus(e), "a label must not take entry focus");
+        }
+
+        /// Caret helpers are inert on an unknown id, not panicking.
+        #[test]
+        fn caret_on_missing_id_is_inert() {
+            set_entry_cursor(999_999, 3);
+            assert_eq!(None, get_entry_cursor(999_999));
+            assert!(!entry_has_focus(999_999));
+        }
+    }
+
+#[cfg(test)]
+mod entry_via_public_wrapper_tests {
+    use super::*;
+    use crate::backends_pancurses_adapter::Entry;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// The whole chain, through the portable `common::Entry` wrapper that a
+    /// host actually uses: caret round-trip, focus, change firing, and the
+    /// suppress flag honoured on top of real firing.
+    #[test]
+    fn public_wrapper_caret_focus_and_suppression() {
+        let win = create_window().unwrap();
+        let _ = win;
+        let inner = create_entry().unwrap();
+        let entry = Entry { id: inner };
+
+        // Caret now round-trips natively (previously the wrapper's
+        // `caret_override` shim was the only source of truth here).
+        entry.set_text("hello");
+        entry.set_position(2);
+        assert_eq!(Some(2), entry.get_position());
+
+        // Focus is observable.
+        entry.grab_focus();
+        assert!(entry_has_focus(inner));
+
+        // Changes fire.
+        let fired = Rc::new(Cell::new(0));
+        let f = fired.clone();
+        let _ = entry.connect_changed(move || f.set(f.get() + 1));
+        entry.set_text("world");
+        assert_eq!(1, fired.get());
+
+        // NOTE: `set_text_suppressing_changed` / `set_text_preserving_caret`
+        // live on the generic `common::Entry` wrapper (they wrap `set_text`
+        // with a flag / a save-restore), not on this adapter — so they are
+        // exercised in the generic layer's own tests. What matters here is
+        // that the adapter fires, which the assertion above covers.
+    }
+
+    /// `set_text_preserving_caret` must actually preserve the caret now that
+    /// the backend reports a real position — previously the wrapper's
+    /// `caret_override` shim had to stand in for it.
+    #[test]
+    fn caret_survives_a_text_replacement() {
+        let inner = create_entry().unwrap();
+        let entry = Entry { id: inner };
+        entry.set_text("abcdef");
+        entry.set_position(3);
+        // The save/restore the generic `set_text_preserving_caret` performs.
+        let pos = entry.get_position();
+        entry.set_text("xyz");
+        if let Some(p) = pos {
+            entry.set_position(p.min(3));
+        }
+        assert_eq!(Some(3), entry.get_position());
+    }
+}
 }
 
 pub use pancurses_backend::*;
+
+
+

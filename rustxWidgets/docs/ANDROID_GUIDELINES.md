@@ -84,7 +84,7 @@ edit-build-install cycle is far slower.
 | Class | Contract |
 |---|---|
 | `MainActivity` | `nativeInit(Activity, LinearLayout)`: calls `init_with_layout`, then runs the app. |
-| Canvas view (default class `com.corro.SheetView`) | `(Context, long canvasId)` ctor; `onDraw(Canvas)` → `nativeOnDraw(id, canvas, w, h)`; `onTouchEvent` → `nativeOnTouch(id, x, y)`. Register the class with `set_sheet_view_class`. |
+| Canvas view (default class `com.corro.SheetView`) | `(Context, long canvasId)` ctor; `onDraw(Canvas)` → `nativeOnDraw(id, canvas, w, h)`. Register the class with `set_sheet_view_class`. See "Touch gestures" below for the pointer contract. |
 | Text watcher (`com.corro.CorroTextWatcher`) | `(long viewPtr)` ctor; `afterTextChanged` → `nativeEntryChanged(viewPtr)`. |
 | Editor action (`com.corro.CorroEditorAction`) | `(long viewPtr)` ctor; `onEditorAction` → `nativeEntryActivate(viewPtr)` for IME Done/Enter. |
 | Key listener (`com.corro.CorroKeyListener`) | `(long viewPtr)` ctor; `onKey` → `nativeEntryActivate(viewPtr)` for hardware/adb Enter. |
@@ -95,6 +95,51 @@ renders); the typing/commit path simply stays inactive.
 Every `native*` declaration needs its own `#[no_mangle]` export in the
 cdylib — including when two shims share one Rust dispatch. A missing export
 only shows up at runtime as `UnsatisfiedLinkError`.
+
+### 3.1 Touch gestures (pinch to zoom; drag pans unless a long press armed select)
+
+The canvas view classifies the raw touch stream and reports it; what a gesture
+*means* is Rust's decision, so the desktop and phone rules live in one place
+(`rswidgets::gridview`, mirrored for corro's live sheet in
+`gui_backend::mobile_gesture`). One gesture means different things on different
+pointers:
+
+| Gesture | Meaning |
+|---|---|
+| Pinch | The sheet's view scale (0.4x..4x), like a photo. |
+| Finger drag | Pans the sheet. |
+| Long press, then drag | Selects a range — the phone's substitute for shift-click. |
+| Tap | Moves the cursor to the tapped cell. |
+| Mouse/stylus drag | Selects (detected via `MotionEvent.getToolType`). |
+| Double tap | Resets the zoom to 1x. |
+
+The exports a canvas view may call (all in `corro::gui::android_backend`, all
+optional — a view that implements none still taps and draws):
+
+| Java native | Rust export | Purpose |
+|---|---|---|
+| `nativeGestureDown(x, y, isTouch)` | `Java_..._nativeGestureDown` | Begin a gesture; `isTouch` picks the platform rule. |
+| `nativeGestureMove(x, y) -> int` | `Java_..._nativeGestureMove` | Outcome code: 0 ignored, 1 select, 2 scroll, 3 tap, 4 long press. |
+| `nativeGestureUp(x, y)` | `Java_..._nativeGestureUp` | End it; a non-drag release is applied as a tap. |
+| `nativeGestureLongPress(x, y)` | `Java_..._nativeGestureLongPress` | Arm selection for the drag that follows. |
+| `nativeGestureCancel()` | `Java_..._nativeGestureCancel` | Drop the gesture without a tap (a second finger arrived, the system stole the touch). |
+| `nativeDragBy(dx, dy) -> int[]` | `Java_..._nativeDragBy` | Convert a pan in pixels to `[dRows, dCols]` with the live (zoom-aware) metrics. |
+| `nativeZoom(factor) -> float` | `Java_..._nativeZoom` | Multiply the view scale by a pinch's span ratio. |
+| `nativeResetZoom() -> float` | `Java_..._nativeResetZoom` | Back to 1x. |
+| `nativeCellSize() -> float[]` | `Java_..._nativeCellSize` | `[row_h, col_w]` in device pixels — **re-read after every zoom**. |
+
+Two rules that matter:
+
+* The pixel→cell conversion must happen in Rust, not Java. The metrics change
+  with a pinch, so a cell size cached on the Java side pans by the stale amount
+  after a zoom. The Java side keeps only the *sub-cell remainder*.
+* A second finger must cancel the one-finger gesture (`ACTION_POINTER_DOWN` →
+  `nativeGestureCancel`), or a pinch also scrolls the sheet underneath itself.
+
+The iOS analogue is the same table with `corro_ios_canvas_*` names (see
+IOS_GUIDELINES.md §3), and the widget-level API is
+`rswidgets::gridview::GridView::{zoom, set_zoom, zoom_by, on_zoom,
+pointer_down, pointer_move, pointer_up, pointer_long_press}`.
 
 ## 4. Threading
 
