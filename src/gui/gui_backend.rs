@@ -6618,6 +6618,14 @@ fn arm_edit_script(state: &Rc<GuiState>) {
         if !due(step.at_ms as f64) {
             return true; // not due yet
         }
+        // Past this point the tick does real work, and a foreign ObjC throw
+        // anywhere in it aborts the process with no trace - which is what
+        // happened: the tick reached 406ms (the first edit is due at 400ms),
+        // printed nothing more, and the app was gone. So each stage is
+        // marked, and they are removed once the path is known good.
+        crate::gui::ios_backend::log_ios(&format!(
+            "[corro] edit tick: step {i} due, showing text"
+        ));
         let addr = crate::grid::CellAddr::Main { row: step.row, col: step.col };
         let chars: Vec<char> = step.value.chars().collect();
         // How far the typing should have got by now. The step's own timestamp is
@@ -6641,12 +6649,18 @@ fn arm_edit_script(state: &Rc<GuiState>) {
             // The in-progress text lives in the entry buffer, which is what the
             // formula bar and the grid's edit overlay both paint from.
             state_for_tick.editing.set(true);
+            crate::gui::ios_backend::log_ios("[corro] edit tick: set_text");
             state_for_tick.formula_entry.set_text_suppressing_changed(&shown);
+            crate::gui::ios_backend::log_ios("[corro] edit tick: set_position");
             state_for_tick.formula_entry.set_position(shown.chars().count());
+            crate::gui::ios_backend::log_ios("[corro] edit tick: update_cursor");
             update_state_cursor(&state_for_tick, app.core.cursor.row, app.core.cursor.col);
+            crate::gui::ios_backend::log_ios("[corro] edit tick: sync_labels");
             sync_chrome_labels(&state_for_tick);
+            crate::gui::ios_backend::log_ios("[corro] edit tick: redraw");
             state_for_tick.canvas.queue_redraw();
             state_for_tick.window.queue_redraw();
+            crate::gui::ios_backend::log_ios("[corro] edit tick: shown ok");
         }
 
         if shown_n >= chars.len() {
