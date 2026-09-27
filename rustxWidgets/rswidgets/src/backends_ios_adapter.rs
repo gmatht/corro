@@ -2873,11 +2873,13 @@ pub fn add_periodic_tick(
         250,
         Box::new(move || {
             let n = fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n == 1 || n == 4 || n == 20 {
-                crate::backends::apple::log_apple(&format!(
-                    "ios: periodic tick has fired {n} times (timer is live)"
-                ));
-            }
+            // Every fire, unconditionally. This used to log only at 1, 4 and
+            // 20, which cannot distinguish "the timer stopped after one fire"
+            // from "it fired 3 times": there was no way to see the tail. A
+            // 250ms timer is ~4 lines/sec, so the log stays readable.
+            crate::backends::apple::log_apple(&format!(
+                "ios: periodic tick has fired {n} times (timer is live)"
+            ));
             true
         }),
     )
