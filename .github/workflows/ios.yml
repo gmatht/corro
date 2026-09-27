@@ -90,6 +90,9 @@ jobs:
   # desktop live-GUI tests (tests/gui_click_commit.rs, tests/gui_edit_parity.rs)
   # against the same `gui_backend` code.
   rust-ios-check:
+    # A hang is a failure, not a stall: this job is a pure compile check and
+    # has no legitimate reason to run long.
+    timeout-minutes: 25
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,6 +126,9 @@ jobs:
 
   # ── The real half: build + boot the app on a Mac ────────────────────
   build-and-boot:
+    # A cold simulator boot plus an app launch measured ~15 min on this
+    # runner, so 45 leaves real headroom while still bounding the job.
+    timeout-minutes: 45
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -335,13 +341,21 @@ jobs:
         run: |
           set -uo pipefail
           SHOT=ios-first-frame.png
+          # Every simctl call is bounded. `simctl launch` and `simctl io
+          # screenshot` block until the simulator answers, and a simulator
+          # that is busy (a second run on the same device, or one wedged by
+          # the app under test) never answers at all: the step then sat in
+          # "Screenshot the first frame" for 50 minutes with no output and
+          # no timeout. A cap costs nothing when things work and is the
+          # difference between a failed run and a hung one.
+          SIMCTL=(timeout 120 xcrun simctl)
           for attempt in $(seq 1 8); do
             # Launching an already-running app activates it rather than
             # starting a second copy, and the readiness wait has proven it is
             # alive, so this cannot fork a second instance.
-            xcrun simctl launch "$SIM_UDID" com.corro.corro >/dev/null 2>&1 || true
+            "${SIMCTL[@]}" launch "$SIM_UDID" com.corro.corro >/dev/null 2>&1 || true
             sleep 3
-            xcrun simctl io "$SIM_UDID" screenshot "$SHOT" >/dev/null 2>&1 || true
+            "${SIMCTL[@]}" io "$SIM_UDID" screenshot "$SHOT" >/dev/null 2>&1 || true
             # `--populated`, not just the light-surface gate: the chrome draws
             # before the scripted edits land, so a plain light-surface check
             # passes on the *first* attempt with an empty sheet, and the verify
@@ -378,7 +392,7 @@ jobs:
           # streaming to /tmp/corro-live.log - so there is nothing to relaunch.
           # Copy it aside for the check, then stop the app.
           cp /tmp/corro-live.log /tmp/corro-console.log 2>/dev/null || : > /tmp/corro-console.log
-          xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
+          timeout 120 xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
           echo "--- app output ---"
           tr -d '\000' < /tmp/corro-console.log | head -80 || echo "(no output)"
 
