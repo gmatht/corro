@@ -6583,8 +6583,21 @@ fn arm_edit_script(state: &Rc<GuiState>) {
     // cannot drift when a tick is late.
     let options = super::movie::GuiMovieOptions::from_env();
     let char_ms = options.char_delay_ms().max(1.0);
-    let tick_ms = (char_ms / 4.0).round().max(1.0) as u32;
-    eprintln!("[corro] edit-script typing {} cps ({char_ms}ms/char)", options.typing_cps);
+    // The tick is a *sampling* interval, not the animation rate: the elapsed
+    // time decides which characters are due, so a coarser tick renders the
+    // same animation, just with coarser steps.
+    //
+    // That matters because the tick is driven by an NSTimer, and CoreFoundation
+    // disables a timer's coalescing source below roughly 10ms - after which it
+    // fires a short burst and then goes quiet for the rest of the run. At
+    // `char_ms / 4` = 11ms the edit-script timer sat right on that floor: it
+    // fired about ten times over a 56-second window, so the very first edit
+    // (due at 400ms) never landed and the sheet stayed blank. A 25ms floor
+    // keeps the timer inside the range where it is actually reliable, and
+    // costs nothing here: the animation is defined by elapsed time either way.
+    const MIN_TICK_MS: u32 = 25;
+    let tick_ms = ((char_ms / 4.0).round() as u32).max(MIN_TICK_MS);
+    eprintln!("[corro] edit-script typing {} cps ({char_ms}ms/char, {tick_ms}ms tick)", options.typing_cps);
 
     let tick = move || -> bool {
         let i = idx.get();
