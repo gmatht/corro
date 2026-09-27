@@ -7516,11 +7516,78 @@ fn display_col_width(sheet: &crate::ops::SheetState, c: usize, mc: usize) -> usi
 
 
 #[cfg(test)]
+/// Serialises every test that writes the process-wide colour scheme.
+///
+/// `rswidgets::core::set_color_scheme` is a **global** — a `RwLock<Theme>`
+/// behind a `static`, with no thread or task scoping. Every test that picks a
+/// scheme, paints, and reads the result is therefore not independent of any
+/// other, and cargo runs test threads in parallel.
+///
+/// The symptom is distinctive and easy to misread: such a test passes 20/20 on
+/// its own and fails perhaps one run in five in the suite. That looks like
+/// flakiness and gets ignored or retried, when it is really a determinism bug
+/// in the test.
+///
+/// One lock, shared by every writer in the crate: a second lock in another
+/// module would not exclude these threads, which is how an earlier attempt at
+/// this left the race in place (`actions.rs` has a fourth scheme-touching test
+/// in the same binary).
+///
+/// Note this cannot help across *test binaries*: rswidgets' own theme tests
+/// live in its own binary, so their writes are in a different process. That is
+/// harmless, and the reason the failure mode is confined to one binary.
+pub(crate) fn lock_scheme_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    static SCHEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A poisoned lock only means another scheme test panicked; the theme is
+    // still a plain global, so recovering is correct and keeps one failure
+    // from cascading into every other test in the binary.
+    SCHEME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// As [`lock_scheme_for_tests`], but also pins the scheme to `Light`.
+///
+/// This is what a test that *reads* the palette wants. Taking only the lock is
+/// not enough: the lock excludes other threads, but it does not make the value
+/// a *given*. A test that asserts light-mode colours and merely hopes nothing
+/// set Night still fails when it runs beside a test that does — and that is
+/// the reader half of the same race, which is why three of these tests were
+/// fixed once and the suite still failed one run in five.
+#[cfg(test)]
+pub(crate) fn light_scheme_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    let guard = lock_scheme_for_tests();
+    rswidgets::core::set_color_scheme(rswidgets::core::ColorScheme::Light);
+    guard
+}
+
+#[cfg(test)]
 mod brightness_tests {
     use super::*;
     use rswidgets::backends::headless::RecordingDrawContext;
     use std::collections::HashMap;
 
+    /// Serialises the tests that drive the colour scheme.
+    ///
+    /// `rswidgets::core::set_color_scheme` writes **process-wide** state, so
+    /// three tests in this module that each pick a scheme, paint, and read the
+    /// result are not independent: cargo runs test threads in parallel, and
+    /// whichever test happens to set the scheme last wins for everybody. The
+    /// symptom is a test that passes 20/20 on its own and fails roughly one run
+    /// in three in the suite — which reads as "flaky" and gets ignored, rather
+    /// than as the determinism bug it is.
+    ///
+    /// It cannot be fixed by restoring the scheme afterwards, because the
+    /// damage is done during the window between another thread's `set` and its
+    /// read. The tests have to be serialised, which is what this lock is for.
+    ///
+    /// Deliberately a plain `Mutex` held for the test's duration, not a
+    /// scheme-scoped helper: a helper would hide the requirement, and the next
+    /// scheme-touching test would forget it.
+    ///
+    /// The lock itself lives in `crate::gui::lock_scheme_for_tests` because
+    /// `actions.rs` has a fourth scheme-touching test
+    /// (`toggle_night_mode_flips_the_palette_and_reports_it`) in this same
+    /// test binary, and a second lock in this module would not exclude it —
+    /// which is exactly how the race survived a first fix.
     fn two_by_two_grid() -> GridBox {
         crate::grid::Grid::new(2, 2).into()
     }
@@ -7530,6 +7597,9 @@ mod brightness_tests {
     /// painted white, so margins were indistinguishable from body content.
     #[test]
     fn margin_cells_render_dimmer_than_main_cells() {
+        // Paints and asserts exact palette values, so it must *state*
+        // the scheme rather than inherit one; see light_scheme_for_tests.
+        let _scheme = super::light_scheme_for_tests();
         let grid = two_by_two_grid();
         let hr = HEADER_ROWS;
         let lm = MARGIN_COLS;
@@ -7592,6 +7662,9 @@ mod brightness_tests {
     /// data by reading the numbers.
     #[test]
     fn totals_column_and_row_render_off_white() {
+        // Paints and asserts exact palette values, so it must *state*
+        // the scheme rather than inherit one; see light_scheme_for_tests.
+        let _scheme = super::light_scheme_for_tests();
         use crate::grid::{CellAddr, ColumnAddr};
 
         let mut grid: GridBox = crate::grid::Grid::new(2, 3).into();
@@ -7687,6 +7760,9 @@ mod brightness_tests {
     /// must not become so dark it outranks the margin.
     #[test]
     fn aggregate_shade_sits_between_data_and_margin() {
+        // Paints and asserts exact palette values, so it must *state*
+        // the scheme rather than inherit one; see light_scheme_for_tests.
+        let _scheme = super::light_scheme_for_tests();
         let p = chrome::palette();
         let (data, margin, agg) = (p.cell_body().0, p.margin_body().0, p.aggregate_body().0);
         assert!(
@@ -7711,6 +7787,8 @@ mod brightness_tests {
     /// the real paint path under both schemes and asserts the surfaces invert.
     #[test]
     fn night_mode_repaints_the_grid_palette() {
+        // The colour scheme is process-wide state; see SCHEME_LOCK.
+        let _scheme = super::lock_scheme_for_tests();
         // Only `ColorScheme` is used: `Role`/`Theme` were imported here for a
         // version of this test that read the toolkit's palette directly, which
         // this one no longer does (it drives corro's own paint path instead).
@@ -7790,6 +7868,8 @@ mod brightness_tests {
     /// the app's own values must still be the historical ones.
     #[test]
     fn the_default_scheme_is_unchanged() {
+        // The colour scheme is process-wide state; see SCHEME_LOCK.
+        let _scheme = super::lock_scheme_for_tests();
         use rswidgets::core::ColorScheme;
         rswidgets::core::set_color_scheme(ColorScheme::Light);
         let pal = chrome::palette();
@@ -7812,6 +7892,8 @@ mod brightness_tests {
     /// states the property rather than a literal.
     #[test]
     fn padlocks_stay_visible_in_night_mode() {
+        // The colour scheme is process-wide state; see SCHEME_LOCK.
+        let _scheme = super::lock_scheme_for_tests();
         use rswidgets::core::ColorScheme;
         rswidgets::core::set_color_scheme(ColorScheme::Night);
         let gutter = chrome::palette().gutter();
@@ -7843,6 +7925,9 @@ mod brightness_tests {
     /// rule it intends to encode.
     #[test]
     fn margin_cells_never_take_the_totals_shade() {
+        // Paints and asserts exact palette values, so it must *state*
+        // the scheme rather than inherit one; see light_scheme_for_tests.
+        let _scheme = super::light_scheme_for_tests();
         use crate::grid::CellAddr;
         let mut grid: GridBox = crate::grid::Grid::new(1, 2).into();
         // The key cell that marks main row 0 as a totals row.
@@ -7902,6 +7987,9 @@ mod brightness_tests {
     /// line it sits on.
     #[test]
     fn cursor_and_selection_outrank_the_totals_shade() {
+        // Paints and asserts exact palette values, so it must *state*
+        // the scheme rather than inherit one; see light_scheme_for_tests.
+        let _scheme = super::light_scheme_for_tests();
         use crate::grid::{CellAddr, ColumnAddr};
 
         let mut grid: GridBox = crate::grid::Grid::new(1, 2).into();
@@ -7991,6 +8079,9 @@ mod brightness_tests {
     /// the intent is the entire column.
     #[test]
     fn row_and_col_kinds_expand_the_body_highlight() {
+        // Paints and asserts exact palette values, so it must *state*
+        // the scheme rather than inherit one; see light_scheme_for_tests.
+        let _scheme = super::light_scheme_for_tests();
         use crate::grid::SelectionKind;
         let grid = two_by_two_grid();
         let hr = HEADER_ROWS;

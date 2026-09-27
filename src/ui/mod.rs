@@ -13666,7 +13666,28 @@ mod drive_feature_tests {
             }
         }
         let out = SharedOut::default();
-        let mut terminal = Terminal::new(CrosstermBackend::new(out.clone())).unwrap();
+        // `Viewport::Fixed` rather than `Terminal::new`, and the reason is
+        // platform-specific enough to be worth writing down.
+        //
+        // `Terminal::new` means `Viewport::Fullscreen`, which asks the backend
+        // for its size — and `CrosstermBackend::size()` calls
+        // `crossterm::terminal::size()`, a real `ioctl` on the controlling
+        // terminal. Under a Linux CI runner that happens to work; on macOS it
+        // returns `Os { code: 35, WouldBlock }` for a session with no tty, so
+        // the `.unwrap()` at the construction site took the whole test down
+        // (found by the macOS workflow's first run, 819 other tests green).
+        //
+        // The size is *known* here — it is a headless stand-in, not a real
+        // terminal — so stating it is both correct and the only construction
+        // that does not touch the tty.
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(out.clone()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
         let paint = |terminal: &mut Terminal<CrosstermBackend<SharedOut>>| {
             terminal
                 .draw(|f| {
