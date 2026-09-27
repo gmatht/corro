@@ -350,10 +350,16 @@ jobs:
           # difference between a failed run and a hung one.
           SIMCTL=(timeout 120 xcrun simctl)
           for attempt in $(seq 1 8); do
-            # Launching an already-running app activates it rather than
-            # starting a second copy, and the readiness wait has proven it is
-            # alive, so this cannot fork a second instance.
-            "${SIMCTL[@]}" launch "$SIM_UDID" com.corro.corro >/dev/null 2>&1 || true
+            # Do NOT `simctl launch` here. On a running app it is not an
+            # "activate": it restarts the process, so every retry threw away
+            # the work the previous one had done. That is invisible in the
+            # output - the loop looked like it was retrying a screenshot, and
+            # in fact it was restarting the app - and it is why the sheet was
+            # blank in all eight frames despite the edits having committed.
+            #
+            # The app is launched once, by the step above, which also waits for
+            # its readiness marker. It is still foreground: `simctl terminate`
+            # has not run, so there is nothing for a re-activation to achieve.
             sleep 3
             "${SIMCTL[@]}" io "$SIM_UDID" screenshot "$SHOT" >/dev/null 2>&1 || true
             # `--populated`, not just the light-surface gate: the chrome draws
@@ -377,7 +383,7 @@ jobs:
               echo "::error::the app has crashed (see the trace in the startup-output step); not retrying the screenshot"
               break
             fi
-            echo "  attempt ${attempt}: still looks like a wallpaper; re-activating"
+            echo "  attempt ${attempt}: not a populated sheet yet; waiting"
             sleep 4
           done
           # Dimensions recorded either way; the verify step is the hard gate, so
