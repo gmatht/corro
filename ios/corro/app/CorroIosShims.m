@@ -435,6 +435,71 @@
 }
 @end
 
+// `Label::set_fixed_width` needs two more, and for the same reason they are
+// declared-but-unimplemented in the generated category: the body is BEHAVIOUR.
+//
+// The generated header declares them so a signature disagreement with the
+// adapter's `msg1iv` is a compile error; the bodies live here. They were
+// missing entirely, and a missing method is not a no-op - Objective-C raises
+// `unrecognized selector sent to instance`, which unwinds through the
+// Objective-C runtime rather than Rust, so the `catch_unwind` in
+// `corro_ios_root_ready` cannot intercept it and the app aborts. That is
+// where the iOS CI runs died, at `addr_label.set_fixed_width(..)`.
+//
+// Why a pin is needed at all: a `UILabel` sized inside a `UIStackView` takes
+// its `-intrinsicContentSize`, and the formula bar's address text changes on
+// every cursor move (`A1` -> `B1` -> `A100`). Without a pin the slot resizes
+// and shoves every sibling packed after it sideways on each keystroke.
+@implementation UIView (CorroWidthPin)
+
+// The constraint installed by `corroSetPinnedWidth:`, kept so a later
+// re-pin can replace it rather than accumulate a second one (a second
+// conflicting required-width constraint makes Auto Layout unsatisfiable, and
+// UIKit resolves that by breaking whichever it likes - which looks like the
+// pin working intermittently).
+static const void *kCorroPinnedWidthKey = &kCorroPinnedWidthKey;
+
+- (void)corroSetPinnedWidth:(NSInteger)width {
+    NSLayoutConstraint *existing =
+        (NSLayoutConstraint *)objc_getAssociatedObject(self, kCorroPinnedWidthKey);
+    if (existing != nil) {
+        [NSLayoutConstraint deactivateConstraints:@[existing]];
+        objc_setAssociatedObject(self, kCorroPinnedWidthKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // A negative width is the documented "release the pin" answer, matching
+    // the adapter's `w.unwrap_or(-1)`.
+    if (width < 0) {
+        return;
+    }
+    // `required` (1000) rather than the default 750: the point of the pin is
+    // to beat the intrinsic content size, and 750 loses that tie.
+    NSLayoutConstraint *pin =
+        [NSLayoutConstraint constraintWithItem:self
+                                     attribute:NSLayoutAttributeWidth
+                                     relatedBy:NSLayoutRelationEqual
+                                        toItem:nil
+                                     attribute:NSLayoutAttributeNotAnAttribute
+                                    multiplier:1.0
+                                      constant:(CGFloat)width];
+    pin.priority = UILayoutPriorityRequired;
+    pin.active = YES;
+    objc_setAssociatedObject(self, kCorroPinnedWidthKey, pin,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// A width equality constraint alone does not settle it: the label's
+// `-intrinsicContentSize` still competes at content-hugging 250. Raising the
+// hugging priority is what makes the pinned width win the conflict, and
+// dropping it back to 250 on release is what lets the label go back to
+// shrink-to-fit.
+- (void)corroSetContentHugging:(NSInteger)priority {
+    [self setContentHuggingPriority:(UILayoutPriority)priority
+                            forAxis:UILayoutConstraintAxisHorizontal];
+}
+
+@end
+
 @implementation CorroIosPicker
 
 - (void)corroAddPickerItem:(NSString *)title {

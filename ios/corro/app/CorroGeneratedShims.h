@@ -42,6 +42,16 @@
 - (void)corroSetCanvasId:(NSInteger)arg0;
 - (CGFloat)corroBoundsWidth;
 - (CGFloat)corroBoundsHeight;
+/// `Label::set_fixed_width`, first half: install (or, for a negative width,
+/// remove) a required width constraint. Hand-written because the body is
+/// BEHAVIOUR, not forwarding - see the note in
+/// `rustxWidgets/src/apple_generator.rs`. Declared here so a signature
+/// mismatch with the adapter's `msg1iv` is a compile error rather than the
+/// uncatchable `unrecognized selector` that killed the app.
+- (void)corroSetPinnedWidth:(NSInteger)arg0;
+/// `Label::set_fixed_width`, second half: the horizontal content-hugging
+/// priority. ONE argument, matching the adapter's `msg1iv`.
+- (void)corroSetContentHugging:(NSInteger)arg0;
 @end
 
 #pragma mark - Hand-written, signature-checked

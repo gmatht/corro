@@ -99,6 +99,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: iOS cfg checks (simulator, arm64 device, 32-bit armv7s)
         run: ios/corro/scripts/check_rswidgets_ios.sh && ios/corro/scripts/check_corro_ios.sh
+      - name: Every selector the backend sends is implemented in a shim
+        # Objective-C raises `unrecognized selector sent to instance` for a
+        # missing method. It does not ignore the message, and the throw
+        # unwinds through the Objective-C runtime rather than through Rust, so
+        # the `catch_unwind` in corro_ios_root_ready cannot intercept it: the
+        # app aborts with no Rust-side trace.
+        #
+        # This was on no workflow at all - it lived only in verify_all.sh,
+        # which nothing calls - which is how `corroSetPinnedWidth:` and
+        # `corroSetContentHugging:` went unimplemented long enough to kill the
+        # app at startup and send two CI runs looking at the screenshot
+        # instead. A one-second check that catches the whole class now runs
+        # on every commit.
+        run: ios/corro/scripts/check_selectors.sh
       - name: Run the iOS host-pipeline preview
         # corro's half of the host contract: the menu model the Swift side
         # turns into a UIMenu, and the entry points CorroBridge.h declares.
