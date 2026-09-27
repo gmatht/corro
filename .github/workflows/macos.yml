@@ -334,6 +334,11 @@ jobs:
           // it. Kept in step with app/CorroMacBridge.h by
           // scripts/check_bridge.sh -- a symbol the Rust crate stops
           // exporting fails the link here.
+          //
+          // It needs its own `main`: linking an executable without one fails
+          // with `Undefined symbols: _main`, which is an error about THIS
+          // file and not about the bridge, so it is worth having here rather
+          // than discovering it as the only complaint the link step makes.
           #import <AppKit/AppKit.h>
           // Resolved via -Iapp below. The quoted include is relative to the
           // *including file* (this one, in /tmp), not to -I, so
@@ -368,6 +373,14 @@ jobs:
               (void)corro_macos_menu_item_count(0);
               (void)corro_macos_menu_item(0, 0, &l, &a);
               corro_macos_root_ready(NULL, NULL);
+          }
+
+          // The program does nothing: this is an ABI test, not a smoke test.
+          // A runner has no window server for a GUI app, so there is nothing
+          // to launch -- what is being proved is that the header and the
+          // staticlib agree, which the link above already did.
+          int main(void) {
+              return 0;
           }
           OBJC
 
