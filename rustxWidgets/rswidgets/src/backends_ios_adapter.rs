@@ -2760,25 +2760,59 @@ const RUN_LOOP_MODES: &[&str] = &["NSRunLoopCommonModes", "NSDefaultRunLoopMode"
 
 #[cfg(target_os = "ios")]
 fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::core::Error> {
-    use crate::backends::apple::{cls, own, selector};
-
     if !crate::backends::apple::is_initialized() {
         return Err(crate::core::Error::Backend(
             "periodic tick requested before the iOS backend was initialised".into(),
         ));
     }
 
-    // The id is needed inside the closure to unregister itself when it returns
-    // false, so it goes through a Cell the closure reads at call time.
+    // The closure the trampoline dispatches: run `f`, and re-arm the next
+    // one-shot unless `f` said to stop.
+    //
+    // The re-arm lives *inside* the dispatched closure rather than in the
+    // trampoline, so the cadence is ours: a one-shot NSTimer is created and
+    // added, and each fire schedules the next. Nothing about the tick depends
+    // on the timer remembering that it is supposed to repeat - which is the
+    // property that could not be relied on here (see the `repeats:NO` note at
+    // the arming site).
     let id_cell: std::rc::Rc<std::cell::Cell<u64>> = std::rc::Rc::new(std::cell::Cell::new(0));
     let id_for_cb = id_cell.clone();
+    let ms_for_cb = ms;
     let mut f = f;
     let registered = crate::backends::apple::register_callback(Box::new(move || {
         if !f() {
             crate::backends::apple::unregister_callback(id_for_cb.get());
+            return;
+        }
+        // Fire again one interval from now. A failure here is logged rather
+        // than propagated: the tick is already gone (it returned true but
+        // nothing is scheduled to call it again), and the honest report is a
+        // log line, not a silent stop.
+        if let Err(e) = arm_one_shot(ms_for_cb, id_for_cb.get()) {
+            crate::backends::apple::log_apple(&format!(
+                "ios: could not re-arm the {ms_for_cb}ms tick: {e}"
+            ));
         }
     }));
     id_cell.set(registered);
+
+    let registered = id_cell.get();
+    arm_one_shot(ms, registered)?;
+    crate::backends::apple::log_apple(&format!(
+        "ios: main-queue one-shot tick armed ({ms}ms, callback #{registered}); \
+         each fire re-arms the next"
+    ));
+    Ok(())
+}
+
+/// Create and schedule ONE one-shot `NSTimer` that calls back into `callback_id`.
+///
+/// Split out of [`schedule_timer`] because the tick re-arms itself: each fire
+/// calls this again for the next interval. The repeat is therefore a fact of
+/// our bookkeeping, not of the timer's internal state.
+#[cfg(target_os = "ios")]
+fn arm_one_shot(ms: u32, callback_id: u64) -> Result<(), crate::core::Error> {
+    use crate::backends::apple::{cls, own, selector};
 
     // `CorroIosTarget targetWithCallbackId:` - the host's trampoline class,
     // which calls corro_ios_callback(id) -> dispatch_callback(id).
@@ -2792,7 +2826,7 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
         ));
     }
     let target =
-        unsafe { crate::backends::apple::msg1i(shim, "targetWithCallbackId:", registered as isize) };
+        unsafe { crate::backends::apple::msg1i(shim, "targetWithCallbackId:", callback_id as isize) };
     if target.is_null() {
         return Err(crate::core::Error::Backend(
             "CorroIosTarget targetWithCallbackId: returned nil".into(),
@@ -2827,6 +2861,17 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
             bool,
         ) -> *mut std::os::raw::c_void =
             std::mem::transmute(crate::backends::apple::msg_shim());
+        // `repeats:NO`, and re-armed from Rust on every fire.
+        //
+        // A repeating NSTimer was the original design and it did not survive
+        // contact with this host: every timer fired exactly once and then went
+        // quiet for the rest of the run, which the per-tick log made visible
+        // (step 0/8 at 221, 227, 251, 276ms, then nothing for 56 seconds).
+        // Whether the `repeats:YES` flag survived the arm64 `objc_msgSend`
+        // cast or CFRunLoop was refusing the coalescing source, arming a
+        // one-shot and re-arming it ourselves does not depend on the answer:
+        // the repeat is a fact of our bookkeeping rather than of the timer's
+        // internal state, and it cannot be lost silently.
         let timer = send(
             timer_cls,
             selector("timerWithTimeInterval:target:selector:userInfo:repeats:"),
@@ -2834,7 +2879,7 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
             target,
             selector("corroFired:"),
             std::ptr::null_mut(),
-            true,
+            false,
         );
         if timer.is_null() {
             return Err(crate::core::Error::Backend(
@@ -2890,11 +2935,10 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
             );
         }
     }
-    crate::backends::apple::log_apple(&format!(
-        "ios: NSTimer on the main run loop ({ms}ms, common modes, target CorroIosTarget#{registered})"
-    ));
     Ok(())
 }
+
+
 
 /// Schedule `f` to run every `ms` milliseconds on the main run loop, returning
 /// `false` from `f` to stop.
