@@ -372,9 +372,16 @@ jobs:
           OBJC
 
           xcrun clang -c /tmp/host_abi.m -o /tmp/host_abi.o -Iapp -fobjc-arc
+          # `-framework objc` is WRONG and fails with `ld: framework 'objc'
+          # not found`: objc is a *library* (libobjc.A.dylib), not a
+          # framework. It is also already in libSystem, so clang links it by
+          # default for any Objective-C file and naming it is unnecessary as
+          # well as invalid. Listed here because the framework spellings below
+          # are load-bearing and it is worth being explicit about which is
+          # which — CoreGraphics in particular MUST be a framework, which is
+          # the bug that failed this job's first run.
           xcrun clang /tmp/host_abi.o "$LIB" -o /tmp/host_abi \
-            -framework AppKit -framework CoreGraphics -framework Foundation \
-            -framework objc
+            -framework AppKit -framework CoreGraphics -framework Foundation
           echo "linked: every corro_macos_* export resolved"
 
       - name: The generated shims and the bridge header are one contract
