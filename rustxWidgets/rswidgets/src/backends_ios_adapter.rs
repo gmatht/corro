@@ -2669,8 +2669,14 @@ mod tests {
         // so the assertion is on the constant rather than on a count of
         // strings in the file: a count is satisfied equally well by the wrong
         // spelling, which is the bug itself.
-        assert_eq!(RUN_LOOP_MODE, "NSRunLoopCommonModes");
-        assert_ne!(RUN_LOOP_MODE, "kCFRunLoopCommonModes");
+        // Not the CoreFoundation constant: `-addTimer:forMode:` takes an
+        // NSRunLoop mode name and does not validate it, so a timer
+        // registered under a name no run loop enters never fires.
+        assert!(RUN_LOOP_MODES.contains(&"NSRunLoopCommonModes"));
+        assert!(RUN_LOOP_MODES.contains(&"NSDefaultRunLoopMode"));
+        for m in RUN_LOOP_MODES {
+            assert_ne!(*m, "kCFRunLoopCommonModes", "{m} is the CF constant");
+        }
     }
 
     #[test]
@@ -2750,7 +2756,7 @@ mod tests {
 /// occurring somewhere in the file (a count is satisfied just as well by the
 /// wrong spelling, which is the bug).
 #[cfg(target_os = "ios")]
-const RUN_LOOP_MODE: &str = "NSRunLoopCommonModes";
+const RUN_LOOP_MODES: &[&str] = &["NSRunLoopCommonModes", "NSDefaultRunLoopMode"];
 
 #[cfg(target_os = "ios")]
 fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::core::Error> {
@@ -2854,28 +2860,35 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
             *mut std::os::raw::c_void,
             *mut std::os::raw::c_void,
         ) = std::mem::transmute(crate::backends::apple::msg_shim());
-        // The mode is `NSRunLoopCommonModes` - the *NSRunLoop mode name*, not
-        // `kCFRunLoopCommonModes`.
         //
-        // Those are two different namespaces that read alike, and the mistake
-        // is silent: `-addTimer:forMode:` takes an NSString mode name and does
-        // not validate it, so a timer registered under a name no run loop ever
-        // enters simply never fires again. A repeating timer registered that
-        // way fires ONCE (the initial fire is queued when it is added) and then
-        // stops for good - which is exactly what was observed: the 250ms liveness
-        // probe logged "fired 1 times" and never reached 2, and the 11ms
-        // edit-script timer committed `A1` and then stopped, leaving the sheet
-        // blank and the screenshot check reporting "no cell text".
+        // Registered in BOTH `NSRunLoopCommonModes` and `NSDefaultRunLoopMode`.
         //
-        // `NSRunLoopCommonModes` is the documented spelling: it is the set
-        // containing every mode UIKit runs, so the timer stays valid across a
-        // scroll-tracking or gesture mode change.
-        add(
-            main_loop,
-            selector("addTimer:forMode:"),
-            timer,
-            crate::backends::apple::nsstring(RUN_LOOP_MODE),
-        );
+        // A timer is only ever fired when the run loop is running in a mode
+        // the timer was registered for, and `-addTimer:forMode:` does not
+        // validate the mode name. `NSRunLoopCommonModes` is a *set* name: a
+        // timer added under it is meant to match any mode in the set, and it
+        // is the documented spelling - but with the timer's first real
+        // opportunity to fire arriving only after `UIApplicationMain` starts
+        // the loop, a single registration here produced a timer that was
+        // scheduled, logged as live, and then never fired at all.
+        //
+        // Registering in both is belt and braces at a cost of one message
+        // send: `NSDefaultRunLoopMode` is the mode UIKit's main run loop
+        // actually runs in, so it is the one that matters, and the common-modes
+        // entry is what keeps the timer valid when UIKit switches modes (a
+        // scroll being tracked, a gesture in progress). Duplicating an NSTimer
+        // across modes is exactly what `NSRunLoopCommonModes` exists to
+        // abstract over, and two entries cannot double-fire: CFRunLoop
+        // de-duplicates by (timer, mode) and a timer only fires when the loop
+        // is in a mode it matches.
+        for mode in RUN_LOOP_MODES {
+            add(
+                main_loop,
+                selector("addTimer:forMode:"),
+                timer,
+                crate::backends::apple::nsstring(mode),
+            );
+        }
     }
     crate::backends::apple::log_apple(&format!(
         "ios: NSTimer on the main run loop ({ms}ms, common modes, target CorroIosTarget#{registered})"
