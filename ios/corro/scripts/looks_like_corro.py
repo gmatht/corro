@@ -107,9 +107,8 @@ def decode_png(path):
     return w, h, channels, rows
 
 
-def measure(path):
-    """(w, h, light_fraction, dark_fraction) over the lower two thirds."""
-    w, h, ch, rows = decode_png(path)
+def light_fractions(w, h, ch, rows):
+    """(light_fraction, dark_fraction) over the lower two thirds."""
     tot = light = dark = 0
     for yy in range(h // 3, h, 2):
         row = rows[yy]
@@ -122,20 +121,58 @@ def measure(path):
             if lum < 110:
                 dark += 1
     t = max(tot, 1)
-    return w, h, light / t, dark / t
+    return light / t, dark / t
+
+
+def measure(path):
+    """(w, h, light_fraction, dark_fraction) over the lower two thirds."""
+    w, h, ch, rows = decode_png(path)
+    light, dark = light_fractions(w, h, ch, rows)
+    return w, h, light, dark
+
+
+# The two data columns the scripted edits write into, as x bands. These are
+# the same bands the workflow's cell-text assertion uses, so "looks like a
+# populated sheet" means the same thing in both places.
+COL_A = (90, 190)
+COL_B = (190, 300)
+# A row band that skips the chrome: the formula bar and the column headers are
+# always drawn, so ink up there proves nothing about the sheet.
+BODY_ROWS = (240, None)
+
+
+def column_ink(w, h, ch, rows, x0, x1):
+    """Ink pixels in an x band, over the sheet body rather than the chrome."""
+    lo = BODY_ROWS[0]
+    hi = BODY_ROWS[1] if BODY_ROWS[1] is not None else h - 60
+    return sum(1 for yy in range(lo, min(hi, len(rows)), 2)
+               for xx in range(x0, x1, 2) if rows[yy][xx * ch] < 100)
 
 
 def main(argv):
-    if len(argv) != 2:
-        print("usage: looks_like_corro.py <png>", file=sys.stderr)
+    if len(argv) < 2:
+        print("usage: looks_like_corro.py <png> [--populated]", file=sys.stderr)
         return 1
     try:
-        w, h, light, dark = measure(argv[1])
+        w, h, ch, rows = decode_png(argv[1])
+        light, dark = light_fractions(w, h, ch, rows)
     except Exception as e:  # unreadable/corrupt: not a pass
         print(f"could not measure {argv[1]}: {e}", file=sys.stderr)
         return 1
+    a = column_ink(w, h, ch, rows, *COL_A)
+    b = column_ink(w, h, ch, rows, *COL_B)
     print(f"{w}x{h} light={light:.1%} dark={dark:.1%} "
-          f"(gate: light >= {LIGHT_GATE:.0%})")
+          f"(gate: light >= {LIGHT_GATE:.0%})  ink colA={a} colB={b}")
+    # `populated` additionally requires cell text, and is what the screenshot
+    # step waits for. Without it the loop accepted the *chrome-only* frame on
+    # its first attempt and the verify step then failed on a blank sheet -
+    # two checks disagreeing about the same image, which is the confusion the
+    # `--populated` flag removes.
+    if len(argv) > 2 and argv[2] == "--populated":
+        if a < 50 or b < 50:
+            print("  ...a light surface, but no cell text in the data columns yet")
+            return 2
+        print("  ...and cell text in two data columns")
     return 0 if light >= LIGHT_GATE else 2
 
 

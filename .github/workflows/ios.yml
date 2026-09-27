@@ -342,8 +342,14 @@ jobs:
             xcrun simctl launch "$SIM_UDID" com.corro.corro >/dev/null 2>&1 || true
             sleep 3
             xcrun simctl io "$SIM_UDID" screenshot "$SHOT" >/dev/null 2>&1 || true
-            if python3 ios/corro/scripts/looks_like_corro.py "$SHOT"; then
-              echo "ok: attempt ${attempt} looks like corro's sheet"
+            # `--populated`, not just the light-surface gate: the chrome draws
+            # before the scripted edits land, so a plain light-surface check
+            # passes on the *first* attempt with an empty sheet, and the verify
+            # step then fails on a blank workbook. Two checks disagreeing about
+            # the same image is the confusion this flag removes - the loop now
+            # waits for the frame the verify step actually wants.
+            if python3 ios/corro/scripts/looks_like_corro.py "$SHOT" --populated; then
+              echo "ok: attempt ${attempt} shows a populated corro sheet"
               break
             fi
             # Retrying is only worth it while the app is still up. If it has
