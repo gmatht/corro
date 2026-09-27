@@ -2653,6 +2653,27 @@ mod tests {
     }
 
     #[test]
+    fn test_timer_run_loop_mode_is_the_nsrunloop_name() {
+        // `-addTimer:forMode:` takes an NSRunLoop *mode name* and does not
+        // validate it, so a timer registered under a name no run loop enters
+        // fires once (the add queues an initial fire) and then stops forever.
+        //
+        // The near-identical `kCFRunLoopCommonModes` is the CoreFoundation
+        // constant, a different namespace: it registers the timer under a
+        // mode nothing ever runs in. That bug stopped the iOS edit-script
+        // timer after a single fire, which left the sheet blank and made the
+        // screenshot check report "no cell text" - a symptom with no obvious
+        // link to a run-loop mode string.
+        //
+        // The mode is named in exactly one place, as a constant the send reads,
+        // so the assertion is on the constant rather than on a count of
+        // strings in the file: a count is satisfied equally well by the wrong
+        // spelling, which is the bug itself.
+        assert_eq!(RUN_LOOP_MODE, "NSRunLoopCommonModes");
+        assert_ne!(RUN_LOOP_MODE, "kCFRunLoopCommonModes");
+    }
+
+    #[test]
     fn test_stack_view_is_never_built_with_plain_init() {
         // A UIStackView sent plain `-init` raises
         // NSInternalInconsistencyException, which unwinds through the
@@ -2716,6 +2737,21 @@ mod tests {
 /// Split out so the liveness probe in [`add_periodic_tick`] uses the identical
 /// scheduling path - a probe taking a different route would prove nothing about
 /// the real timer.
+/// The run-loop mode the periodic-tick timers are registered in.
+///
+/// The `NSRunLoop` **mode name**, which is what `-addTimer:forMode:` takes.
+/// It is not `kCFRunLoopCommonModes`: that is the CoreFoundation constant, a
+/// different namespace that reads almost identically, and `addTimer:forMode:`
+/// does not validate the name it is given. A repeating timer registered under
+/// a mode no run loop enters fires exactly once - the add queues one fire -
+/// and then stops, which is a silent failure with a very distant symptom.
+///
+/// Named once so the tests can assert on the value rather than on a string
+/// occurring somewhere in the file (a count is satisfied just as well by the
+/// wrong spelling, which is the bug).
+#[cfg(target_os = "ios")]
+const RUN_LOOP_MODE: &str = "NSRunLoopCommonModes";
+
 #[cfg(target_os = "ios")]
 fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::core::Error> {
     use crate::backends::apple::{cls, own, selector};
@@ -2818,16 +2854,27 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
             *mut std::os::raw::c_void,
             *mut std::os::raw::c_void,
         ) = std::mem::transmute(crate::backends::apple::msg_shim());
-        // The mode is the string VALUE of NSRunLoopCommonModes, which is
-        // "kCFRunLoopCommonModes" - not the constant's name. Passing
-        // "NSRunLoopCommonModes" looks right and silently registers the timer
-        // under a mode nothing runs in, i.e. it never fires. (Cost: one CI run
-        // in which every timer was created and none ever fired.)
+        // The mode is `NSRunLoopCommonModes` - the *NSRunLoop mode name*, not
+        // `kCFRunLoopCommonModes`.
+        //
+        // Those are two different namespaces that read alike, and the mistake
+        // is silent: `-addTimer:forMode:` takes an NSString mode name and does
+        // not validate it, so a timer registered under a name no run loop ever
+        // enters simply never fires again. A repeating timer registered that
+        // way fires ONCE (the initial fire is queued when it is added) and then
+        // stops for good - which is exactly what was observed: the 250ms liveness
+        // probe logged "fired 1 times" and never reached 2, and the 11ms
+        // edit-script timer committed `A1` and then stopped, leaving the sheet
+        // blank and the screenshot check reporting "no cell text".
+        //
+        // `NSRunLoopCommonModes` is the documented spelling: it is the set
+        // containing every mode UIKit runs, so the timer stays valid across a
+        // scroll-tracking or gesture mode change.
         add(
             main_loop,
             selector("addTimer:forMode:"),
             timer,
-            crate::backends::apple::nsstring("kCFRunLoopCommonModes"),
+            crate::backends::apple::nsstring(RUN_LOOP_MODE),
         );
     }
     crate::backends::apple::log_apple(&format!(
