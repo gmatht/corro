@@ -305,12 +305,40 @@ jobs:
 
       - name: Screenshot the first frame
         # Runs while the detached launch from the previous step is still alive.
+        #
+        # WHY A FOREGROUND + RETRY LOOP. Run #117 uploaded the springboard
+        # *again*, and this time the app had demonstrably come up:
+        # UI_READY_BEFORE_SCREENSHOT=1 and the readiness marker were both in the
+        # console capture. Measured from that artifact: a pink/blue wallpaper
+        # gradient with app icons, no grid.
+        #
+        # `simctl io screenshot` captures whatever the *simulator window* shows,
+        # which is not necessarily the app. Being alive and ready does not make
+        # a process frontmost, so the readiness marker is necessary and not
+        # sufficient -- only the pixels can settle it. So: activate the app,
+        # shoot, and look at the result; repeat if the frame is wrong. The
+        # previous failure mode was taking one shot and trusting it.
         run: |
-          xcrun simctl io "$SIM_UDID" screenshot ios-first-frame.png
-          # A screenshot of the wrong screen is the failure this workflow
-          # shipped once (the home screen, run #97), so record the dimensions
-          # and let the check step verify the image is corro's.
-          file ios-first-frame.png
+          set -uo pipefail
+          SHOT=ios-first-frame.png
+          for attempt in $(seq 1 8); do
+            # Launching an already-running app activates it rather than
+            # starting a second copy, and the readiness wait has proven it is
+            # alive, so this cannot fork a second instance.
+            xcrun simctl launch "$SIM_UDID" com.corro.corro >/dev/null 2>&1 || true
+            sleep 3
+            xcrun simctl io "$SIM_UDID" screenshot "$SHOT" >/dev/null 2>&1 || true
+            if python3 ios/corro/scripts/looks_like_corro.py "$SHOT"; then
+              echo "ok: attempt ${attempt} looks like corro's sheet"
+              break
+            fi
+            echo "  attempt ${attempt}: still looks like a wallpaper; re-activating"
+            sleep 4
+          done
+          # Dimensions recorded either way; the verify step is the hard gate, so
+          # a still-wrong frame is reported there with the same measurement
+          # rather than silently accepted here.
+          file "$SHOT"
 
       - name: Capture the app's startup output (stops the app)
         if: always()
@@ -375,97 +403,84 @@ jobs:
       - name: Verify the screenshot shows corro's sheet WITH text
         if: always()
         run: |
-          # The image was uploaded once while showing the springboard (run #97),
-          # and that is the failure this catches. A first attempt keyed on "is
-          # the centre third greyscale" was too weak to do it: the home screen's
-          # wallpaper scored a spread of 21 against a threshold of 24, i.e. it
-          # would have passed.
+          # The image was uploaded while showing the springboard (runs #97 and
+          # #117), and that is the failure this catches.
           #
-          # The reliable discriminator is *how much of the image is achromatic*,
-          # measured over the lower two thirds (where the grid is). corro's
-          # chrome is neutral throughout; the springboard is a saturated
-          # wallpaper with a dock. Measured on real images:
+          # ⚠️ THE PREVIOUS VERSION OF THIS CHECK REJECTED A CORRECT FRAME. It
+          # measured "how much of the image is achromatic" on the premise that
+          # "corro's chrome is neutral throughout". Theming killed that premise:
+          # `Role::Header` is (0.88, 0.90, 0.93) and `Role::Text` is
+          # (0.05, 0.05, 0.10) -- both blue-tinged, a spread of 13 against a
+          # threshold of 6. So it failed corro's own sheet while passing for
+          # reasons that had nothing to do with the sheet.
           #
-          #   corro, desktop render   100.0% achromatic
-          #   corro, populated grid    98.7%
-          #   iOS home screen (run 97)  2.2%
+          # The replacement asks what a spreadsheet actually IS: a light surface
+          # carrying dark text. `looks_like_corro.py` measures that, and its
+          # docstring records the two real reference images it was calibrated
+          # on (corro 31.0% light, springboard 15.4%). The screenshot is the
+          # primary evidence: if it is wrong, nothing downstream should be able
+          # to argue this step into passing.
+          if ! python3 ios/corro/scripts/looks_like_corro.py ios-first-frame.png; then
+            echo "::error::ios-first-frame.png does not look like corro's sheet."
+            echo "::error::A spreadsheet is a LIGHT surface carrying dark text; a"
+            echo "::error::saturated wallpaper is neither. See the numbers above."
+            exit 1
+          fi
+          echo "ok: a light surface, as a spreadsheet is"
+
+          # ── the "WITH text" half ──────────────────────────────────────────
+          # Kept as a separate heredoc because it needs the decoded rows, and
+          # it is the check that "is it corro's chrome?" cannot do: a blank
+          # workbook is chrome only, with no values, and that shipped twice.
           #
-          # So a 50% floor has an enormous margin either way, and is not picky
-          # about the exact palette corro happens to use.
+          # Deliberately NOT a positional assertion. One was written and
+          # removed again: it keyed on a 40-device-pixel row pitch, but iOS
+          # scales its metrics by UIScreen.scale, so the real pitch on this 2x
+          # simulator is 80px -- the check failed the CORRECT frame. A check
+          # that guesses the geometry is worse than no check.
           python3 - <<'PY'
           import struct, sys, zlib
-
-          path = "ios-first-frame.png"
-          data = open(path, "rb").read()
+          data = open("ios-first-frame.png", "rb").read()
           if data[:8] != b"\x89PNG\r\n\x1a\n":
-              sys.exit(f"{path} is not a PNG")
-
-          pos, idat, w, h, bitd, ctype = 8, b"", 0, 0, 0, 0
+              print("::error::ios-first-frame.png is not a PNG")
+              sys.exit(1)
+          pos, idat, w, h, ctype = 8, b"", 0, 0, 0
           while pos < len(data):
               ln = struct.unpack(">I", data[pos:pos+4])[0]
               typ = data[pos+4:pos+8]
               body = data[pos+8:pos+8+ln]
               if typ == b"IHDR":
-                  w, h, bitd, ctype = struct.unpack(">IIBB", body[:10])
+                  w, h, _bd, ctype = struct.unpack(">IIBB", body[:10])
               elif typ == b"IDAT":
                   idat += body
-              elif typ == b"IEND":
-                  break
               pos += 12 + ln
-
-          if bitd != 8 or ctype not in (2, 6):
-              print(f"(unhandled PNG: bit_depth={bitd} colour_type={ctype}); skipping")
-              sys.exit(0)
-
-          ch = 3 if ctype == 2 else 4
+          ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
           raw = zlib.decompress(idat)
           stride = w * ch
-          prev = bytearray(stride)
-          rows, y = [], 0
-          for i in range(0, len(raw), stride + 1):
-              f = raw[i]
-              line = bytearray(raw[i+1:i+1+stride])
-              for x in range(stride):
-                  a = line[x-ch] if x >= ch else 0
-                  b = prev[x]
-                  c = prev[x-ch] if x >= ch else 0
-                  if f == 1:
-                      line[x] = (line[x] + a) & 0xFF
-                  elif f == 2:
-                      line[x] = (line[x] + b) & 0xFF
-                  elif f == 3:
-                      line[x] = (line[x] + ((a + b) >> 1)) & 0xFF
-                  elif f == 4:
+          rows, prev = [], bytearray(stride)
+          i = 0
+          for _y in range(h):
+              f = raw[i]; i += 1
+              line = bytearray(raw[i:i+stride]); i += stride
+              if f == 1:
+                  for x in range(ch, stride): line[x] = (line[x] + line[x-ch]) & 0xFF
+              elif f == 2:
+                  for x in range(stride): line[x] = (line[x] + prev[x]) & 0xFF
+              elif f == 3:
+                  for x in range(stride):
+                      a = line[x-ch] if x >= ch else 0
+                      line[x] = (line[x] + ((a + prev[x]) >> 1)) & 0xFF
+              elif f == 4:
+                  for x in range(stride):
+                      a = line[x-ch] if x >= ch else 0
+                      b = prev[x]
+                      c = prev[x-ch] if x >= ch else 0
                       p = a + b - c
                       pa, pb, pc = abs(p-a), abs(p-b), abs(p-c)
                       pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
                       line[x] = (line[x] + pr) & 0xFF
               rows.append(bytes(line))
               prev = line
-              y += 1
-              if y >= h:
-                  break
-
-          # Achromatic fraction over the lower two thirds.
-          tot = grey = 0
-          for yy in range(h // 3, h, 2):
-              row = rows[yy]
-              for xx in range(0, w, 2):
-                  o = xx * ch
-                  r, g, b = row[o], row[o+1], row[o+2]
-                  tot += 1
-                  if max(r, g, b) - min(r, g, b) <= 6:
-                      grey += 1
-          frac = grey / max(tot, 1)
-          print(f"{w}x{h}: achromatic fraction over the lower 2/3 = {frac:.1%}")
-
-          if frac < 0.5:
-              print("::error::ios-first-frame.png does not look like corro — its chrome is neutral")
-              print("::error::grey, and only %.1f%% of this image is. This is the run #97" % (frac * 100))
-              print("::error::failure: the screenshot captured the simulator's home screen.")
-              sys.exit(1)
-          print("ok: neutral grey throughout, as corro's chrome is")
-
           # Cell TEXT must be present. This is the check the earlier frames
           # needed and did not have: "is it corro's chrome?" cannot see a blank
           # workbook (chrome only, no values), which is what shipped twice.
