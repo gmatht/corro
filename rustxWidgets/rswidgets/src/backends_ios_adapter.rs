@@ -2345,14 +2345,24 @@ mod ios_adapter {
         if bx.is_null() {
             return Ok(BoxWidget(bx));
         }
+        // Each message send below is a potential *foreign* throw, and a throw
+        // here cannot be caught by `catch_unwind` (see `alloc_init_class`):
+        // the process aborts with no Rust-side trace. The phase markers are
+        // the only way to tell which one did it, so they stay until the
+        // selector contract is known to hold.
+        core_ios::log_ios(&format!("create_box: constructed {class_name}"));
         unsafe {
             // 0 = horizontal, 1 = vertical: NSLayoutConstraint's axis
             // convention and Android's LinearLayout constants agree.
             msg1iv(bx, "setAxis:", orientation.as_int() as isize);
+        }
+        core_ios::log_ios("create_box: setAxis ok");
+        unsafe {
             // `setSpacing:` takes a CGFloat; the integer overload via
             // `corroSetSpacing:` keeps the ABI simple on 32-bit.
             msg1iv(bx, "corroSetSpacing:", spacing as isize);
         }
+        core_ios::log_ios("create_box: corroSetSpacing ok");
         Ok(BoxWidget(bx))
     }
 
