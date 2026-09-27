@@ -2788,6 +2788,9 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
         // than propagated: the tick is already gone (it returned true but
         // nothing is scheduled to call it again), and the honest report is a
         // log line, not a silent stop.
+        crate::backends::apple::log_apple(&format!(
+            "ios: re-arming the {ms_for_cb}ms one-shot"
+        ));
         if let Err(e) = arm_one_shot(ms_for_cb, id_for_cb.get()) {
             crate::backends::apple::log_apple(&format!(
                 "ios: could not re-arm the {ms_for_cb}ms tick: {e}"
