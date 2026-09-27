@@ -97,6 +97,81 @@ mod ios_adapter {
         core_ios::root_view()
     }
 
+    /// UIKit classes whose `-init` raises, and the selector that creates one
+    /// properly.
+    ///
+    /// `UIStackView` documents `initWithArrangedSubviews:` as its
+    /// *designated* initializer; sending it plain `-init` raises
+    /// `NSInternalInconsistencyException`. That exception is a **foreign**
+    /// throw — it unwinds through the Objective-C runtime, not through Rust —
+    /// so `catch_unwind` cannot intercept it and the process dies with
+    /// `fatal runtime error: Rust cannot catch foreign exceptions, aborting`.
+    ///
+    /// That is exactly how this adapter died, twice (iOS CI runs #97 and
+    /// #117), always at the same point: `run_gui: new_box` printed and nothing
+    /// after it. The trailing screen was the *springboard*, which is why the
+    /// failure looked like a screenshot problem and took two runs to trace
+    /// back to a layout box.
+    ///
+    /// The class is a parameter rather than a hardcoded string so the test
+    /// that guards this reads the real list. A class whose plain `-init` is
+    /// fine (UILabel, UITextField, UIView, ...) must NOT be added: it would
+    /// then get an empty-array initializer it has no use for.
+    const DESIGNATED_INITIALIZERS: &[(&str, &str)] = &[("UIStackView", "initWithArrangedSubviews:")];
+
+    /// The selector to construct `class_name`, or `"init"` when the plain
+    /// one is correct.
+    fn initializer_for(class_name: &str) -> &'static str {
+        DESIGNATED_INITIALIZERS
+            .iter()
+            .find(|(cls_name, _)| *cls_name == class_name)
+            .map(|(_, sel_name)| *sel_name)
+            .unwrap_or("init")
+    }
+
+    /// `[[class alloc] initWithArrangedSubviews:@[]]` for a class that needs
+    /// it, else `[[class alloc] init]`. An empty array is what the caller
+    /// wants either way: `BoxWidget::append` adds children one at a time
+    /// afterwards.
+    fn alloc_init_class(class: *mut c_void, class_name: &str) -> *mut c_void {
+        if class.is_null() {
+            return std::ptr::null_mut();
+        }
+        let sel_name = initializer_for(class_name);
+        if sel_name == "init" {
+            return alloc_init(class);
+        }
+        // `raw_send!` supplies its own `unsafe` internally, so this body is
+        // deliberately NOT wrapped: an outer `unsafe` here made every
+        // expansion report an `unnecessary unsafe block` (lint-clean builds
+        // are part of the project's contract, and this repo builds for three
+        // Apple targets on every CI run).
+        let alloc = unsafe { msg0(class, "alloc") };
+        if alloc.is_null() {
+            return std::ptr::null_mut();
+        }
+        // An empty `NSArray`, from the class rather than a literal: `nil`
+        // here would raise a *different* uncatchable exception.
+        let array_cls = cls("NSArray");
+        if array_cls.is_null() {
+            return std::ptr::null_mut();
+        }
+        let empty = unsafe { msg0(array_cls, "array") };
+        if empty.is_null() {
+            return std::ptr::null_mut();
+        }
+        let obj = raw_send!(
+            alloc,
+            sel_name,
+            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void,
+            (empty)
+        );
+        if obj.is_null() {
+            return std::ptr::null_mut();
+        }
+        own(obj)
+    }
+
     /// Allocate + init an instance of `class_name`, register metadata, and
     /// retain it. Returns null when the backend is uninitialised or the class
     /// is missing (a host that ships no UIKit, or an SDK without the class) —
@@ -110,7 +185,7 @@ mod ios_adapter {
             core_ios::log_ios(&format!("ios: class {class_name} not found"));
             return std::ptr::null_mut();
         }
-        let obj = alloc_init(class);
+        let obj = alloc_init_class(class, class_name);
         if obj.is_null() {
             return std::ptr::null_mut();
         }
@@ -2337,7 +2412,11 @@ mod ios_adapter {
             new_widget("UIView", Kind::Canvas)
         } else {
             core_ios::log_ios(&format!("create_canvas: using class '{class_name}'"));
-            let obj = alloc_init(class);
+            // Through `alloc_init_class`, not `alloc_init`: a host is free to
+            // register a canvas class that needs a designated initializer, and
+            // plain `-init` would raise the same uncatchable exception that
+            // killed the app in `create_box`.
+            let obj = alloc_init_class(class, &class_name);
             if obj.is_null() {
                 std::ptr::null_mut()
             } else {
@@ -2535,6 +2614,31 @@ mod tests {
             crate::core::DrawContext::text_extents_styled(&dc, "hello", "monospace", 12.0, 0, 0);
         let _ = (x, y);
         assert!(w > 0.0 && h > 0.0);
+    }
+
+    #[test]
+    fn test_stack_view_is_never_built_with_plain_init() {
+        // A UIStackView sent plain `-init` raises
+        // NSInternalInconsistencyException, which unwinds through the
+        // Objective-C runtime rather than Rust, so `catch_unwind` cannot
+        // catch it and the process aborts. That is the crash that killed
+        // `run_gui` at `new_box` (iOS CI runs #97 and #117), with the
+        // springboard showing behind it.
+        //
+        // Asserted on the table rather than on behaviour because the
+        // behaviour needs a live UIKit: the table is what the constructor
+        // reads, so a reordering that drops the entry fails here rather
+        // than on a simulator.
+        assert_eq!(
+            super::initializer_for("UIStackView"),
+            "initWithArrangedSubviews:"
+        );
+        // ... and the classes that DO accept plain `-init` must not be
+        // redirected: an empty-array initializer on a UILabel would be
+        // meaningless, and a wrong entry here is its own bug.
+        for plain in ["UIView", "UILabel", "UITextField", "UIButton", "UITextView"] {
+            assert_eq!(super::initializer_for(plain), "init", "{plain}");
+        }
     }
 
     #[test]

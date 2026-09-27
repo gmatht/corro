@@ -332,6 +332,17 @@ jobs:
               echo "ok: attempt ${attempt} looks like corro's sheet"
               break
             fi
+            # Retrying is only worth it while the app is still up. If it has
+            # died there is no frame left to wait for, and re-launching a
+            # crashing app eight times costs a minute and buries the crash in
+            # a wall of identical attempts. Run #117 died in `new_box` and the
+            # loop ground through all eight before the diagnostics ran, so the
+            # real error had to be dug out of a step whose output was eight
+            # copies of "not corro's sheet".
+            if grep -qaE "fatal runtime error|SIGABRT|SIGSEGV|Terminating app" /tmp/corro-live.log 2>/dev/null; then
+              echo "::error::the app has crashed (see the trace in the startup-output step); not retrying the screenshot"
+              break
+            fi
             echo "  attempt ${attempt}: still looks like a wallpaper; re-activating"
             sleep 4
           done
