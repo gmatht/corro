@@ -6601,6 +6601,16 @@ fn arm_edit_script(state: &Rc<GuiState>) {
 
     let tick = move || -> bool {
         let i = idx.get();
+        // Unconditional, with the index and how long the step has been due for.
+        // Every previous diagnosis of "the timer stopped" was a guess, because
+        // nothing logged from *inside* the tick: the observable was the number
+        // of trampoline fires, which cannot distinguish "the timer stopped"
+        // from "the tick ran and did nothing".
+        crate::gui::ios_backend::log_ios(&format!(
+            "[corro] edit tick: step {i}/{} at t+{:.0}ms",
+            steps.len(),
+            start.elapsed().as_secs_f64() * 1000.0
+        ));
         let Some(step) = steps.get(i) else {
             return false;
         };
