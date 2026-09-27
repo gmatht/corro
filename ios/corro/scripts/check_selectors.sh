@@ -143,4 +143,39 @@ if missing_macos:
         print("   ", m)
     sys.exit(1)
 print(f"macOS: all {len(sent_macos)} custom selectors the adapter sends are generatable")
+
+# The reverse drift: an *AppKit* selector sent to a UIKit class. The iOS
+# adapter was written alongside the macOS one and inherited `setHeadIndent:`,
+# which is NSTextField's method - a UILabel has no such selector, so the send
+# raised `unrecognized selector` and killed the app at startup. That is
+# invisible to every Rust-side check and to `cargo check` (a message send is a
+# string, not a symbol), so it is worth naming explicitly.
+#
+# The set is the AppKit-only text/layout selectors that have a UIKit
+# equivalent under a different name; a method that merely does not exist is
+# covered by the checks above, this one is about a method that exists on the
+# *sibling* platform and so looks plausible in review.
+APPKIT_ONLY = {
+    "setHeadIndent:",        # NSTextField      -> UILabel: no inset at all
+    "setStringValue:",       # NSTextField      -> UITextField: setText:
+    "setAttributedStringValue:",  # NSTextField -> UITextField: setAttributedText:
+    "setBezeled:",           # NSButton         -> UIButton: no bezel
+    "setTarget:",            # NSControl        -> UIControl: addTarget:action:forControlEvents:
+    "setAction:",            # NSControl        -> UIControl: addTarget:action:forControlEvents:
+    "setContentTintColor:",  # NSView           -> UIView: tintColor
+    "setWantsLayer:",        # NSView           -> CALayer layer on UIView
+    "setFrameSize:",         # NSView           -> UIView: bounds
+}
+drift = sorted(
+    sel for sel in re.findall(r'"([a-zA-Z][A-Za-z0-9]*(?::[a-z][A-Za-z0-9]*)*:?)"', adapter)
+    if sel in APPKIT_ONLY
+)
+if drift:
+    print("AppKit selectors the iOS adapter sends to UIKit classes.")
+    print("Objective-C raises for these, and the throw is uncatchable from Rust:")
+    for d in drift:
+        print("   ", d, "  (AppKit only; the UIKit equivalent is a different selector)")
+    sys.exit(1)
+print(f"iOS: none of the {len(APPKIT_ONLY)} known AppKit-only selectors are sent by the UIKit adapter")
+
 PY

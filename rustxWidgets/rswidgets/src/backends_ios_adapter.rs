@@ -40,7 +40,7 @@ mod ios_adapter {
     use once_cell::sync::Lazy;
 
     use crate::backends::ios::{
-        self as core_ios, alloc_init, cls, msg0, msg0i, msg0v, msg1bv, msg1cv, msg1i, msg1iv,
+        self as core_ios, alloc_init, cls, msg0, msg0i, msg0v, msg1bv, msg1i, msg1iv,
         msg1v, msg1vi, msg4cv, nsstring, nsstring_to_rust, own, Kind, WidgetMeta,
     };
     use crate::core::{DrawContext, Error, Widget};
@@ -584,12 +584,24 @@ mod ios_adapter {
         /// [`Label::set_fixed_width`]: a pinned, left-aligned label sits flush
         /// against its slot's edge, and this restores the inset the
         /// shrink-to-fit label had.
+        ///
+        /// The macOS twin sends `setHeadIndent:`, which is an `NSTextField`
+        /// method. **A `UILabel` has no such selector**, so the send raised
+        /// `unrecognized selector` - a foreign throw, uncatchable, and the
+        /// next abort in this same startup path. That was drift from
+        /// AppKit's text model, not a missing implementation.
+        ///
+        /// UIKit has no plain-text inset on `UILabel`: the equivalent is the
+        /// `UIEdgeInsets` on `attributedText`, which needs an attributed
+        /// string, and that in turn means *behaviour* the host must
+        /// implement - the same trap `corroBoundsWidth` documents. So the
+        /// value is recorded and the text left alone.
+        ///
+        /// The inset is cosmetic and the slot is already pinned to its widest
+        /// text, so losing it costs a few points of left padding on one label;
+        /// sending a selector the object does not have costs the whole app.
         pub fn set_margin_start(&self, px: i32) {
             core_ios::with_meta_mut(self.0, |m| m.margin_start = px);
-            if self.0.is_null() {
-                return;
-            }
-            unsafe { msg1cv(self.0, "setHeadIndent:", px as f64) };
         }
 
         /// Set the x alignment of the label's text (0.0 left .. 1.0 right).
