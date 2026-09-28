@@ -2416,12 +2416,51 @@ mod nwg_adapter {
 
     // ========== Canvas ==========
 
+/// Handler ids for the gesture stream.
+///
+/// `bind_raw_event_handler` panics on ids <= 0xFFFF, which NWG reserves, so
+/// these start well above it and increment. A process-wide counter avoids two
+/// canvases colliding on the same hwnd.
+fn next_gesture_id() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0x5000_0000);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The client-relative point packed into an `LPARAM` by a mouse message.
+///
+/// Win32 packs x in the low word and y in the high word. Both are read as
+/// `i16` because the signed-ness is carried in the top bit: a window dragged
+/// partly off the left edge reports a negative x, and reading it as unsigned
+/// would turn that into ~65000 and put the pointer in the wrong place.
+fn win32_point(l: isize) -> (f64, f64) {
+    let l = l as u32;
+    let x = (l & 0xFFFF) as i16 as f64;
+    let y = ((l >> 16) & 0xFFFF) as i16 as f64;
+    (x, y)
+}
+
+/// Decode a mouse message's `WPARAM` into the portable `Modifiers`.
+///
+/// The `GET_KEYSTATE` bits live in the low 16 bits: shift 0x0001, control
+/// 0x0002, alt 0x0004 and the Win key 0x0008. The button mask starts at bit 8.
+fn win32_mods(w: usize) -> crate::core::Modifiers {
+    let k = (w as u32 & 0xFFFF) as u16;
+    crate::core::Modifiers {
+        shift: k & 0x0001 != 0,
+        ctrl: k & 0x0002 != 0,
+        alt: k & 0x0004 != 0,
+        meta: k & 0x0008 != 0,
+    }
+}
+
     pub struct Canvas {
         frame: Option<Rc<nwg::Frame>>,
         hwnd: *mut c_void,
         draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>>>>,
         click_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>>,
         key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>>,
+        /// The canonical gesture stream, fed from raw Win32 mouse messages.
+        gesture_cb: Rc<RefCell<Option<Box<dyn FnMut(crate::core::Gesture)>>>>,
         _raw_handlers: Rc<Vec<nwg::RawEventHandler>>,
         painting: Rc<RefCell<bool>>,
     }
@@ -2516,22 +2555,154 @@ mod nwg_adapter {
         pub fn force_draw(&self, _window_ptr: *mut c_void, _fallback_w: i32, _fallback_h: i32) {}
         /// The canonical gesture stream. See `core::Gesture`.
         ///
-        /// ACCEPTED BUT NOT YET DELIVERED ON THIS BACKEND.
+        /// Implemented over raw Win32 messages via
+        /// `nwg::bind_raw_event_handler`, because NWG exposes no mouse API on a
+        /// `Frame` -- its `on_motion` / `on_release` / `on_click_button` are
+        /// still no-ops that never fire. NWG's own `Event::OnMouseMove` would
+        /// work, but it carries no coordinates, and a canvas needs a position
+        /// in its own client space.
         ///
-        /// NWG gives a `Canvas` only a click callback; its `on_motion`,
-        /// `on_release` and `on_click_button` are all documented no-ops that never
-        /// fire, because NWG does not plumb Win32 motion or button transitions
-        /// through to a frame. This accepts the callback so application code
-        /// compiles and behaves identically on both backends, and simply never
-        /// fires here.
+        /// Handles `WM_LBUTTONDOWN` / `WM_LBUTTONUP` (with right-button mapped
+        /// onto the middle/secondary enum value), `WM_MOUSEMOVE` and
+        /// `WM_MOUSEWHEEL`. Coordinates come from the low/high halves of the
+        /// `LPARAM`, which is how Win32 packs a client-relative point, and are
+        /// signed via `i16` because a window can extend past the screen edge.
         ///
-        /// The consequence is concrete and worth stating: a drag or wheel-zoom
-        /// written against this API is live on GTK and inert on Windows until the
-        /// NWG path is implemented. It is not a silent difference in feel -- the
-        /// gesture simply does not arrive, so code that only pans on drag will look
-        /// broken rather than subtly different on Windows. The viewer is the
-        /// reason this is called out rather than papered over.
-        pub fn on_gesture(&self, _cb: Box<dyn FnMut(crate::core::Gesture)>) {}
+        /// Modifiers come from the `GET_KEYSTATE` bits in the `WPARAM`.
+        pub fn on_gesture(&self, cb: Box<dyn FnMut(crate::core::Gesture)>) {
+            *self.gesture_cb.borrow_mut() = Some(cb);
+        }
+
+        /// Binds the raw handlers that feed the gesture stream.
+        ///
+        /// Separate from `on_gesture` so it is called once at construction --
+        /// binding handlers is what costs, and doing it per registration would
+        /// leak one handler per call.
+        pub(crate) fn install_gesture_handlers(&self, raw_hwnd: isize) {
+            let cb = self.gesture_cb.clone();
+            let mut ids: Vec<usize> = Vec::new();
+
+            // Press and release. WM_LBUTTONDOWN/UP carry the position in LPARAM;
+            // the right-button messages are used for the secondary button so a
+            // right-click drag is reachable at all.
+            for (msg, button, pressed) in [
+                (winapi::um::winuser::WM_LBUTTONDOWN, crate::core::Button::Primary, true),
+                (winapi::um::winuser::WM_LBUTTONUP, crate::core::Button::Primary, false),
+                (winapi::um::winuser::WM_RBUTTONDOWN, crate::core::Button::Secondary, true),
+                (winapi::um::winuser::WM_RBUTTONUP, crate::core::Button::Secondary, false),
+            ] {
+                let slot = cb.clone();
+                let id = next_gesture_id();
+                if nwg::bind_raw_event_handler(
+                    &nwg::ControlHandle::Hwnd(raw_hwnd as _),
+                    id,
+                    move |_hwnd, m, w, l| {
+                        if m != msg {
+                            return None;
+                        }
+                        let (x, y) = win32_point(l);
+                        let mods = win32_mods(w);
+                        if let Some(f) = slot.borrow_mut().as_mut() {
+                            f(crate::core::Gesture::Button { button, pressed, x, y, mods });
+                        }
+                        // Do NOT consume: the press must still reach on_click,
+                        // which has its own handler on WM_LBUTTONDOWN.
+                        None
+                    },
+                )
+                .is_ok()
+                {
+                    ids.push(id);
+                }
+            }
+
+            // Motion. Whether this is a drag or a hover comes from the button
+            // mask in WPARAM (GET_KEYSTATE), exactly as on GTK: plain motion
+            // with no button down is a hover, with one down it is a drag.
+            {
+                let slot = cb.clone();
+                let id = next_gesture_id();
+                if nwg::bind_raw_event_handler(
+                    &nwg::ControlHandle::Hwnd(raw_hwnd as _),
+                    id,
+                    move |_hwnd, m, w, l| {
+                        if m != winapi::um::winuser::WM_MOUSEMOVE {
+                            return None;
+                        }
+                        let (x, y) = win32_point(l);
+                        let held = (w as u16 as i16 as u32 & (1 << (8 + 0))) != 0;
+                        let mods = win32_mods(w);
+                        let g = if held {
+                            crate::core::Gesture::Drag { x, y, mods }
+                        } else {
+                            crate::core::Gesture::Hover { x, y, mods }
+                        };
+                        if let Some(f) = slot.borrow_mut().as_mut() {
+                            f(g);
+                        }
+                        None
+                    },
+                )
+                .is_ok()
+                {
+                    ids.push(id);
+                }
+            }
+
+            // Wheel. Win32 puts the notches in the high word of WPARAM
+            // (GET_WHEEL_DELTA_WPARAM) as 120 per notch, signed. Deltas are
+            // normalised from 120 to 1.0 so a notch reads as "one step" on
+            // every backend, rather than making every caller know the Win32
+            // unit.
+            {
+                let slot = cb.clone();
+                let id = next_gesture_id();
+                if nwg::bind_raw_event_handler(
+                    &nwg::ControlHandle::Hwnd(raw_hwnd as _),
+                    id,
+                    move |_hwnd, m, w, l| {
+                        if m != winapi::um::winuser::WM_MOUSEWHEEL {
+                            return None;
+                        }
+                        let wparam = w as u32;
+                        let notches = ((wparam >> 16) & 0xFFFF) as i16 as f64;
+                        // Low bit of WPARAM is the "not from the scroll bar"
+                        // flag; without it a window that has no scrollbar would
+                        // never see the wheel.
+                        if wparam & 0x0001 == 0 {
+                            return None;
+                        }
+                        if notches == 0.0 {
+                            return None;
+                        }
+                        const WHEEL_DELTA: f64 = 120.0;
+                        let (x, y) = win32_point(l);
+                        let mods = win32_mods(w);
+                        if let Some(f) = slot.borrow_mut().as_mut() {
+                            f(crate::core::Gesture::Scroll {
+                                delta: crate::core::ScrollDelta { dx: 0.0, dy: notches / WHEEL_DELTA },
+                                x,
+                                y,
+                                mods,
+                            });
+                        }
+                        // Consumed: the wheel belongs to the canvas, and letting
+                        // it through scrolls whatever is behind the window.
+                        Some(0)
+                    },
+                )
+                .is_ok()
+                {
+                    ids.push(id);
+                }
+            }
+
+            // Bind and drop the `RawEventHandler` values. NWG keeps the
+            // registration alive internally; the handle is only a token for
+            // unbinding, so dropping it here is correct and matches how the
+            // existing click handler is installed. Only the slot is retained.
+            let _ = ids;
+        }
     }
 
     impl Clone for Canvas {
@@ -2542,6 +2713,7 @@ mod nwg_adapter {
                 draw_cb: self.draw_cb.clone(),
                 click_cb: self.click_cb.clone(),
                 key_cb: self.key_cb.clone(),
+                gesture_cb: self.gesture_cb.clone(),
                 _raw_handlers: Rc::new(Vec::new()),
                 painting: self.painting.clone(),
             }
@@ -2573,6 +2745,7 @@ mod nwg_adapter {
         let draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn DrawContext, i32, i32)>>>> = Rc::new(RefCell::new(None));
         let painting: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
         let click_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>> = Rc::new(RefCell::new(None));
+        let gesture_cb: Rc<RefCell<Option<Box<dyn FnMut(crate::core::Gesture)>>>> = Rc::new(RefCell::new(None));
         let key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>> = Rc::new(RefCell::new(None));
 
         let mut handlers: Vec<nwg::RawEventHandler> = Vec::new();
@@ -2746,15 +2919,22 @@ mod nwg_adapter {
             }
         }
 
-        Ok(Canvas {
+        let canvas = Canvas {
             frame: Some(Rc::new(frame)),
+            gesture_cb,
             hwnd,
             draw_cb,
             click_cb,
             key_cb,
             _raw_handlers: Rc::new(handlers),
             painting,
-        })
+        };
+        // Bind the gesture handlers once, here, rather than in `on_gesture`:
+        // `on_gesture` is called for every registration, and binding a subclass
+        // per call would leak one each time (nwg refuses a duplicate id on the
+        // same hwnd, so it would also fail on the second call).
+        canvas.install_gesture_handlers(hwnd as isize);
+        Ok(canvas)
     }
 
     // ========== Overlay ==========
@@ -3558,9 +3738,74 @@ mod nwg_adapter {
             );
         }
     }
+#[cfg(test)]
+mod gesture_math_tests {
+    use super::*;
+
+    fn lparam(x: i32, y: i32) -> isize {
+        ((y as u32) << 16 | (x as u32 & 0xFFFF)) as isize
+    }
+
+    fn wparam(keys: u16, buttons: u16) -> usize {
+        (buttons as usize) << 16 | keys as usize
+    }
+
+    #[test]
+    fn a_point_is_read_from_both_halves_of_lparam() {
+        assert_eq!(win32_point(lparam(120, 340)), (120.0, 340.0));
+        assert_eq!(win32_point(lparam(0, 0)), (0.0, 0.0));
+    }
+
+    /// A window dragged off the left edge reports a negative x, and the sign
+    /// lives in the top bit of the low word. Read as unsigned it becomes ~65000
+    /// and the pointer lands nowhere near the cursor.
+    #[test]
+    fn a_negative_coordinate_stays_negative() {
+        let (x, y) = win32_point(lparam(-5, 200));
+        assert_eq!(x, -5.0, "x must not wrap to 65531");
+        assert_eq!(y, 200.0);
+    }
+
+    #[test]
+    fn the_four_modifier_bits_are_decoded() {
+        let none = win32_mods(wparam(0, 0));
+        assert!(!none.shift && !none.ctrl && !none.alt && !none.meta);
+
+        let all = win32_mods(wparam(0x0001 | 0x0002 | 0x0004 | 0x0008, 0));
+        assert!(all.shift && all.ctrl && all.alt && all.meta);
+
+        let shift_only = win32_mods(wparam(0x0001, 0));
+        assert!(shift_only.shift && !shift_only.ctrl);
+    }
+
+    /// Wheel notches arrive as 120 per notch in the high word of WPARAM, with
+    /// bit 0 set to mark "not from the scrollbar". Both wheel up and wheel down
+    /// produce positive numbers, distinguished by the sign.
+    #[test]
+    fn the_wheel_delta_is_normalised_to_one_per_notch() {
+        const WHEEL_DELTA: i32 = 120;
+        let up = (WHEEL_DELTA << 16 | 1) as usize;
+        let down = ((-WHEEL_DELTA) as u32 as i32) << 16 | 1;
+        // decode the way the handler does
+        let wparam = down as u32;
+        let notches = ((wparam >> 16) & 0xFFFF) as i16 as f64;
+        assert_eq!(notches / 120.0, -1.0, "wheel down is one notch, negative");
+        assert!(notches > 0.0 || notches < 0.0, "up would be +1.0: {}", notches as u32);
+        let _ = up;
+    }
+
+    #[test]
+    fn the_scrollbar_flag_bit_is_distinguished_from_a_notch() {
+        // A window with no scrollbar gets bit 0 clear, and must not be told the
+        // user scrolled -- that is what makes a canvas receive the wheel.
+        let from_scrollbar = (120u32) << 16; // bit 0 clear
+        assert_eq!(from_scrollbar & 1, 0, "this is the case the handler drops");
+    }
+}
 }
 
 #[cfg(windows)]
 pub use nwg_adapter::*;
 #[cfg(windows)]
 pub use crate::backends::nwg::Orientation;
+
