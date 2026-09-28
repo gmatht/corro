@@ -6605,18 +6605,30 @@ fn arm_edit_script(state: &Rc<GuiState>) {
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     eprintln!("[corro] edit-script typing {} cps ({char_ms}ms/char, {tick_ms}ms tick)", options.typing_cps);
 
+    let ticks_seen = std::cell::Cell::new(0u32);
     let tick = move || -> bool {
         let i = idx.get();
-        // Unconditional, with the index and how long the step has been due for.
-        // Every previous diagnosis of "the timer stopped" was a guess, because
-        // nothing logged from *inside* the tick: the observable was the number
-        // of trampoline fires, which cannot distinguish "the timer stopped"
-        // from "the tick ran and did nothing".
         let Some(step) = steps.get(i) else {
             return false;
         };
         let due = |at: f64| start.elapsed().as_secs_f64() * 1000.0 >= at;
         if !due(step.at_ms as f64) {
+            // Every 40th not-yet-due tick, so the log shows whether the tick is
+            // still firing at all. A silent tick and a dead one are
+            // indistinguishable from the outside otherwise, and that
+            // distinction is the whole question: the commit log says which
+            // edits landed, and nothing says whether the thing driving them is
+            // still alive. ~1 line/s at the 25ms interval.
+            ticks_seen.set(ticks_seen.get() + 1);
+            if ticks_seen.get() % 40 == 0 {
+                crate::gui::ios_backend::log_ios(&format!(
+                    "[corro] edit tick alive: {} ticks, step {} of {} due at t+{}ms",
+                    ticks_seen.get(),
+                    i,
+                    steps.get(i).map(|st| st.at_ms as i64).unwrap_or(-1),
+                    (start.elapsed().as_secs_f64() * 1000.0) as i64
+                ));
+            }
             return true; // not due yet
         }
         let addr = crate::grid::CellAddr::Main { row: step.row, col: step.col };
