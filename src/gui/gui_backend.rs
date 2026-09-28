@@ -6676,12 +6676,18 @@ fn arm_edit_script(state: &Rc<GuiState>) {
                 eprintln!("{m}");
             }
             app.core.state = app.core.workbook.active_sheet().clone();
+            crate::gui::ios_backend::log_ios("[corro] edit tick: after clone state");
             state_for_tick.editing.set(false);
             state_for_tick.formula_entry.set_text_suppressing_changed("");
+            crate::gui::ios_backend::log_ios("[corro] edit tick: after entry clear");
             update_state_cursor(&state_for_tick, app.core.cursor.row, app.core.cursor.col);
+            crate::gui::ios_backend::log_ios("[corro] edit tick: after update_cursor");
             sync_chrome_labels(&state_for_tick);
+            crate::gui::ios_backend::log_ios("[corro] edit tick: after sync_labels");
             state_for_tick.canvas.queue_redraw();
+            crate::gui::ios_backend::log_ios("[corro] edit tick: after canvas redraw");
             state_for_tick.window.queue_redraw();
+            crate::gui::ios_backend::log_ios("[corro] edit tick: after window redraw");
             idx.set(i + 1);
         }
         true
