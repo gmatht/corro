@@ -61,10 +61,29 @@ class Qmp:
             req["arguments"] = args
         self.f.write(json.dumps(req).encode() + b"\n")
         self.f.flush()
-        resp = json.loads(self.f.readline().decode())
-        if not quiet and "error" in resp:
-            print(f"QMP {name}: {resp['error']}", file=sys.stderr)
-        return resp
+        # Read until the RESPONSE to this command, skipping async events.
+        # Reading a single line is not enough: QEMU emits events (RESET,
+        # STOP, SHUTDOWN, ...) at any point, and consuming one as if it were
+        # the reply desynchronises the stream - the next read then returns the
+        # stale reply to the PREVIOUS command, and eventually a blank line,
+        # which json.loads rejects. That surfaced as a JSONDecodeError deep
+        # inside the boot loop, long after the actual cause.
+        while True:
+            line = self.f.readline()
+            if not line:
+                raise OSError(f"QMP closed while waiting for {name}")
+            line = line.decode().strip()
+            if not line:
+                continue                      # keep-alive / blank
+            try:
+                resp = json.loads(line)
+            except ValueError:
+                continue                      # not JSON; cannot be a reply
+            if "return" in resp or "error" in resp:
+                if not quiet and "error" in resp:
+                    print(f"QMP {name}: {resp['error']}", file=sys.stderr)
+                return resp
+            # else: an async event, keep reading
 
     def close(self):
         try:

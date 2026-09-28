@@ -36,7 +36,10 @@ CORRO = os.path.abspath(os.path.join(HERE, ".."))
 ROS_DIR = os.environ.get("ROS_DIR", "/root/vm/reactos")
 STOCK_ISO = os.path.join(ROS_DIR, "ReactOS-0.4.16-i386.iso")
 TREE = os.path.join(ROS_DIR, "build-tree")
-OUT_ISO = os.path.join(ROS_DIR, "corro-live.iso")
+# Per-run ISO, like the floppy: a shared path means the next run's
+# genisoimage overwrites the image the running QEMU still has open, which
+# shows up as an unexplained SIGKILL (rc=-9) rather than anything obvious.
+OUT_ISO = os.path.join(ROS_DIR, f"corro-live-{os.getpid()}.iso")
 # Per-run floppy: see make_floppy() for why it must not be shared.
 FLOPPY = os.path.join(
     ROS_DIR, f"corro-log-{os.getpid()}.img")
@@ -298,12 +301,13 @@ def main():
         os.unlink(FLOPPY)
     except OSError:
         pass
-    for stale in glob.glob(os.path.join(ROS_DIR, "corro-log-*.img")):
+    for pat in ("corro-log-*.img", "corro-live-*.iso"):
+      for stale in glob.glob(os.path.join(ROS_DIR, pat)):
         if os.path.getmtime(stale) < time.time() - 3600:
-            try:
-                os.unlink(stale)
-            except OSError:
-                pass
+          try:
+            os.unlink(stale)
+          except OSError:
+            pass
     return 0
 
 
