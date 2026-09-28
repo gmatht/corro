@@ -5188,7 +5188,11 @@ mod mobile_gesture {
         // 'static, and the dialog outlives this function.
         let items = std::rc::Rc::new(items);
         let items_cb = items.clone();
-        dialog.connect_response(move |response| {
+        // `connect_response` registers the handler and can only fail if the
+        // backend is not initialised — in which case the dialog is dead and
+        // `present` would show a dialog whose buttons do nothing. Closing it
+        // is better than showing that.
+        if dialog.connect_response(move |response| {
             // Guard the underflow: a dismissal reports a response that is not
             // an index into the list.
             if response < 1 {
@@ -5197,7 +5201,11 @@ mod mobile_gesture {
             if let Some((_, action)) = items_cb.get(response as usize - 1) {
                 dispatch_mobile_menu_action(action);
             }
-        });
+        })
+        .is_err()
+        {
+            return;
+        }
         dialog.layout_dialog();
         dialog.present();
         // The dialog and its buttons are native objects the closure above
@@ -5417,14 +5425,37 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             delegate_shared_action(name, state);
         }
         "save_as" => {
-            if let Some(path) = dialogs::file_save_dialog() {
-                app.core.path = Some(path.clone());
-                match crate::io::write_workbook_log(
-                    &path,
+            // `SaveTarget`, not `PathBuf`: on Android the picker returns a
+            // `content://` URI, and `write_workbook_log` would write it to a
+            // `std::fs` path that does not exist. `dialogs::write_workbook`
+            // routes a document through the content resolver and a path
+            // through the ordinary temp-and-rename save.
+            let suggested = app
+                .core
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("Sheet1.corro")
+                .to_string();
+            if let Some(target) = dialogs::file_save_target(&suggested) {
+                let display = target.display();
+                let result = dialogs::write_workbook(
+                    &target,
                     &app.core.workbook,
                     &app.core.persisted_view_sort_cols,
-                ) {
-                    Ok(()) => app.core.status = format!("Saved to {}", path.display()),
+                );
+                match result {
+                    Ok(()) => {
+                        // Only a *path* becomes the document's own path; a
+                        // document has no path, so recording the URI in
+                        // `core.path` would make a later `save` try to write
+                        // it with `std::fs` and fail.
+                        if let dialogs::SaveTarget::Path(p) = &target {
+                            app.core.path = Some(p.clone());
+                        }
+                        app.core.status = format!("Saved to {display}");
+                    }
                     Err(e) => app.core.status = format!("Save error: {e}"),
                 }
             }

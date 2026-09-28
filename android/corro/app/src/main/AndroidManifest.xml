@@ -14,6 +14,49 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!--
+              "Open with corro" from a file manager or a downloads app.
+
+              Without these the app is not offered as a handler for a
+              spreadsheet at all, which on Android is indistinguishable from
+              the APK not being installed: the user taps a .corro file and
+              nothing lists corro. MainActivity.onNewIntent delivers the URI
+              to the same place the in-app picker does, so the Open action has
+              one path either way.
+
+              A MIME type is required on Android: omitting it makes the
+              intent unmatchable, and the wildcard is therefore spelled out
+              per extension rather than as * / * (which would make corro the
+              offered handler for every file on the device).
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="text/comma-separated-values" />
+                <data android:mimeType="text/tab-separated-values" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="application/vnd.oasis.opendocument.spreadsheet" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+            </intent-filter>
+            <!--
+              A document shared *to* corro by another app ("Share -> corro").
+              The same scheme set, and the reason onNewIntent also accepts a
+              SEND intent's EXTRA_STREAM.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/comma-separated-values" />
+                <data android:mimeType="text/tab-separated-values" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="application/vnd.oasis.opendocument.spreadsheet" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+            </intent-filter>
         </activity>
     </application>
 </manifest>

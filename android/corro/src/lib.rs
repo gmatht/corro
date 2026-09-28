@@ -20,6 +20,11 @@ pub extern "system" fn Java_com_corro_MainActivity_nativeInit(
 ) {
     // Custom sheet view for canvases (grid rendering via onDraw -> Rust).
     rswidgets::backends::android::set_sheet_view_class("com.corro.SheetView");
+    // Bind the Storage Access Framework picker to the Activity. Done here
+    // rather than from Rust later because the file dialogs are reached from
+    // the menu strip, which can be tapped the instant the sheet appears —
+    // and a picker with no Activity has nowhere to start its intent from.
+    rswidgets::backends::android::attach_file_picker();
     if let Err(e) = corro::gui::android_backend::android_main(&mut env, &activity, &root_layout) {
         let _ = env.throw_new("java/lang/RuntimeException", e);
     }

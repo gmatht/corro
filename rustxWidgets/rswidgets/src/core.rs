@@ -956,6 +956,49 @@ pub struct App {
     action_group: Rc<RefCell<Option<crate::backends_gtk_adapter::Application>>>,
 }
 
+/// Extensions to MIME types, for the Android Storage Access Framework.
+///
+/// SAF takes MIME types while every other backend's filter list is globs
+/// (`*.corro`, `*.*`), so the translation lives here rather than in the Java
+/// picker: one readable table, and the same filter list produces the same
+/// types on every Android host.
+///
+/// An unrecognised extension becomes `*&#47;*` rather than being dropped. A
+/// filter the mapping does not know must not narrow the picker to nothing —
+/// "shows more files than asked" is recoverable, "shows none" is not.
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+fn mimes_from_filters(filters: &[(&str, &[&str])]) -> Vec<String> {
+    fn ext_mime(ext: &str) -> &'static str {
+        match ext.trim_start_matches("*.").to_ascii_lowercase().as_str() {
+            "corro" | "log" => "application/octet-stream",
+            "csv" | "tsv" => "text/comma-separated-values",
+            "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+            "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "txt" | "md" | "ascii" => "text/plain",
+            "json" => "application/json",
+            "xml" => "text/xml",
+            "pdf" => "application/pdf",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "zip" => "application/zip",
+            _ => "*/*",
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (_, patterns) in filters {
+        for p in *patterns {
+            let mime = ext_mime(p).to_string();
+            if !out.contains(&mime) {
+                out.push(mime);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push("*/*".to_string());
+    }
+    out
+}
+
 impl App {
     /// Initialize the default backend and return an App wrapper.
     /// Uses the priority chain from `backends::init()` (gtk > nwg > wasm > android > pancurses).
@@ -1610,21 +1653,62 @@ pub fn create_scrolled_window(&self) -> Result<crate::backends_android_adapter::
 }
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
-pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> {
-    Ok(None) // File dialogs not available on Android (content URIs instead)
-}
-#[cfg(all(target_os = "android", not(feature = "zork")))]
-pub fn open_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
-    Ok(None) // File dialogs not available on Android (content URIs instead)
-}
-#[cfg(all(target_os = "android", not(feature = "zork")))]
-pub fn save_file(&self, _title: &str) -> Result<Option<String>, Error> {
-    Ok(None) // File dialogs not available on Android (content URIs instead)
-}
-#[cfg(all(target_os = "android", not(feature = "zork")))]
-pub fn save_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])], _current_name: &str) -> Result<Option<String>, Error> {
-    Ok(None) // File dialogs not available on Android (content URIs instead)
-}
+    pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> {
+        Ok(crate::backends::android::open_document(&[]))
+    }
+
+    /// The Android Storage Access Framework, not a file chooser.
+    ///
+    /// The returned string is a `content://` **URI, not a path**: there is no
+    /// filesystem path behind a SAF result, and `std::fs` cannot open one. A
+    /// caller that needs a real file calls
+    /// [`crate::backends::android::materialize_document`], which copies the
+    /// document into the app's private storage and returns a path the
+    /// ordinary loaders can read. Returning `None` here is what made
+    /// File &rarr; Open open nothing and File &rarr; Save As discard the save.
+    #[cfg(all(target_os = "android", not(feature = "zork")))]
+    pub fn open_file_filtered(
+        &self,
+        _title: &str,
+        filters: &[(&str, &[&str])],
+    ) -> Result<Option<String>, Error> {
+        Ok(crate::backends::android::open_document(
+            &mimes_from_filters(filters),
+        ))
+    }
+
+    /// See [`Self::open_file_filtered`]: a `content://` URI, not a path.
+    #[cfg(all(target_os = "android", not(feature = "zork")))]
+    pub fn save_file(&self, _title: &str) -> Result<Option<String>, Error> {
+        Ok(crate::backends::android::create_document(
+            "*/*",
+            "untitled.corro",
+        ))
+    }
+
+    /// See [`Self::open_file_filtered`] for the URI. The *default name* is
+    /// honoured (via `Intent.EXTRA_TITLE`) rather than ignored, so the
+    /// platform picker opens with it pre-filled the way a desktop's save
+    /// dialog does.
+    #[cfg(all(target_os = "android", not(feature = "zork")))]
+    pub fn save_file_filtered(
+        &self,
+        _title: &str,
+        filters: &[(&str, &[&str])],
+        current_name: &str,
+    ) -> Result<Option<String>, Error> {
+        let mimes = mimes_from_filters(filters);
+        // The picker takes one type; the first filter's is the best single
+        // answer when a caller offers several groups, and an empty list means
+        // any file, which is also the honest answer for "*.*".
+        let mime = mimes.first().cloned().unwrap_or_else(|| "*/*".to_string());
+        let name = if current_name.is_empty() {
+            "untitled.corro"
+        } else {
+            current_name
+        };
+        Ok(crate::backends::android::create_document(&mime, name))
+    }
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 pub fn create_grid(&self) -> Result<crate::backends_android_adapter::Grid, Error> {

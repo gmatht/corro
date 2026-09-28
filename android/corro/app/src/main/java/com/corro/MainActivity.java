@@ -2,6 +2,7 @@ package com.corro;
 
 import android.app.Activity;
 import android.os.Bundle;
+import android.content.Intent;
 import android.view.KeyEvent;
 import android.widget.LinearLayout;
 
@@ -22,8 +23,47 @@ public class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         setContentView(root);
 
+        // Bind the Storage Access Framework picker to this Activity before
+        // Rust boots, so a File menu action taken the moment the sheet
+        // appears already has somewhere to start an intent from.
+        CorroFile.attach(this);
+
         // Boot corro: backend init + spreadsheet UI
         nativeInit(this, root);
+    }
+
+    /**
+     * Forward the document picker's result.
+     *
+     * <p>SAF is asynchronous: {@code startActivityForResult} returns
+     * immediately and the chosen {@code content://} URI arrives here, long
+     * after Rust's file dialog has blocked waiting for it. Without this
+     * forward the result is dropped and every Open and Save As reports
+     * "cancelled".
+     *
+     * <p>Forwarded unconditionally rather than filtered on the request code
+     * here: {@link CorroFile#onActivityResult} checks the code, and keeping
+     * the check in one place means a second picker with a different code
+     * needs no second hook here.
+     */
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        CorroFile.onActivityResult(requestCode, resultCode, data);
+    }
+
+    /**
+     * Open a document the user handed us from outside (a VIEW/SEND intent).
+     *
+     * <p>What a file manager's "Open with corro" produces. Without this the
+     * intent is dropped, which on Android looks identical to the app not
+     * being installed as a handler for spreadsheets at all.
+     */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        CorroFile.deliverExternalIntent(intent);
     }
 
     /**

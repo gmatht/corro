@@ -1933,6 +1933,209 @@ mod android_backend {
     static ENTRY_KEY_LISTENERS: Lazy<Mutex<Vec<GlobalRef>>> =
         Lazy::new(|| Mutex::new(Vec::new()));
 
+    // ---- Storage Access Framework ----
+
+    /// Bind the SAF picker to the Activity. The host calls this from
+    /// `onCreate`; rswidgets cannot subclass the host's Activity, so the
+    /// picker is reached through a host-supplied class rather than
+    /// rswidgets' own.
+    pub fn attach_file_picker() {
+        let _ = with_env_and_activity(|env, activity| {
+            let cls = match load_app_class(env, "com.corro.CorroFile") {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = env.exception_clear();
+                    return Ok(());
+                }
+            };
+            env.call_static_method(&cls, "attach", "(Landroid/app/Activity;)V",
+                &[activity.as_obj().into()])?;
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    /// Build the `String[]` a `CorroFile.open` call takes from a list of
+    /// `&str`. `None` for an empty list, so the Java side can tell "no filter
+    /// requested" (any file) from "filter of one empty string".
+    fn jni_string_array<'a>(
+        env: &mut JNIEnv<'a>,
+        values: &[String],
+    ) -> Result<jni::objects::JObjectArray<'a>, Box<dyn StdError + Send + Sync>> {
+        let arr = env.new_object_array(
+            values.len() as i32,
+            "java/lang/String",
+            jni::objects::JObject::null(),
+        )?;
+        for (i, v) in values.iter().enumerate() {
+            let j = env.new_string(v)?;
+            env.set_object_array_element(&arr, i as i32, &j)?;
+        }
+        Ok(arr)
+    }
+
+    /// Show the platform's open-document picker and return the chosen
+    /// `content://` URI, or `None` if the user cancelled.
+    ///
+    /// This is the Android spelling of `open_file`. Note the difference that
+    /// makes it more than a rename: the result is a **URI, not a path** —
+    /// there is no filesystem path behind it, and a `content://` string
+    /// cannot be opened with `std::fs`. Callers use
+    /// [`materialize_document`] to get a real file, or
+    /// [`write_document`] to write one back.
+    pub fn open_document(mime_types: &[String]) -> Option<String> {
+        with_env_and_activity(|env, _activity| {
+            let cls = load_app_class(env, "com.corro.CorroFile")?;
+            let arr = jni_string_array(env, mime_types)?;
+            let uri = env
+                .call_static_method(&cls, "open", "([Ljava/lang/String;)Ljava/lang/String;", &[(&arr).into()])?
+                .l()?;
+            if uri.is_null() {
+                return Ok(None);
+            }
+            let uri = unsafe { jni::objects::JObject::from_raw(uri.as_raw()) };
+            let s: String = env.get_string(&JString::from(uri))?.into();
+            Ok(Some(s))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Show the platform's create-document picker and return the chosen
+    /// `content://` URI. This is `save_file`.
+    pub fn create_document(mime: &str, default_name: &str) -> Option<String> {
+        with_env_and_activity(|env, _activity| {
+            let cls = load_app_class(env, "com.corro.CorroFile")?;
+            let j_mime = env.new_string(mime)?;
+            let j_name = env.new_string(default_name)?;
+            let uri = env
+                .call_static_method(
+                    &cls,
+                    "create",
+                    "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    &[(&j_mime).into(), (&j_name).into()],
+                )?
+                .l()?;
+            if uri.is_null() {
+                return Ok(None);
+            }
+            let uri = unsafe { jni::objects::JObject::from_raw(uri.as_raw()) };
+            let s: String = env.get_string(&JString::from(uri))?.into();
+            Ok(Some(s))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Read a document's bytes through the content resolver. Empty on any
+    /// failure — an empty workbook is indistinguishable from an empty file
+    /// here, which is the same failure the caller would get from an empty
+    /// path on a desktop.
+    pub fn read_document(uri: &str) -> Vec<u8> {
+        with_env_and_activity(|env, _activity| {
+            let cls = load_app_class(env, "com.corro.CorroFile")?;
+            let j_uri = env.new_string(uri)?;
+            let bytes = env
+                .call_static_method(&cls, "readBytes", "(Ljava/lang/String;)[B", &[(&j_uri).into()])?
+                .l()?;
+            if bytes.is_null() {
+                return Ok(Vec::new());
+            }
+            let arr = unsafe {
+                jni::objects::JByteArray::from(
+                    jni::objects::JObject::from_raw(bytes.as_raw()),
+                )
+            };
+            let len = env.get_array_length(&arr)? as i32;
+            let mut buf = vec![0i8; len.max(0) as usize];
+            if len > 0 {
+                env.get_byte_array_region(&arr, 0, &mut buf)?;
+            }
+            Ok(buf.into_iter().map(|b| b as u8).collect())
+        })
+        .unwrap_or_default()
+    }
+
+    /// Overwrite a document's contents. `false` on failure; the caller
+    /// surfaces it as a save error rather than a silent success.
+    pub fn write_document(uri: &str, data: &[u8]) -> bool {
+        with_env_and_activity(|env, _activity| {
+            let cls = load_app_class(env, "com.corro.CorroFile")?;
+            let j_uri = env.new_string(uri)?;
+            let bytes = env.byte_array_from_slice(data)?;
+            let ok = env
+                .call_static_method(
+                    &cls,
+                    "writeBytes",
+                    "(Ljava/lang/String;[B)Z",
+                    &[(&j_uri).into(), (&bytes).into()],
+                )?
+                .z()?;
+            Ok::<bool, Box<dyn StdError + Send + Sync>>(ok)
+        })
+        .unwrap_or(false)
+    }
+
+    /// Copy a document into the app's private storage and return the real
+    /// path.
+    ///
+    /// This is what makes the *import* direction work without touching the
+    /// loaders: they all take a `Path` and use `std::fs`, and a `content://`
+    /// URI is not one. Copying once means a workbook opened from Drive or
+    /// Downloads can be read by the existing code unchanged, and the
+    /// persistable permission is not needed for the read.
+    pub fn materialize_document(uri: &str, file_name: &str) -> Option<String> {
+        with_env_and_activity(|env, _activity| {
+            let cls = load_app_class(env, "com.corro.CorroFile")?;
+            let j_uri = env.new_string(uri)?;
+            let j_name = env.new_string(file_name)?;
+            let path = env
+                .call_static_method(
+                    &cls,
+                    "materialize",
+                    "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    &[(&j_uri).into(), (&j_name).into()],
+                )?
+                .l()?;
+            if path.is_null() {
+                return Ok(None);
+            }
+            let path = unsafe { jni::objects::JObject::from_raw(path.as_raw()) };
+            let out: String = env.get_string(&JString::from(path))?.into();
+            Ok(Some(out))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Forward the host Activity's `onActivityResult` to the SAF picker.
+    ///
+    /// The platform delivers the picker's answer to the Activity, and
+    /// rswidgets cannot subclass the host's, so the host's `onActivityResult`
+    /// calls this. Without it `startActivityForResult`'s result is dropped
+    /// and every dialog returns "cancelled".
+    pub fn forward_file_picker_result(
+        request: i32,
+        result_code: i32,
+        data: &JObject<'_>,
+    ) {
+        let _ = with_env_and_activity(|env, _activity| {
+            let cls = match load_app_class(env, "com.corro.CorroFile") {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = env.exception_clear();
+                    return Ok(());
+                }
+            };
+            env.call_static_method(
+                &cls,
+                "onActivityResult",
+                "(IILandroid/content/Intent;)V",
+                &[request.into(), result_code.into(), data.into()],
+            )?;
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
     pub fn attach_child(container_ptr: *mut std::os::raw::c_void, child_ptr: *mut std::os::raw::c_void) {
         if container_ptr.is_null() || child_ptr.is_null() {
             return;

@@ -1921,13 +1921,13 @@ mod android_adapter {
     /// `core::key` defines for every non-Windows target.
     const ESCAPE_KEY: u32 = 0xFF1B;
 
-    /// Whether a menu popup is open, and the submenu it holds.
-    ///
-    /// This is what makes `menu_active` a real answer rather than `false`:
-    /// the desktop uses it to decide whether a plain letter key should be
-    /// routed to menu selection instead of starting a cell edit, and a
-    /// constant `false` meant that on Android an open menu and a typed
-    /// character collided.
+    // Whether a menu popup is open, and the submenu it holds.
+    //
+    // This is what makes `menu_active` a real answer rather than `false`:
+    // the desktop uses it to decide whether a plain letter key should be
+    // routed to menu selection instead of starting a cell edit, and a
+    // constant `false` meant that on Android an open menu and a typed
+    // character collided.
     thread_local! {
         static MENU_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
