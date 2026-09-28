@@ -355,6 +355,38 @@ mod wasm_adapter {
         state
     }
 
+    /// A DOM `MouseEvent::button` number as a `core::Button`.
+    ///
+    /// The DOM numbering is 0 = primary (left), 1 = secondary (right),
+    /// 2 = middle, 3 = back, 4 = forward, and higher for extra buttons.
+    /// `core::Button` groups 0/1/2 to the same three and passes the rest
+    /// through as `Other(n)` — so a pen's eraser end and a thumb button on a
+    /// trackpad arrive as themselves rather than being flattened into
+    /// "secondary", which is what a two-value mapping would do.
+    fn button_from_dom(button: i16) -> crate::core::Button {
+        use crate::core::Button;
+        match button {
+            0 => Button::Primary,
+            1 => Button::Secondary,
+            2 => Button::Middle,
+            other => Button::Other(other.clamp(0, u8::MAX as i16) as u8),
+        }
+    }
+
+    /// All four modifiers from a pointer event, for `core::Modifiers`.
+    ///
+    /// The DOM gives `meta` (Command / Windows / Menu) as its own field, where
+    /// GDK folds it into one modifier bit — so reading it separately is what
+    /// keeps a ⌘-click distinguishable from a Ctrl-click on the same platform.
+    fn modifiers_from(evt: &web_sys::PointerEvent) -> crate::core::Modifiers {
+        crate::core::Modifiers {
+            shift: evt.shift_key(),
+            ctrl: evt.ctrl_key(),
+            alt: evt.alt_key(),
+            meta: evt.meta_key(),
+        }
+    }
+
     /// Own a `Closure` for the life of the program.
     ///
     /// A `Closure` that is dropped releases the JS function it points at, so
@@ -2805,6 +2837,9 @@ impl SimpleAction {
         motion_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64, u32)>>>>,
         /// `(keyval, modifier mask) -> consumed`, for keys.
         key_raw_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> bool>>>>,
+        /// The unified gesture stream, fed by pointer and wheel listeners.
+        /// See [`Canvas::on_gesture`].
+        gesture_cb: Rc<RefCell<Option<Box<dyn FnMut(crate::core::Gesture)>>>>,
         /// `(x, y, button, modifier mask)`, for a release.
         release_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64, u32, u32)>>>>,
         closures: Rc<RefCell<Vec<Box<dyn Any>>>>,
@@ -2838,6 +2873,7 @@ impl SimpleAction {
                 click_button_cb: self.click_button_cb.clone(),
                 motion_cb: self.motion_cb.clone(),
                 key_raw_cb: self.key_raw_cb.clone(),
+                gesture_cb: self.gesture_cb.clone(),
                 release_cb: self.release_cb.clone(),
                 closures: self.closures.clone(),
             }
@@ -2892,6 +2928,160 @@ impl SimpleAction {
         /// on a page. The DOM has all of it: `MouseEvent::button()` gives the
         /// button number and the shift/ctrl/alt keys are on the event, so the
         /// same `(x, y, button, state)` tuple GTK produces is available here.
+        /// The canonical gesture stream: hover, drag, button and scroll in one
+        /// vocabulary, built by the backend from the DOM's events. See
+        /// `core::Gesture`.
+        ///
+        /// A browser is a better fit for this than the platform the other two
+        /// backends implement it on. NWG has to reach for raw `WM_*` messages
+        /// because a `Frame` exposes no mouse API at all, and it recovers the
+        /// modifier state from `GET_KEYSTATE` bits. The DOM instead *is* the
+        /// unified pointer abstraction: a single `PointerEvent` carries the
+        /// button, the set of buttons currently held, and all four modifiers,
+        /// for touch, pen and mouse alike. So the mapping is a direct read
+        /// rather than a reconstruction.
+        ///
+        /// Four listeners, because the DOM splits what Win32 packs into one
+        /// message:
+        ///
+        /// * `pointerdown` / `pointerup` -> [`Gesture::Button`]. `PointerEvent`
+        ///   has a distinct event for *primary* press and release, but that
+        ///   only covers the left button; the others arrive as ordinary
+        ///   pointer events, so all buttons are read from `button()`.
+        /// * `pointermove` -> [`Gesture::Hover`] with no button held, or
+        ///   [`Gesture::Drag`] with one. The DOM already makes that
+        ///   distinction — `buttons` is a bitmask — so the test is a mask
+        ///   check rather than bookkeeping.
+        /// * `wheel` -> [`Gesture::Scroll`].
+        ///
+        /// Coordinates are `offset_x`/`offset_y`, i.e. widget-relative, which
+        /// is what `Gesture` documents and what the other backends deliver.
+        /// `getBoundingClientRect` would give page coordinates, and
+        /// subtracting it per event would be a way to be off by a scroll
+        /// position.
+        ///
+        /// Nothing is `prevent_default`ed. The gesture stream is additive
+        /// here: this backend's own `on_click` / `on_motion` / `on_release`
+        /// are separately registered and may still want the event, and a
+        /// wheel handler that swallowed the event would break page scrolling
+        /// for a user whose handler ignored it.
+        pub fn on_gesture(&self, cb: Box<dyn FnMut(crate::core::Gesture)>) {
+            *self.gesture_cb.borrow_mut() = Some(cb);
+
+            // pointerdown / pointerup -> Button
+            for (event, pressed) in [("pointerdown", true), ("pointerup", false)] {
+                let cell = self.gesture_cb.clone();
+                let closure =
+                    Closure::<dyn FnMut(web_sys::PointerEvent)>::new(move |evt: web_sys::PointerEvent| {
+                        let gesture = crate::core::Gesture::Button {
+                            button: button_from_dom(evt.button()),
+                            pressed,
+                            x: evt.offset_x() as f64,
+                            y: evt.offset_y() as f64,
+                            mods: modifiers_from(&evt),
+                        };
+                        // `try_borrow_mut` so a handler that re-enters (by
+                        // queueing a redraw that synthesises an event) drops
+                        // the event instead of panicking across the FFI
+                        // boundary, where the panic cannot unwind.
+                        if let Ok(mut slot) = cell.try_borrow_mut() {
+                            if let Some(f) = slot.as_mut() {
+                                f(gesture);
+                            }
+                        }
+                    });
+                self.elem
+                    .add_event_listener_with_callback(event, closure.as_ref().unchecked_ref())
+                    .ok();
+                self.closures.borrow_mut().push(Box::new(closure));
+            }
+
+            // pointermove -> Hover or Drag
+            {
+                let cell = self.gesture_cb.clone();
+                let closure = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
+                    move |evt: web_sys::PointerEvent| {
+                        let mods = modifiers_from(&evt);
+                        let x = evt.offset_x() as f64;
+                        let y = evt.offset_y() as f64;
+                        // `buttons` is a bitmask: 1 = primary, 2 = secondary,
+                        // 4 = middle. Any bit set means a drag; none means a
+                        // hover. The DOM makes this distinction directly,
+                        // where Win32 has to re-read GET_KEYSTATE.
+                        let gesture = if evt.buttons() == 0 {
+                            crate::core::Gesture::Hover { x, y, mods }
+                        } else {
+                            crate::core::Gesture::Drag { x, y, mods }
+                        };
+                        if let Ok(mut slot) = cell.try_borrow_mut() {
+                            if let Some(f) = slot.as_mut() {
+                                f(gesture);
+                            }
+                        }
+                    },
+                );
+                self.elem
+                    .add_event_listener_with_callback(
+                        "pointermove",
+                        closure.as_ref().unchecked_ref(),
+                    )
+                    .ok();
+                self.closures.borrow_mut().push(Box::new(closure));
+            }
+
+            // wheel -> Scroll
+            {
+                let cell = self.gesture_cb.clone();
+                // The element is captured by value: a `&self` cannot be held
+                // by a `'static` closure, and the listener must outlive this
+                // call. `HtmlCanvasElement` is a JsCast handle, so cloning it
+                // is a refcount bump on the same DOM node.
+                let elem = self.elem.clone();
+                let closure =
+                    Closure::<dyn FnMut(web_sys::WheelEvent)>::new(move |evt: web_sys::WheelEvent| {
+                        // `deltaMode` is 0 for pixels, 1 for lines, 2 for pages.
+                        // Only the pixel mode is passed through unconverted: a
+                        // line or page delta is multiplied out to a pixel-like
+                        // amount so the caller sees one unit, which is what
+                        // NWG does by dividing WHEEL_DELTA out of WM_MOUSEWHEEL.
+                        // A page is taken as a full viewport height, and a line
+                        // as 16 px, the standard conversion.
+                        let (dx, dy) = match evt.delta_mode() {
+                            1 => (evt.delta_x() * 16.0, evt.delta_y() * 16.0),
+                            2 => {
+                                // A "page" of scroll is one viewport, so a
+                                // page-mode delta is scaled by the canvas's own
+                                // height rather than a fixed number.
+                                let h = elem.client_height() as f64;
+                                (evt.delta_x() * h, evt.delta_y() * h)
+                            }
+                            _ => (evt.delta_x(), evt.delta_y()),
+                        };
+                        let gesture = crate::core::Gesture::Scroll {
+                            delta: crate::core::ScrollDelta { dx, dy },
+                            x: evt.offset_x() as f64,
+                            y: evt.offset_y() as f64,
+                            mods: crate::core::Modifiers {
+                                shift: evt.shift_key(),
+                                ctrl: evt.ctrl_key(),
+                                alt: evt.alt_key(),
+                                meta: evt.meta_key(),
+                            },
+                        };
+                        if let Ok(mut slot) = cell.try_borrow_mut() {
+                            if let Some(f) = slot.as_mut() {
+                                f(gesture);
+                            }
+                        }
+                    });
+                self.elem
+                    .add_event_listener_with_callback("wheel", closure.as_ref().unchecked_ref())
+                    .ok();
+                self.closures.borrow_mut().push(Box::new(closure));
+            }
+        }
+
+        /// Button/modifier-aware press. See the GTK backend's
         pub fn on_click_button(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
             *self.click_button_cb.borrow_mut() = Some(cb);
             let cell = self.click_button_cb.clone();
@@ -3076,6 +3266,7 @@ impl SimpleAction {
             click_button_cb: Rc::new(RefCell::new(None)),
             motion_cb: Rc::new(RefCell::new(None)),
             key_raw_cb: Rc::new(RefCell::new(None)),
+            gesture_cb: Rc::new(RefCell::new(None)),
             release_cb: Rc::new(RefCell::new(None)),
             closures: Rc::new(RefCell::new(Vec::new())),
         })
