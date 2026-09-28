@@ -145,6 +145,45 @@ jobs:
       # iphonesimulator arm64. Pin the deployment target to what current Xcode
       # accepts — the iOS 7.1.2 path needs an archived SDK no runner has
       # (IOS_GUIDELINES.md §0/§9).
+      - name: Make GNU coreutils available
+        # ⚠️ `timeout` IS A GNU TOOL and macOS runners do not ship it. Every
+        # `timeout N cmd` in this workflow was therefore a hard failure - not a
+        # no-op, the shell reports "command not found" and the command never
+        # runs - which is why several `timeout`-wrapped `simctl` calls here
+        # quietly produced nothing at all, including the one that reads the
+        # app's log. Two runs chased a "no app log" that was really
+        # "the command that fetches it does not exist".
+        #
+        # `brew install coreutils` provides it as `gtimeout`; the symlink below
+        # makes the plain name work, and a small `run_bounded` shim covers the
+        # case where the install failed, because a bounded call is a safety
+        # property and must not depend on a package being there.
+        run: |
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          mkdir -p "$HOME/bin"
+          if brew list coreutils >/dev/null 2>&1 || brew install coreutils >/dev/null 2>&1; then
+            ln -sf "$(brew --prefix coreutils)/libexec/gnubin/gtimeout" "$HOME/bin/timeout"
+          fi
+          cat > "$HOME/bin/run_bounded" <<'SH'
+          #!/bin/bash
+          # run_bounded SECONDS CMD... — run CMD, kill it after SECONDS.
+          # Uses `timeout` when present (coreutils) and falls back to a
+          # background job plus a watchdog, so the safety property holds even
+          # where coreutils is not installed.
+          secs="$1"; shift
+          if command -v timeout >/dev/null 2>&1; then
+            exec timeout "$secs" "$@"
+          fi
+          "$@" & pid=$!
+          ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null ) & watchdog=$!
+          wait "$pid"; rc=$?
+          kill -TERM "$watchdog" 2>/dev/null
+          exit $rc
+          SH
+          chmod +x "$HOME/bin/run_bounded"
+          "$HOME/bin/run_bounded" 5 sh -c 'exit 7' && echo "BAD: returned 0" || echo "run_bounded: exit $? (expect 7)"
+          "$HOME/bin/run_bounded" 1 sh -c 'sleep 5' && echo "BAD: did not time out" || echo "run_bounded: timeout works"
+
       - name: Show toolchain versions
         run: |
           xcodebuild -version
@@ -302,7 +341,7 @@ jobs:
           # came to look like a hung one.
           app_log() {
             local dir cand
-            dir="$(timeout 60 xcrun simctl get_app_container "$SIM_UDID" \
+            dir="$(run_bounded 60 xcrun simctl get_app_container "$SIM_UDID" \
                      com.corro.corro data 2>/dev/null)" || dir=""
             for cand in "$dir/tmp/corro-app.log" "$dir/corro-app.log"; do
               if [ -n "$dir" ] && [ -r "$cand" ]; then cat "$cand" 2>/dev/null; return; fi
@@ -414,7 +453,7 @@ jobs:
           # "Screenshot the first frame" for 50 minutes with no output and
           # no timeout. A cap costs nothing when things work and is the
           # difference between a failed run and a hung one.
-          SIMCTL=(timeout 120 xcrun simctl)
+          SIMCTL=(run_bounded 120 xcrun simctl)
           for attempt in $(seq 1 8); do
             # Do NOT `simctl launch` here. On a running app it is not an
             # "activate": it restarts the process, so every retry threw away
@@ -442,7 +481,7 @@ jobs:
             # `main.m` logs "UIApplicationMain RETURNED" when the run loop
             # unwinds, so its ABSENCE plus a fall-off in the app's own
             # markers is the honest signal.
-            APPDIR="$(timeout 60 xcrun simctl get_app_container "$SIM_UDID" \
+            APPDIR="$(run_bounded 60 xcrun simctl get_app_container "$SIM_UDID" \
                      com.corro.corro data 2>/dev/null || true)"
           if [ -n "$APPDIR" ] && grep -qa "UIApplicationMain RETURNED" \
                "$APPDIR/tmp/corro-app.log" 2>/dev/null; then
@@ -504,7 +543,7 @@ jobs:
           # The error is NOT suppressed: when this fails the run has nothing
           # to say about the app, and "no log" without the reason is exactly
           # what sent the last two runs in circles.
-          APPDIR="$(timeout 60 xcrun simctl get_app_container "$SIM_UDID" \
+          APPDIR="$(run_bounded 60 xcrun simctl get_app_container "$SIM_UDID" \
                      com.corro.corro data 2>&1 | tail -1)"
           echo "get_app_container -> '${APPDIR:-<empty>}'"
           for cand in "$APPDIR/tmp/corro-app.log" "$APPDIR/corro-app.log"; do
@@ -517,7 +556,7 @@ jobs:
             echo "::warning::no app log found (looked in '${APPDIR:-<no container>}'); falling back to the app's stderr, which can drop bursts"
             cp /tmp/corro-live.log /tmp/corro-console.log 2>/dev/null || : > /tmp/corro-console.log
           fi
-          timeout 120 xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
+          run_bounded 120 xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
           echo "--- app output ---"
           tr -d '\000' < /tmp/corro-console.log | head -80 || echo "(no output)"
 
