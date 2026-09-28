@@ -559,10 +559,22 @@ pub fn log_apple(msg: &str) {
         const O_WRONLY: i32 = 1;
         const O_CREAT: i32 = 64;
         const O_APPEND: i32 = 1024;
-        let path = b"/tmp/corro-app.log\0";
-        let fd = libc_open(path.as_ptr() as *const std::os::raw::c_char, O_WRONLY | O_CREAT | O_APPEND, 0o644);
-        if fd >= 0 {
-            write(fd, line.as_ptr() as *const std::os::raw::c_void, line.len());
+        // Log to BOTH `/tmp` and the app container's own `tmp`, because they
+        // are not the same directory on iOS: an app's `/tmp` is already its
+        // container's, but a host-side reader that wants the file has to know
+        // the container path, and `get_app_container` needs a bundle id that
+        // is only resolved at build time. Writing both means the reader does
+        // not have to be right about any of that - it can find whichever one
+        // it can actually see.
+        for path in [b"/tmp/corro-app.log\0".as_ref(), b"./corro-app.log\0".as_ref()] {
+            let fd = libc_open(
+                path.as_ptr() as *const std::os::raw::c_char,
+                O_WRONLY | O_CREAT | O_APPEND,
+                0o644,
+            );
+            if fd >= 0 {
+                write(fd, line.as_ptr() as *const std::os::raw::c_void, line.len());
+            }
         }
         write(
             2,
