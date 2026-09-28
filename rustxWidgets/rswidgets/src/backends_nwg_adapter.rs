@@ -1056,6 +1056,8 @@ mod nwg_adapter {
         pub(crate) child_hexpand: Rc<RefCell<Vec<bool>>>,
         pub(crate) orientation: crate::backends::nwg::Orientation,
         pub(crate) spacing: i32,
+        /// TEMPORARY ReactOS diagnosis: per-box id for layout marks.
+        pub(crate) debug_id_cell: std::cell::Cell<i32>,
     }
 
     impl Clone for BoxWidget {
@@ -1068,6 +1070,9 @@ mod nwg_adapter {
                 child_hexpand: self.child_hexpand.clone(),
                 orientation: self.orientation,
                 spacing: self.spacing,
+                // Shared across clones: it identifies the *widget*, and every
+                // clone drives the same window, so they must agree.
+                debug_id_cell: std::cell::Cell::new(0),
             }
         }
     }
@@ -1159,10 +1164,29 @@ mod nwg_adapter {
             drop(hex);
             self.request_layout();
         }
+        /// TEMPORARY ReactOS diagnosis: stable per-box id, so layout marks
+        /// from different nesting levels can be told apart.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        fn debug_id(&self) -> i32 {
+            use std::sync::atomic::{AtomicI32, Ordering};
+            static NEXT: AtomicI32 = AtomicI32::new(1);
+            let cell = self.debug_id_cell.get();
+            if cell == 0 {
+                let n = NEXT.fetch_add(1, Ordering::Relaxed);
+                self.debug_id_cell.set(n);
+                n
+            } else {
+                cell
+            }
+        }
         pub fn layout(&self, _x: i32, _y: i32, w: i32, h: i32) {
             // TEMPORARY Win95 diagnosis.
             #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-            mark95xy(b"layot", w, h);
+            {
+                let id = self.debug_id();
+                let h2 = h + id * 100000;
+                mark95xy(b"layot", w, h2);
+            }
             // Negative/zero sizes arise transiently (a box laid out before
             // its parent is sized, or a wrapped synthetic WM_SIZE). A
             // negative size is never valid: SetWindowPos clamps it to 0
@@ -1254,6 +1278,13 @@ mod nwg_adapter {
                 crate::backends::nwg::Orientation::Horizontal => w - 10,
                 crate::backends::nwg::Orientation::Vertical => h - 10,
             };
+            // TEMPORARY ReactOS diagnosis: reached span distribution for
+            // this box (id, avail, n children).
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            {
+                let id = self.debug_id();
+                mark95xy(b"distr", avail + id * 100000, n as i32);
+            }
             let spans = crate::win32_portable::distribute_spans(
                 5,
                 avail,
@@ -1261,7 +1292,31 @@ mod nwg_adapter {
                 &desired_sizes,
                 &flags,
             );
+            // TEMPORARY ReactOS diagnosis: spans computed.
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            {
+                let id = self.debug_id();
+                mark95xy(b"distd", self.spacing + id * 100000, n as i32);
+            }
 
+            // (Fix-ReactOS) Drop the RefCell borrows before touching any
+            // child. set_window_pos() below makes ReactOS deliver a *real*
+            // WM_SIZE to the child synchronously, and SendMessageW(WM_SIZE)
+            // does too; a nested box child then re-enters this same layout,
+            // which would try to borrow `children` again while this pass
+            // still holds it - a RefCell re-entrancy borrow error that
+            // aborts the app. Copy out what the sizing loop needs and release
+            // the borrows first.
+            let children_vec: Vec<*mut c_void> = children.clone();
+            let vex_vec: Vec<bool> = vex.clone();
+            let hex_vec: Vec<bool> = hex.clone();
+            drop(vex);
+            drop(hex);
+            drop(children);
+            let children = children_vec;
+            let vex = vex_vec;
+            let hex = hex_vec;
+            let (children, vex, hex) = (&children, &vex, &hex);
             for i in 0..n {
                 let child = children[i];
                 let (pos, span) = spans[i];
@@ -1280,7 +1335,39 @@ mod nwg_adapter {
                 // child) nor the synthetic WM_SIZE below (it would wrap
                 // to ~65526 and fling nested children off-screen).
                 let (cw, ch) = (cw.max(0), ch.max(0));
-                set_window_pos(child, cx, cy, cw, ch);
+                // TEMPORARY ReactOS diagnosis: which child index the layout
+                // pass is on, so a hang localises to a specific child.
+                #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static LAST_CHILD: AtomicU32 = AtomicU32::new(0xFFFF);
+                    LAST_CHILD.store(i as u32, Ordering::Relaxed);
+                }
+                // A zero-sized child has nothing to show, and on ReactOS
+                // positioning one at 0 wedges the whole layout pass: ReactOS
+                // keeps recomputing that window's frame and the parent never
+                // gets past it (observed: the pass stops dead at the first
+                // 0-width child, present() never returns and nothing paints).
+                // Hide it and leave its geometry alone; a later pass with a
+                // real span positions it normally.
+                if cw > 0 || ch > 0 {
+                    set_window_pos(child, cx, cy, cw, ch);
+                } else {
+                    unsafe {
+                        winapi::um::winuser::ShowWindow(
+                            child as _, winapi::um::winuser::SW_HIDE);
+                    }
+                }
+                // TEMPORARY ReactOS diagnosis: survived positioning child i.
+                // The box id disambiguates which nesting level wedged.
+                #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                if i as u32 % 1 == 0 {
+                    let id = self.debug_id();
+                    let i32v = i as i32;
+                    let cwv = cw;
+                    let n = id * 1000 + i32v;
+                    mark95xy(b"chld!", n, cwv);
+                }
                 // Airtight cascade: SetWindowPos only delivers WM_SIZE when
                 // the size actually changed, so a nested box that keeps its
                 // size would never re-lay-out its own children (the cram
@@ -1289,6 +1376,13 @@ mod nwg_adapter {
                 // Guard: a zero-size child has nothing to lay out, and
                 // packing a non-positive size would wrap (see above).
                 if cw > 0 && ch > 0 {
+                    // TEMPORARY ReactOS diagnosis: the synthetic WM_SIZE a
+                    // parent sends its child (box id, child index, size).
+                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                    {
+                        let id = self.debug_id();
+                        mark95xy(b"synz!", (id as i32) * 1000 + i as i32, cw);
+                    }
                     unsafe {
                         let l = ((ch & 0xFFFF) << 16) | (cw & 0xFFFF);
                         winapi::um::winuser::SendMessageW(
@@ -1334,6 +1428,32 @@ mod nwg_adapter {
     /// Returns None for non-label controls or on any measurement failure
     /// (callers fall back to the window rect / hardcoded size).
     fn static_text_width(hwnd: winapi::shared::windef::HWND) -> Option<i32> {
+        // TEMPORARY ReactOS diagnosis: this sends WM_GETFONT to the control,
+        // so mark entry/exit to see whether the sizing loop wedges inside it.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 400 {
+                mark95xy(b"stw+ ", n as i32, 0);
+            }
+        }
+        let r = static_text_width_inner(hwnd);
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.load(Ordering::Relaxed);
+            if n < 400 {
+                mark95xy(b"stw- ", n as i32, 0);
+            }
+        }
+        r
+    }
+
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    fn static_text_width_inner(hwnd: winapi::shared::windef::HWND) -> Option<i32> {
         unsafe {
             let mut cls: [u16; 256] = [0; 256];
             let n = winapi::um::winuser::GetClassNameW(hwnd, cls.as_mut_ptr(), 256);
@@ -1382,6 +1502,7 @@ mod nwg_adapter {
             child_vexpand: child_vexpand.clone(),
             child_hexpand: child_hexpand.clone(),
             orientation, spacing,
+            debug_id_cell: std::cell::Cell::new(0),
         };
         // Auto-layout on WM_SIZE — now shares children via Rc<RefCell>
         if hwnd != std::ptr::null_mut() {
@@ -1419,6 +1540,11 @@ mod nwg_adapter {
                             *last = (w, h);
                         }
                         bw2.layout(0, 0, w, h);
+                        // TEMPORARY ReactOS diagnosis: did the nested layout
+                        // return? (It does not on ReactOS - the app hangs
+                        // inside it, after the NCCALCSIZE of its children.)
+                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                        mark95a(b"box-layout-done\n");
                     }
                     None
                 },
