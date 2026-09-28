@@ -2458,7 +2458,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         }
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
-            let inner = crate::backends_wasm_adapter::create_menubar(&model.inner, action_group)?;
+            let inner = crate::backends_wasm_adapter::create_menubar(&model.inner, _action_group)?;
             Ok(crate::common::MenuBar { inner })
         }
         #[cfg(all(target_os = "android", not(feature = "zork")))]

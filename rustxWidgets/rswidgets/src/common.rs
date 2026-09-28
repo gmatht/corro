@@ -76,6 +76,14 @@ mod platform {
 macro_rules! common_types_mod {
     () => {
         use super::platform::*;
+        // `raw_handle` is a `core::Widget` trait method, and every platform
+        // type implements it. Without the trait in scope it does not resolve
+        // on the backends whose adapter has no inherent `raw_handle`, which is
+        // what made the wasm32 build fail on this line alone. `allow` is
+        // needed because the wasm adapter *does* have an inherent one, which
+        // makes the import unused there.
+        #[allow(unused_imports)]
+        use crate::core::Widget;
 
         #[derive(Clone)]
         pub struct Window { pub inner: PlatformWindow }
@@ -466,15 +474,22 @@ mod common_types {
     impl Canvas {
         pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) { self.inner.on_key(cb); }
     }
-    // Wasm has no native scrollbar need here (the web view scrolls natively);
-    // these exist so gui code compiles unchanged.
     impl ScrolledWindow {
-        pub fn set_child(&self, _child: &impl AsRef<*mut std::os::raw::c_void>) {}
-        pub fn set_policy(&self, _hscroll: u32, _vscroll: u32) {}
-        pub fn set_vexpand(&self, _expand: bool) {}
-        pub fn set_vexpand(&self, _expand: bool) {}
-        pub fn scroll_to(&self, _hval: f64, _hupper: f64, _hpage: f64, _vval: f64, _vupper: f64, _vpage: f64) {}
-        pub fn on_scroll(&self, _cb: Box<dyn FnMut(bool, f64)>) {}
+        // The shared GUI nests the canvas here, so this takes a `Canvas`
+        // (like the ios/macos/android arms) rather than a raw handle: the
+        // adapter's `set_child` is generic over `AsElement` and the wrapper
+        // is what knows which element that is.
+        pub fn set_child(&self, child: &crate::common::Canvas) { self.inner.set_child(&child.inner); }
+        // Forwarded rather than stubbed: the adapter has real CSS-backed
+        // implementations of all three (`overflow-x`/`overflow-y`,
+        // `flex-grow`/`align-self`), so `sync_scrollbars`
+        // (`gui_backend.rs:3053`) now actually reaches the DOM.
+        pub fn set_policy(&self, hscroll: u32, vscroll: u32) { self.inner.set_policy(hscroll as i32, vscroll as i32); }
+        pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
+        pub fn scroll_to(&self, hval: f64, hupper: f64, hpage: f64, vval: f64, vupper: f64, vpage: f64) {
+            self.inner.scroll_to(hval, hupper, hpage, vval, vupper, vpage);
+        }
+        pub fn on_scroll(&self, cb: Box<dyn FnMut(bool, f64)>) { self.inner.on_scroll(cb); }
     }
 }
 

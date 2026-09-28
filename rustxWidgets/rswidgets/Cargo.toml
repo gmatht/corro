@@ -52,6 +52,10 @@ web-sys = { version = "0.3", features = [
   "CanvasRenderingContext2d", "CssStyleDeclaration", "DomTokenList",
   "HtmlCollection", "Window",
   "Text",
+  # B5/B15: Canvas::text_extents_styled needs measure_text (TextMetrics), and
+  # MenuBar::popup_submenu_by_mnemonic_at needs a bounding box to turn the
+  # caller's screen coordinates into a position inside the bar.
+  "TextMetrics", "DomRect", "NodeList",
 ] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
