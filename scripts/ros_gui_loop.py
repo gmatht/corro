@@ -37,10 +37,24 @@ ROS_DIR = os.environ.get("ROS_DIR", "/root/vm/reactos")
 STOCK_ISO = os.path.join(ROS_DIR, "ReactOS-0.4.16-i386.iso")
 TREE = os.path.join(ROS_DIR, "build-tree")
 OUT_ISO = os.path.join(ROS_DIR, "corro-live.iso")
-FLOPPY = os.path.join(ROS_DIR, "corro-log.img")
+# Per-run floppy: see make_floppy() for why it must not be shared.
+FLOPPY = os.path.join(
+    ROS_DIR, f"corro-log-{os.getpid()}.img")
 UNICOWS = "/opt/wine-stable/lib/wine/i386-windows/unicows.dll"
 
-QMP_PORT = int(os.environ.get("QMP_PORT", "4446"))
+# Fixed ports were a flakiness source: another session (or a leftover VM from a
+# killed run) holding the port makes QEMU exit at startup, and the failure
+# surfaces only as a QMP connection refusal with the real reason buried in
+# qemu's own log. Ask the OS for a free port instead, and let QMP_PORT override.
+def _free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+QMP_PORT = int(os.environ.get("QMP_PORT") or _free_port())
+VNC_DISPLAY = int(os.environ.get("VNC_DISPLAY") or (9000 + (QMP_PORT % 900)))
 OUT = os.environ.get("ROS_OUT", "/tmp/rosrun")
 
 
@@ -136,6 +150,15 @@ def build_iso(exe):
 
 
 def make_floppy():
+    """Create the log floppy.
+
+    Recreated from scratch every run, and named per-run (see FLOPPY's
+    definition). A shared path is a flakiness source: QEMU takes a write lock
+    on the image for as long as it runs, so two concurrent runs - or a run
+    after one was killed - make the next QEMU exit at startup with "Failed to
+    get \"write\" lock", which used to surface only as a QMP connection
+    refusal.
+    """
     with open(FLOPPY, "wb") as f:
         f.truncate(1474560)
     subprocess.run(["mkfs.vfat", "-F", "12", FLOPPY],
@@ -153,7 +176,10 @@ def start_qemu():
         "-drive", f"file={OUT_ISO},format=raw,media=cdrom,if=ide,index=2",
         "-drive", f"file={FLOPPY},format=raw,if=floppy",
         "-usb", "-device", "usb-tablet", "-vga", "cirrus",
-        "-display", "none", "-vnc", ":6",
+        # VNC display is a separate pick: the QMP port and the VNC port are
+        # different numbers and neither implies the other, so a fixed ":6"
+        # collided independently of QMP_PORT.
+        "-display", "none", "-vnc", f":{VNC_DISPLAY}",
         "-qmp", f"tcp:127.0.0.1:{QMP_PORT},server,nowait",
         "-rtc", "base=localtime", "-net", "none", "-boot", "once=d",
     ], stdout=logp, stderr=subprocess.STDOUT, start_new_session=True)
@@ -168,7 +194,21 @@ def main():
     log(f"== qemu pid {proc.pid}")
     sys.path.insert(0, os.path.join(CORRO, "scripts"))
     import qmp
-    q = qmp.Qmp(QMP_PORT)
+    try:
+        q = qmp.Qmp(QMP_PORT)
+    except OSError as e:
+        # A QMP refusal on its own is close to useless: the real reason is in
+        # qemu's log, and the common causes (image locked by another QEMU, port
+        # taken, bad ISO) never reach this exception. Report the actual cause
+        # instead of making the reader go and find it.
+        if proc.poll() is not None:
+            log(f"== qemu exited immediately (rc={proc.returncode})")
+        else:
+            log(f"== qemu still running but QMP on {QMP_PORT} refused ({e})")
+        logf = "/tmp/qemu-corro-ros.log"
+        if os.path.exists(logf):
+            log(f"== qemu said:\n" + open(logf).read()[-2000:])
+        raise SystemExit(1)
     t0 = time.time()
     last_enter = 0.0
     at_desktop = False
@@ -187,9 +227,23 @@ def main():
         ImageOps.autocontrast(im.convert("L")).save(f"{OUT}/_boot.png")
         txt = subprocess.run(["tesseract", f"{OUT}/_boot.png", "-", "--psm", "6"],
                              capture_output=True, text=True).stdout.lower()
-        if any(k in txt for k in ("recycle", "command prompt", "install reactos")):
+        # Desktop detection. These must be things that CANNOT appear on a boot
+        # screen: the FreeLDR menu itself offers "Run ReactOS Live CD" and
+        # "Install ReactOS", so matching on those called the boot menu the
+        # desktop and the run then sat on a menu for the rest of its budget
+        # while the app never started. (The Recycle Bin / My Computer /
+        # Start Menu strings only exist once Explorer is up.)
+        # The app's own window is ALSO a success condition. Once the Startup
+        # batch launches it, the window covers the desktop icons, so the
+        # desktop markers stop matching and the loop kept re-sending Enter at
+        # an already-working VM until the budget ran out. Match the app's title
+        # so a run ends as soon as the thing under test is on screen.
+        app_up = ("corro" in txt) and ("edit" in txt or "insert" in txt)
+        if any(k in txt for k in ("recycle bin", "my computer",
+                                  "command prompt", "start menu")) or app_up:
             if not at_desktop:
-                log(f"== desktop reached at t={time.time()-t0:.0f}s")
+                what = "app" if app_up else "desktop"
+                log(f"== {what} reached at t={time.time()-t0:.0f}s")
                 at_desktop = True
                 q.cmd("screendump", {"filename": f"{OUT}/desktop.png", "format": "ppm"})
             # let the Startup batch launch the app, then snapshot it
@@ -197,11 +251,28 @@ def main():
                 time.sleep(15)
                 q.cmd("screendump", {"filename": f"{OUT}/app-{k}.png", "format": "ppm"})
             break
-        if any(k in txt for k in ("language", "press any key", "select the operating",
-                                  "run reactos")) and time.time() - last_enter > 7:
+        # Boot gates that block until a key is pressed: the FreeLDR menu, the
+        # CD driver "press any key" gate, and the first-boot language splash.
+        # "run reactos" is deliberately NOT here even though it appears on the
+        # boot menu: Enter on that menu has already been sent to get here, and
+        # re-matching the menu text just sends more Enters at a screen that is
+        # past the gate. Unreadable screens are handled by the stall re-send
+        # below, which does not depend on OCR at all.
+        gate = any(k in txt for k in ("language", "press any key",
+                                      "select the operating"))
+        if gate and time.time() - last_enter > 7:
             q.cmd("send-key", {"keys": [{"type": "qcode", "data": "ret"}]})
             last_enter = time.time()
             log(f"   [t={time.time()-t0:.0f}s] Enter at boot gate")
+        # The gates do not appear at predictable wall-clock times (KVM vs TCG,
+        # host load, disk cache state all move them) and a single Enter can be
+        # dropped by the guest, so a long stall gets a re-send whether or not
+        # OCR recognised the screen. Without this the run can sit at a gate
+        # whose text was misread until the 360s budget runs out.
+        elif time.time() - t0 > 45 and time.time() - last_enter > 12:
+            q.cmd("send-key", {"keys": [{"type": "qcode", "data": "ret"}]})
+            last_enter = time.time()
+            log(f"   [t={time.time()-t0:.0f}s] Enter (stall re-send)")
         time.sleep(3)
     q.close()
     # fetch the app log off the floppy
@@ -219,6 +290,20 @@ def main():
                 log(f"== fetched {name} -> {dst}")
         subprocess.run(["umount", mount], stderr=subprocess.DEVNULL)
     log("== done; see /tmp/rosrun/ for screenshots and the app log")
+    # The floppy is per-run (see FLOPPY), so remove it here or a long-lived
+    # working directory slowly fills with 1.4 MB images. Sweep by pattern as
+    # well: a run that is killed part-way never reaches this line, and those
+    # are exactly the ones that leave debris.
+    try:
+        os.unlink(FLOPPY)
+    except OSError:
+        pass
+    for stale in glob.glob(os.path.join(ROS_DIR, "corro-log-*.img")):
+        if os.path.getmtime(stale) < time.time() - 3600:
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
     return 0
 
 

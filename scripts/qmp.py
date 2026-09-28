@@ -31,8 +31,26 @@ def _qmp_iter():
 
 
 class Qmp:
-    def __init__(self, port=QMP_PORT):
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=30)
+    def __init__(self, port=QMP_PORT, connect_timeout=60.0):
+        # Retry: QEMU binds the QMP socket slightly AFTER exec returns, so
+        # connecting once straight after spawn loses the race and the caller
+        # sees a bare ConnectionRefusedError that looks like "QEMU failed"
+        # when in fact it is booting fine. Poll until it answers, and only
+        # then give up.
+        deadline = time.time() + connect_timeout
+        last = None
+        while time.time() < deadline:
+            try:
+                self.sock = socket.create_connection(("127.0.0.1", port),
+                                                     timeout=30)
+                break
+            except OSError as e:
+                last = e
+                time.sleep(0.5)
+        else:
+            raise OSError(
+                f"no QMP on port {port} after {connect_timeout:.0f}s "
+                f"(last: {last})")
         self.f = self.sock.makefile("rwb")
         self.f.readline()  # greeting
         self.cmd("qmp_capabilities")
