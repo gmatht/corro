@@ -28,7 +28,7 @@ pub mod repl;
 // adapter (`crate::backends_zork_adapter`) resolves `crate::backends::zork::*`.
 pub use facade::*;
 
-pub use model::{Callback, MenuItemData, ZorkKind, ZorkNode, ZorkState};
+pub use model::{Callback, MenuItemData, MenuItemKind, ZorkKind, ZorkNode, ZorkProps, ZorkState};
 
 use crate::backends::BackendApp;
 

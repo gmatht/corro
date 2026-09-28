@@ -25,6 +25,201 @@ fn id_of(child: &impl AsRef<*mut c_void>) -> usize {
     *child.as_ref() as usize
 }
 
+
+impl Window {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Button {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Label {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl BoxWidget {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Grid {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Entry {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Menu {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl MenuBar {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl SimpleAction {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Dialog {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl DropDown {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl CheckButton {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl RadioButton {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl TextView {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Canvas {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Overlay {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl ScrolledWindow {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Fixed {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl Spreadsheet {
+    /// The model node id. Useful for diagnostics and for correlating a widget
+    /// with a [`ZorkState::snapshot`](crate::backends::zork::model::ZorkState::snapshot)
+    /// entry; the [`crate::backends::zork`] free functions take the same id.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+/// Strip a GTK mnemonic marker: `&` before a character makes that character the
+/// mnemonic, and `&_` is a literal underscore. A trailing `&` is kept.
+///
+/// `&Save` -> `Save`, `P_rint` -> `Print`, `&_&` -> `_&`.
+fn strip_mnemonic(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut chars = label.chars();
+    while let Some(c) = chars.next() {
+        if c != '&' {
+            out.push(c);
+            continue;
+        }
+        // `next()` consumes, so the marked character is not also pushed by the
+        // loop head — peeking here would duplicate it.
+        match chars.next() {
+            Some('_') => out.push('_'),
+            Some(next) => out.push(next),
+            None => out.push('&'),
+        }
+    }
+    out
+}
+
 // -- Window --
 
 #[derive(Clone)]
@@ -550,6 +745,16 @@ impl Menu {
             items.accelerator = accelerator.to_string();
         }
     }
+    /// Append an item whose *label* carries a GTK mnemonic marker (the
+    /// `label_with_mnemonic` family). The `_` is stripped so the stored label
+    /// is what a user would read.
+    pub fn append_key(&self, label: &str, action: &str) {
+        crate::backends::zork::menu_append(self.id, &strip_mnemonic(label), action);
+    }
+    /// See [`Self::append_key`].
+    pub fn append_submenu_key(&self, label: &str, submenu: &Menu) {
+        crate::backends::zork::menu_append_submenu(self.id, &strip_mnemonic(label), submenu.id);
+    }
     pub fn append_separator(&self, label: &str) {
         crate::backends::zork::menu_append_separator(self.id, label);
     }
@@ -704,6 +909,9 @@ impl Dialog {
     pub fn set_default_size(&self, w: i32, h: i32) {
         crate::backends::zork::set_size_request(self.id, w, h);
     }
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        crate::backends::zork::set_size_request(self.id, w, h);
+    }
     /// Record the parent window. A headless dialog has no WM to place it, but
     /// the model keeps the relation so a test can assert it.
     pub fn set_transient_for(&self, parent: *mut c_void) {
@@ -758,6 +966,12 @@ impl Dialog {
     }
     pub fn is_destroyed(&self) -> bool {
         crate::backends::zork::is_destroyed(self.id)
+    }
+    /// GTK's name for [`Self::close`]: destroy the dialog's window. The model
+    /// records the same state (destroyed + hidden), so the two are the same
+    /// operation here.
+    pub fn mark_destroyed(&self) {
+        crate::backends::zork::dialog_mark_destroyed(self.id);
     }
     /// The response ids a test can fire, in registration order.
     pub fn response_ids(&self) -> Vec<i32> {
@@ -947,6 +1161,17 @@ impl RadioButton {
     /// Flip and fire, keeping the group mutually exclusive.
     pub fn toggle(&self) {
         crate::backends::zork::toggle(self.id);
+    }
+
+    /// The group this button belongs to, or `None` if it is not a radio.
+    /// Group `0` means "ungrouped".
+    pub fn group(&self) -> Option<usize> {
+        crate::backends::zork::radiobutton_group(self.id)
+    }
+
+    /// Join `group`. Lets a radio built without a seed be grouped later.
+    pub fn set_group(&self, group_id: usize) {
+        crate::backends::zork::set_radiobutton_group(self.id, group_id);
     }
 
     pub fn grab_focus(&self) {
@@ -1333,9 +1558,7 @@ impl AsRef<*mut c_void> for Spreadsheet {
 }
 
 impl Spreadsheet {
-    pub fn id(&self) -> usize {
-        self.id
-    }
+    /// Set a cell's value (1-based row/col).
     pub fn set_cell(&self, row: u32, col: u32, text: &str) {
         crate::backends::zork::sheet_set_cell(self.id, row, col, text, 0);
     }
@@ -1369,6 +1592,21 @@ impl Spreadsheet {
     }
     pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
         crate::backends::zork::set_draw_callback(self.id, cb);
+    }
+    /// Click-to-edit. The spreadsheet is backed by a real cell map, so this is
+    /// the same hook a `Canvas` has — a test can click a cell and assert which
+    /// cell the handler saw.
+    pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
+        crate::backends::zork::add_click_hook(self.id, cb);
+    }
+    pub fn on_click_button(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+        crate::backends::zork::add_click_button_hook(self.id, cb);
+    }
+    pub fn on_motion(&self, cb: Box<dyn FnMut(f64, f64, u32)>) {
+        crate::backends::zork::add_motion_hook(self.id, cb);
+    }
+    pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) {
+        crate::backends::zork::add_key_hook(self.id, cb);
     }
     pub fn set_hexpand(&self, expand: bool) {
         crate::backends::zork::set_hexpand(self.id, expand);
@@ -1454,10 +1692,22 @@ pub fn create_checkbutton(label: &str) -> Result<CheckButton, Error> {
 }
 
 pub fn create_radiobutton(group: Option<&RadioButton>, label: &str) -> Result<RadioButton, Error> {
-    let gid = group.map(|r| r.id);
-    crate::backends::zork::create_radiobutton(gid, label)
-        .map(|id| RadioButton { id })
-        .map_err(|e| Error::Backend(format!("{}", e)))
+    // A group is named by an id every member shares. The seed supplies it: a
+    // seed that is itself ungrouped (group 0) *becomes* the group, so the seed
+    // and every button created from it stay mutually exclusive. Without a seed
+    // the button is ungrouped and never clears a sibling — the honest
+    // behaviour for an independent radio.
+    let gid = group.and_then(|r| r.group()).filter(|g| *g != 0);
+    let id = match (gid, group) {
+        (Some(g), _) => crate::backends::zork::create_radiobutton(Some(g), label),
+        (None, Some(seed)) => {
+            // Promote the seed to its own group, then join it.
+            crate::backends::zork::set_radiobutton_group(seed.id(), seed.id());
+            crate::backends::zork::create_radiobutton(Some(seed.id()), label)
+        }
+        (None, None) => crate::backends::zork::create_radiobutton(None, label),
+    };
+    id.map(|id| RadioButton { id }).map_err(|e| Error::Backend(format!("{}", e)))
 }
 
 pub fn create_textview() -> Result<TextView, Error> {

@@ -101,6 +101,60 @@ fn short_desc(_state: &ZorkState, node: &ZorkNode) -> String {
     }
 }
 
+/// A one-line property summary, printed by `props` and `look -v`.
+///
+/// The model records geometry, visibility, expansion, margins, classes, focus
+/// and scroll for every node; before this the REPL could not show any of them,
+/// so a `set` had no visible effect from the player's side.
+fn prop_summary(state: &ZorkState, node: &ZorkNode) -> String {
+    let p = &node.props;
+    let mut out: Vec<String> = Vec::new();
+    if let (Some(x), Some(y)) = (p.offset_x, p.offset_y) {
+        out.push(format!("at ({}, {})", x, y));
+    }
+    if let (Some(w), Some(h)) = (p.width, p.height) {
+        out.push(format!("size {}x{}", w, h));
+    }
+    if !p.visible {
+        out.push("hidden".to_string());
+    }
+    if p.hexpand {
+        out.push("hexpand".to_string());
+    }
+    if p.vexpand {
+        out.push("vexpand".to_string());
+    }
+    if p.margin_start != 0 {
+        out.push(format!("margin-start {}", p.margin_start));
+    }
+    if p.margin_top != 0 {
+        out.push(format!("margin-top {}", p.margin_top));
+    }
+    if !p.classes.is_empty() {
+        out.push(format!("classes [{}]", p.classes.join(", ")));
+    }
+    if p.fixed_width.is_some() {
+        out.push(format!("fixed-width {:?}", p.fixed_width));
+    }
+    if let Some(f) = &p.font {
+        out.push(format!("font {:?} @ {}", f, p.font_size));
+    }
+    if p.hscroll != 0.0 || p.vscroll != 0.0 {
+        out.push(format!("scroll ({}, {})", p.hscroll, p.vscroll));
+    }
+    if state.has_focus(node.id) {
+        out.push("focused".to_string());
+    }
+    if node.destroyed {
+        out.push("destroyed".to_string());
+    }
+    if out.is_empty() {
+        "no properties set".to_string()
+    } else {
+        out.join(", ")
+    }
+}
+
 fn dir_name(dirs: &[(&str, &ZorkNode)], id: usize) -> String {
     dirs.iter()
         .find(|(_, t)| t.id == id)
@@ -228,6 +282,12 @@ fn describe_room(state: &ZorkState, node: &ZorkNode) {
         }
     }
 
+    let summary = prop_summary(state, node);
+    if summary != "no properties set" {
+        println!();
+        println!("({})", summary);
+    }
+
     println!();
     println!("You see:");
     println!("  0. (yourself) {}", short_desc(state, node));
@@ -289,28 +349,63 @@ fn execute_command(state: &mut ZorkState, line: &str) {
                 Some(state.current_id)
             };
             if let Some(id) = target_id {
-                if let Some(node) = state.node_mut(id) {
-                    match &node.kind {
-                        ZorkKind::Button { .. } => {
-                            println!("You press the button. It clicks!");
-                            node.fire_callbacks();
-                        }
-                        ZorkKind::MenuBar => {
-                            println!("You click the MenuBar. Use 'select <n>' to choose an item.");
-                        }
-                        ZorkKind::Menu => {
-                            let items = state.menu_items.get(&id).cloned().unwrap_or_default();
-                            if !items.is_empty() {
-                                println!("Select an item:");
-                                for (i, item) in items.iter().enumerate() {
-                                    println!("  {}. {} ({})", i + 1, item.label, item.action);
-                                }
-                            } else {
-                                println!("This menu has no items.");
+                let kind_is_menu = state.node(id).map(|n| matches!(n.kind, ZorkKind::MenuBar | ZorkKind::Menu)).unwrap_or(false);
+                if kind_is_menu {
+                    {
+                        let items = state.menu_items.get(&id).cloned().unwrap_or_default();
+                        if items.is_empty() {
+                            println!("This menu has no items.");
+                        } else {
+                            println!("Select an item:");
+                            for (i, item) in items.iter().enumerate() {
+                                let mark = match item.kind {
+                                    crate::backends::zork::model::MenuItemKind::Separator => " (separator)",
+                                    crate::backends::zork::model::MenuItemKind::Section => " (section)",
+                                    crate::backends::zork::model::MenuItemKind::Check => {
+                                        if item.checked { " [x]" } else { " [ ]" }
+                                    }
+                                    crate::backends::zork::model::MenuItemKind::Radio => {
+                                        if item.checked { " (o)" } else { " ( )" }
+                                    }
+                                    crate::backends::zork::model::MenuItemKind::Normal => "",
+                                };
+                                println!("  {}. {}{}{}", i + 1, item.label, mark, if item.accelerator.is_empty() { String::new() } else { format!("  ({})", item.accelerator) });
                             }
                         }
-                        _ => println!("You can't click that."),
                     }
+                    return;
+                }
+                // Everything else that can be activated goes through
+                // `pointer_click`, so its click hooks run before its
+                // callbacks. The old match only handled Button and said
+                // "You can't click that" for an Entry or CheckButton, which do
+                // have click semantics.
+                let clickable = state.node(id).is_some_and(|n| {
+                    matches!(
+                        n.kind,
+                        ZorkKind::Button { .. }
+                            | ZorkKind::Entry { .. }
+                            | ZorkKind::CheckButton { .. }
+                            | ZorkKind::RadioButton { .. }
+                            | ZorkKind::DropDown { .. }
+                            | ZorkKind::TextView { .. }
+                            | ZorkKind::Canvas { .. }
+                    )
+                });
+                if !clickable {
+                    println!("You can't click that.");
+                    return;
+                }
+                let desc = short_desc(state, state.node(id).unwrap());
+                // A toggleable button flips; anything else just activates.
+                if state.node(id).is_some_and(|n| {
+                    matches!(n.kind, ZorkKind::CheckButton { .. } | ZorkKind::RadioButton { .. })
+                }) {
+                    state.toggle(id);
+                    println!("You press the {}.", desc);
+                } else {
+                    state.pointer_click(id, 0.0, 0.0);
+                    println!("You press the {}. It clicks!", desc);
                 }
             }
         }
@@ -326,21 +421,13 @@ fn execute_command(state: &mut ZorkState, line: &str) {
                     return;
                 }
             };
-            let items = state.menu_items.get(&state.current_id).cloned().unwrap_or_default();
-            if num == 0 || num > items.len() {
-                println!("Invalid selection.");
-                return;
-            }
-            let item = &items[num - 1];
-            println!("You selected \"{}\".", item.label);
-            if item.submenu.is_some() {
-                println!("Opening submenu...");
-            }
-            if !item.action.is_empty() {
-                println!("Action: {}", item.action);
-                if let Some(node) = state.node_mut(state.current_id) {
-                    node.fire_callbacks();
-                }
+            // Route through `menu_select`, which fires the SimpleAction the
+            // item names. The old code only printed the action name, so nothing
+            // ever happened when you picked an item.
+            let idx = num.saturating_sub(1);
+            match state.menu_select(state.current_id, idx) {
+                Some(label) => println!("You selected \"{}\".", label),
+                None => println!("Nothing selectable there."),
             }
         }
         "examine" | "exam" | "x" => {
@@ -372,20 +459,240 @@ fn execute_command(state: &mut ZorkState, line: &str) {
             examine(state, state.current_id);
         }
         "toggle" => {
-            if let Some(n) = state.node_mut(state.current_id) {
-                match &mut n.kind {
-                    ZorkKind::CheckButton { ref mut checked, .. } => {
-                        *checked = !*checked;
-                        println!("CheckButton is now {}.", if *checked { "checked" } else { "unchecked" });
-                        n.fire_callbacks();
+            // `ZorkState::toggle` is group-aware, so using it here means a
+            // radio toggle clears its siblings (the old inline toggle just
+            // flipped this button and left the group inconsistent).
+            let id = state.current_id;
+            let is_toggleable = state.node(id).is_some_and(|n| {
+                matches!(n.kind, ZorkKind::CheckButton { .. } | ZorkKind::RadioButton { .. })
+            });
+            if !is_toggleable {
+                println!("You can't toggle that.");
+                return;
+            }
+            let was = match state.node(id) {
+                Some(n) => match &n.kind {
+                    ZorkKind::CheckButton { checked, .. } | ZorkKind::RadioButton { checked, .. } => *checked,
+                    _ => false,
+                },
+                None => false,
+            };
+            state.toggle(id);
+            let now = match state.node(id) {
+                Some(n) => match &n.kind {
+                    ZorkKind::CheckButton { checked, .. } | ZorkKind::RadioButton { checked, .. } => *checked,
+                    _ => false,
+                },
+                None => false,
+            };
+            let noun = match state.node(id).map(|n| &n.kind) {
+                Some(ZorkKind::CheckButton { .. }) => "CheckButton",
+                Some(ZorkKind::RadioButton { .. }) => "RadioButton",
+                _ => "widget",
+            };
+            println!("{} is now {}.", noun, if now { "on" } else { "off" });
+            // A radio group only ever has one member on; if this toggle turned
+            // something on, say which sibling it cleared.
+            if now && !was {
+                if let Some(ZorkKind::RadioButton { group_id, .. }) = state.node(id).map(|n| &n.kind) {
+                    if *group_id != 0 {
+                        let others_off = state
+                            .nodes
+                            .iter()
+                            .filter(|n| matches!(n.kind, ZorkKind::RadioButton { group_id: g, .. } if g == *group_id && n.id != id))
+                            .all(|n| !matches!(n.kind, ZorkKind::RadioButton { checked: true, .. }));
+                        if others_off {
+                            println!("The rest of the group is now unselected.");
+                        }
                     }
-                    ZorkKind::RadioButton { ref mut checked, .. } => {
-                        *checked = !*checked;
-                        println!("RadioButton is now {}.", if *checked { "selected" } else { "not selected" });
-                        n.fire_callbacks();
-                    }
-                    _ => println!("You can't toggle that."),
                 }
+            }
+        }
+        "props" | "attributes" => {
+            if let Some(node) = state.node(state.current_id) {
+                println!("{}: {}", short_desc(state, node), prop_summary(state, node));
+                if let ZorkKind::Entry { buffer, cursor } = &node.kind {
+                    println!("  caret at {} of {} chars", cursor, buffer.chars().count());
+                }
+                if let ZorkKind::Canvas { .. } = &node.kind {
+                    println!("  redraw requests: {}", node.pointer.redraws);
+                }
+                if !node.dialog_buttons.is_empty() {
+                    let btns: Vec<String> = node
+                        .dialog_buttons
+                        .iter()
+                        .map(|(l, r)| format!("{}={}", l, r))
+                        .collect();
+                    println!("  buttons: {}", btns.join(", "));
+                }
+                if !node.cells.is_empty() {
+                    println!("  {} cell(s) set", node.cells.len());
+                }
+            }
+        }
+        "set" => {
+            if args.len() < 2 {
+                println!("Usage: set <property> <value>");
+                println!("  properties: size, offset, margin-start, margin-top, class, xalign, fixed-width, font, scroll");
+                return;
+            }
+            let prop = args[0].to_lowercase();
+            let id = state.current_id;
+            // The value is the rest of the line, so a class name or font can
+            // contain spaces.
+            let value = args[1..].join(" ");
+            match prop.as_str() {
+                "size" => {
+                    if let Some((w, h)) = parse_pair(&value) {
+                        state.set_size_request(id, w, h);
+                        println!("Size set to {}x{}.", w, h);
+                    } else {
+                        println!("Usage: set size <w> <h>");
+                    }
+                }
+                "offset" => {
+                    if let Some((x, y)) = parse_pair(&value) {
+                        state.set_offset(id, x, y);
+                        println!("Offset set to ({}, {}).", x, y);
+                    } else {
+                        println!("Usage: set offset <x> <y>");
+                    }
+                }
+                "margin-start" => {
+                    if let Some(px) = value.parse::<i32>().ok() {
+                        state.set_margin_start(id, px);
+                        println!("Margin-start set to {}.", px);
+                    } else {
+                        println!("Usage: set margin-start <px>");
+                    }
+                }
+                "margin-top" => {
+                    if let Some(px) = value.parse::<i32>().ok() {
+                        state.set_margin_top(id, px);
+                        println!("Margin-top set to {}.", px);
+                    } else {
+                        println!("Usage: set margin-top <px>");
+                    }
+                }
+                "class" => {
+                    if let Some(cls) = value.strip_suffix('+') {
+                        state.add_class(id, cls);
+                        println!("Added class \"{}\".", cls);
+                    } else if let Some(cls) = value.strip_suffix('-') {
+                        state.remove_class(id, cls);
+                        println!("Removed class \"{}\".", cls);
+                    } else {
+                        state.add_class(id, &value);
+                        println!("Added class \"{}\" (use 'set class <name>-' to remove).", value);
+                    }
+                }
+                "xalign" => {
+                    if let Some(x) = value.parse::<f32>().ok() {
+                        state.set_xalign(id, x);
+                        println!("x-align set to {}.", x);
+                    } else {
+                        println!("Usage: set xalign <0.0-1.0>");
+                    }
+                }
+                "fixed-width" => {
+                    match value.parse::<i32>() {
+                        Ok(w) => {
+                            state.set_fixed_width(id, Some(w));
+                            println!("Width pinned to {}.", w);
+                        }
+                        // "none" / "off" release the pin.
+                        Err(_) if matches!(value.as_str(), "none" | "off") => {
+                            state.set_fixed_width(id, None);
+                            println!("Width pin released.");
+                        }
+                        _ => println!("Usage: set fixed-width <px> | none"),
+                    }
+                }
+                "font" => {
+                    // "font <size>" or "font <family> <size>".
+                    let mut parts = value.rsplitn(2, ' ');
+                    let size = parts.next().and_then(|s| s.parse::<f64>().ok());
+                    let family = parts.next().unwrap_or("sans");
+                    match size {
+                        Some(sz) => {
+                            state.set_font_style(id, Some(family), sz);
+                            println!("Font set to {} @ {}.", family, sz);
+                        }
+                        None => println!("Usage: set font [family] <size>"),
+                    }
+                }
+                "scroll" => {
+                    if let Some((v, upper)) = parse_pair_f64(&value) {
+                        state.set_scroll(id, 0.0, upper, 0.0, v, upper, 0.0);
+                        println!("Scrolled to {}.", v);
+                    } else {
+                        println!("Usage: set scroll <value> <upper>");
+                    }
+                }
+                "title" => {
+                    state.set_window_title(id, &value);
+                    println!("Title set to \"{}\".", value);
+                }
+                "text" => {
+                    match &state.node(id).map(|n| &n.kind) {
+                        Some(ZorkKind::Label { .. }) => {
+                            state.set_label_text(id, &value);
+                            println!("Label text set.");
+                        }
+                        Some(ZorkKind::TextView { .. }) => {
+                            state.set_textview_text(id, &value);
+                            println!("TextView text set.");
+                        }
+                        Some(ZorkKind::Entry { .. }) => {
+                            state.set_entry_text(id, &value);
+                            println!("Entry text set.");
+                        }
+                        _ => println!("That has no text."),
+                    }
+                }
+                "check" => {
+                    match value.as_str() {
+                        "on" | "true" | "yes" | "1" => {
+                            state.set_checkbutton_checked(id, true);
+                            state.set_radiobutton_checked(id, true);
+                            println!("Checked.");
+                        }
+                        "off" | "false" | "no" | "0" => {
+                            state.set_checkbutton_checked(id, false);
+                            state.set_radiobutton_checked(id, false);
+                            println!("Unchecked.");
+                        }
+                        _ => println!("Usage: set check on|off"),
+                    }
+                }
+                _ => println!("Unknown property \"{}\". Try 'help'.", prop),
+            }
+        }
+        "hide" => {
+            state.set_visible(state.current_id, false);
+            println!("Hidden.");
+        }
+        "show" => {
+            state.set_visible(state.current_id, true);
+            println!("Shown.");
+        }
+        "focus" => {
+            let id = state.current_id;
+            state.set_focus(id);
+            if state.has_focus(id) {
+                println!("You focus it.");
+            } else {
+                println!("You can't focus that.");
+            }
+        }
+        "layout" => {
+            // Lay the current box's children out, and report what it needs.
+            let id = state.current_id;
+            if let Some((w, h)) = state.measure_box(id) {
+                state.layout_box(id, 0, 0, w, h);
+                println!("Box laid out: {}x{}.", w, h);
+            } else {
+                println!("You can only lay out a Box.");
             }
         }
         "inventory" | "i" => {
@@ -429,6 +736,12 @@ fn execute_command(state: &mut ZorkState, line: &str) {
             println!("  type / write          - enter text into an Entry (sub-prompt)");
             println!("  read                  - read text at current location");
             println!("  toggle                - toggle a CheckButton/RadioButton");
+            println!("  props                 - show this widget's recorded properties");
+            println!("  set <prop> <value>    - set size/offset/margin/class/xalign/");
+            println!("                          fixed-width/font/scroll/title/text/check");
+            println!("  hide / show           - toggle visibility");
+            println!("  focus                 - take keyboard focus");
+            println!("  layout                - lay out a Box's children");
             println!("  inventory / i         - show your path");
             println!("  back                  - go back the way you came");
             println!("  quit / q / exit       - exit the game");
@@ -452,8 +765,23 @@ fn execute_command(state: &mut ZorkState, line: &str) {
     }
 }
 
-fn resolve_arg_to_id(state: &ZorkState, arg: &str) -> Option<usize> {
-    if let Ok(num) = arg.parse::<usize>() {
+/// Parse `"<a> <b>"` as a pair of `i32`, for `set size` / `set offset`.
+fn parse_pair(value: &str) -> Option<(i32, i32)> {
+    let mut it = value.split_whitespace();
+    let a = it.next()?.parse().ok()?;
+    let b = it.next()?.parse().ok()?;
+    Some((a, b))
+}
+
+/// Parse `"<a> <b>"` as a pair of `f64`, for `set scroll`.
+fn parse_pair_f64(value: &str) -> Option<(f64, f64)> {
+    let mut it = value.split_whitespace();
+    let a = it.next()?.parse().ok()?;
+    let b = it.next()?.parse().ok()?;
+    Some((a, b))
+}
+
+fn resolve_arg_to_id(state: &ZorkState, arg: &str) -> Option<usize> {    if let Ok(num) = arg.parse::<usize>() {
         resolve_number_target(state, num)
     } else {
         let dir = arg.to_lowercase();
@@ -624,9 +952,46 @@ fn examine(state: &ZorkState, id: usize) {
                     }
                 }
             }
+            ZorkKind::Canvas { .. } => {
+                let (w, h) = state.canvas_size(node.id);
+                println!("A Canvas, {}x{}, with {} redraw request(s).", w, h, node.pointer.redraws);
+                if node.draw.is_some() {
+                    println!("It has a draw callback.");
+                } else {
+                    println!("It has no draw callback.");
+                }
+            }
+            ZorkKind::Overlay => {
+                println!("An Overlay with {} layer(s) over its base child.", node.overlays.len());
+            }
+            ZorkKind::ScrolledWindow => {
+                println!("A ScrolledWindow, scrolled to ({}, {}).", node.props.hscroll, node.props.vscroll);
+            }
+            ZorkKind::Fixed => {
+                println!("A Fixed container with {} child(ren).", node.children.len());
+            }
+            ZorkKind::Application => {
+                println!("The Application.");
+            }
+            ZorkKind::Spreadsheet { .. } => {
+                println!("A Spreadsheet with {} cell(s) set.", node.cells.len());
+                let mut keys: Vec<&(u32, u32)> = node.cells.keys().collect();
+                keys.sort();
+                for k in keys {
+                    if let Some(cell) = node.cells.get(k) {
+                        println!("  R{}C{}: {}{}", k.0, k.1, cell.text, if cell.raw { " (raw)" } else { "" });
+                    }
+                }
+            }
             _ => {
                 println!("There's nothing special about this.");
             }
+        }
+        // Every node carries the same property bag, so show it for all of them.
+        let summary = prop_summary(state, node);
+        if summary != "no properties set" {
+            println!();
+            println!("Properties: {}", summary);
         }
     } else {
         println!("Nothing to examine.");

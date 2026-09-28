@@ -188,6 +188,14 @@ pub fn get_radiobutton_checked(id: usize) -> bool {
 pub fn set_checkbutton_checked(id: usize, checked: bool) {
     with_state(|s| s.set_checkbutton_checked(id, checked));
 }
+/// Join a radio button to `group`. Group `0` is "ungrouped": such a button
+/// never clears a sibling.
+pub fn set_radiobutton_group(id: usize, group_id: usize) {
+    with_state(|s| s.set_radiobutton_group(id, group_id));
+}
+pub fn radiobutton_group(id: usize) -> Option<usize> {
+    with_state(|s| s.radiobutton_group(id))
+}
 pub fn set_radiobutton_checked(id: usize, checked: bool) {
     with_state(|s| s.set_radiobutton_checked(id, checked));
 }

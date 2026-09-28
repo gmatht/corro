@@ -521,6 +521,29 @@ impl ZorkState {
         self.add_node(ZorkKind::RadioButton { label: label.to_string(), checked: false, group_id: gid }, self.find_window_id())
     }
 
+    /// Put a radio button into `group`, joining existing members.
+    ///
+    /// [`Self::create_radiobutton`] takes the *seed's* id, so a group of N
+    /// buttons is built by passing the same seed to each. This setter is the
+    /// other direction — useful when a button was created without a group and
+    /// is grouped later, and it is what `core::App::create_radiobutton` needs
+    /// once it stops discarding its `group` argument.
+    pub fn set_radiobutton_group(&mut self, id: usize, group_id: usize) {
+        if let Some(n) = self.node_mut(id) {
+            if let ZorkKind::RadioButton { group_id: ref mut g, .. } = n.kind {
+                *g = group_id;
+            }
+        }
+    }
+
+    /// The group a radio button belongs to; `0` means "ungrouped".
+    pub fn radiobutton_group(&self, id: usize) -> Option<usize> {
+        self.node(id).and_then(|n| match n.kind {
+            ZorkKind::RadioButton { group_id, .. } => Some(group_id),
+            _ => None,
+        })
+    }
+
     pub fn create_textview(&mut self) -> usize {
         self.add_node(ZorkKind::TextView { text: String::new() }, self.find_window_id())
     }
@@ -1221,10 +1244,10 @@ impl ZorkState {
     pub fn set_fixed_width(&mut self, id: usize, w: Option<i32>) {
         if let Some(n) = self.node_mut(id) {
             n.props.fixed_width = w;
-            // A pinned width is a width request, so the two agree.
-            if let Some(width) = w {
-                n.props.width = Some(width);
-            }
+            // A pinned width is a width request, so the two agree. Releasing
+            // the pin releases the width request too, otherwise the widget
+            // would stay sized by a pin the caller has removed.
+            n.props.width = w;
         }
     }
 
@@ -1895,6 +1918,18 @@ where
 #[cfg(test)]
 pub(crate) fn reset_state() {
     ZORK_STATE.with(|s| *s.borrow_mut() = ZorkState::new());
+}
+
+/// Reset the thread-local singleton, for an *external* test binary driving the
+/// adapter (which has no access to `#[cfg(test)]` items). Each test starts from
+/// a fresh model so they do not interfere through the shared singleton.
+pub fn reset_for_test() {
+    ZORK_STATE.with(|s| *s.borrow_mut() = ZorkState::new());
+}
+
+/// Borrow the thread-local singleton read-only, for an external test binary.
+pub fn with_state_for_test<R>(f: impl FnOnce(&ZorkState) -> R) -> R {
+    ZORK_STATE.with(|s| f(&s.borrow()))
 }
 
 #[cfg(test)]

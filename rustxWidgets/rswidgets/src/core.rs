@@ -1438,8 +1438,10 @@ impl App {
 
     #[cfg(feature = "zork")]
     pub fn create_radiobutton(&self, group: Option<&crate::backends_zork_adapter::RadioButton>, label: &str) -> Result<crate::backends_zork_adapter::RadioButton, Error> {
-        let _ = group;
-        crate::backends_zork_adapter::create_radiobutton(None, label)
+        // The group was previously discarded (`let _ = group;`), so every
+        // zork radio was its own singleton and the mutual exclusion GTK/NWG
+        // provide never happened.
+        crate::backends_zork_adapter::create_radiobutton(group, label)
     }
 
     #[cfg(feature = "zork")]

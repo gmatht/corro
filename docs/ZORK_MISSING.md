@@ -1,7 +1,18 @@
 # Zork backend — missing features vs. GTK / NWG (and pancurses)
 
-Status: **enumeration complete**, implementation in progress.
+Status: **§0-§3 implemented and tested**; §4-§5 extended; §6-§7 still open.
 Last updated: 2026-09-28.
+
+Verify with:
+
+```
+cargo build -p rswidgets --no-default-features --features zork --offline
+cargo test  -p rswidgets --no-default-features --features zork --offline
+```
+
+110 lib tests (23 new model unit tests), 27 harness tests (21 new) and 44
+adapter tests (`tests/zork_adapter.rs`, all new) pass. The default `gtk` build
+is unaffected.
 
 The `zork` backend (`rustxWidgets/rswidgets/src/backends_zork_adapter.rs` +
 `src/backends/zork/`) is a headless, in-memory widget model with a typed test
