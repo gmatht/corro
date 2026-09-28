@@ -260,29 +260,28 @@ jobs:
           # a file, and every diagnostic here (the phase markers, the
           # selector tracing, the per-tick log) depends on it. `nohup` plus
           # the redirect is what makes the pty outlive the step.
-          : > /tmp/corro-live.log
-          nohup xcrun simctl launch "$SIM_UDID" com.corro.corro \
-            >> /tmp/corro-live.log 2>&1 &
+          # `setsid` (falling back to nohup where it is unavailable) puts the
+          # launch in a NEW session, so it is not in the step's process group
+          # and does not receive the SIGHUP that the step's exiting shell sends
+          # to its jobs.
+          #
+          # This is the whole reason the app was missing from every
+          # screenshot. `nohup` alone was not enough: it ignores SIGHUP, but
+          # `simctl launch --console-pty` keeps the app tied to the pty it
+          # created, and when the launching step's shell went away the pty went
+          # with it and the app went with the pty. The app lived long enough to
+          # boot, draw, arm the edit script and tick four times (~250ms) and
+          # then exited - reporting nothing wrong at any point, which is why it
+          # took a `launchctl` liveness probe to find.
+          if command -v setsid >/dev/null 2>&1; then
+            setsid xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
+              > /tmp/corro-live.log 2>&1 &
+          else
+            nohup xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
+              > /tmp/corro-live.log 2>&1 &
+          fi
           echo "launch pid $!"
           disown 2>/dev/null || true
-          # The app's stderr goes to the *simulator's* log, not to a pty this
-          # step owns. `--console-pty` ties the app's lifetime to that pty, and
-          # the app died with it - see the comment above. The simulator's own
-          # log carries the same lines: every Rust message this file greps for
-          # is written with a plain `write(2)` to fd 2, which CoreSimulator
-          # forwards to the system log. A `log stream` filtered to this process
-          # gives the file back.
-          # Match on the *subsystem-free* text rather than the process name:
-          # the app's binary is `corro` but CoreSimulator reports the process
-          # under the bundle's executable name, which is not guaranteed to
-          # match the target. Every line this workflow greps for is prefixed
-          # `[corro] ` or `[rswidgets] `, so match the text - that is what the
-          # steps actually consume, and it cannot rot with a name change.
-          nohup xcrun simctl spawn "$SIM_UDID" log stream --level debug \
-            --style compact \
-            --predicate 'eventMessage CONTAINS "[corro]" OR eventMessage CONTAINS "[rswidgets]"' \
-            >> /tmp/corro-live.log 2>&1 &
-          echo "log stream pid $!"
           disown 2>/dev/null || true
 
           # Wait for the app's own readiness marker. `ios backend initialised`
