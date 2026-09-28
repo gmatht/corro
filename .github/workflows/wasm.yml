@@ -1,0 +1,113 @@
+name: WASM
+
+# Keeps `wasm32-unknown-unknown` compiling.
+#
+# Why this exists, given the check already exists: `gui_loop.sh` has a "WASM
+# build — cross-compile check" step, but it is guarded by
+#
+#     rustup target list --toolchain nightly | grep -q "wasm32-unknown-unknown (installed)"
+#
+# and the `nightly` in rust-toolchain.toml has no wasm32 std installed, so on
+# any machine that has not explicitly run
+# `rustup target add wasm32-unknown-unknown --toolchain nightly` the step
+# reports `skip` and exits 0. A green run therefore proved nothing. That is how
+# the target reached 35 errors in rswidgets plus 7 in the app crate with
+# nothing failing: docs/WASM_MISSING.md enumerated the gaps by static diff, but
+# no job ever compiled them.
+#
+# So the job below pins the toolchain it checks with, installs the target on
+# it, and makes the build a required step rather than a conditional one. The
+# rule is `+stable`, not nightly: the repo's default toolchain has no wasm32
+# std, and the check is worthless on a toolchain that cannot build it.
+#
+# What this does NOT cover, stated here so it is not assumed:
+#   * Running the app in a browser. That needs wasm-bindgen-cli, a bundler and
+#     an index.html, none of which exist in the repo yet. The producer side of
+#     the browser test contract does exist (`window.__corro_output`, and
+#     `document.title = "CORRO_QUIT"` in `quit_main_loop`) and has no driver.
+#   * Anything about DOM behaviour. A compile check cannot tell you that a
+#     click handler fires. The widget layer's correctness is argued in
+#     docs/WASM_MISSING.md and needs a harness, not more CI.
+#
+# A green run here means "the target builds", nothing stronger.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - "rustxWidgets/rswidgets/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/wasm.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "rustxWidgets/rswidgets/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+env:
+  CARGO_TERM_COLORS: false
+  # Warnings are errors here. A new dead-code path on wasm is exactly the
+  # failure mode that let the CLI surface rot unnoticed, and the ten warnings
+  # this job would otherwise inherit cost more to fix than to prevent.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build-wasm:
+    # A cross-compile check with no linking and no toolchain download of
+    # consequence. 20 minutes leaves room for a cold target install and a
+    # full rebuild of the dependency graph.
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The target is the whole point of the job. `targets:` installs it,
+          # so the "skip if not installed" failure mode gui_loop.sh has cannot
+          # happen here.
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-unknown-unknown
+
+      - name: rswidgets builds for wasm32
+        # The widget layer on its own. This is the command
+        # docs/WASM_MISSING.md states, and it is the faster of the two, so it
+        # fails first with the smaller diff.
+        run: cargo +stable check -p rswidgets --target wasm32-unknown-unknown --no-default-features
+
+      - name: corro builds for wasm32
+        # The app, which is what `gui_loop.sh` checks. It reaches code the
+        # rswidgets-only check never compiles: `src/io`'s io layer, the GUI
+        # pipeline, and main.rs's cfg gates. Those gates are where the seven
+        # app-crate errors were, so checking rswidgets alone would not have
+        # caught them.
+        run: cargo +stable build --target wasm32-unknown-unknown --features wasm --no-default-features
+
+      - name: The wasm binary is a real wasm module
+        # `cargo check` would stop at type-checking; this job builds, so the
+        # linker has to resolve every symbol. Asserting on the artifact is
+        # what makes that meaningful -- a build that "succeeds" and emits
+        # nothing usable is a failure this catches.
+        run: |
+          set -euo pipefail
+          wasm=$(ls -1 target/wasm32-unknown-unknown/debug/corro.wasm)
+          test -s "$wasm" || { echo "::error::no wasm artifact produced"; exit 1; }
+          # Magic number \0asm, little-endian version 1.
+          magic=$(head -c 4 "$wasm" | od -An -tx1 | tr -d ' \n')
+          if [ "$magic" != "0061736d" ]; then
+            echo "::error::$wasm is not a wasm module (magic $magic, want 0061736d)"
+            exit 1
+          fi
+          echo "corro.wasm: $(du -h "$wasm" | cut -f1)"
+
+      - name: The host builds did not regress
+        # The wasm work touches `core.rs` and `common.rs`, which every backend
+        # includes, so a change that only breaks wasm would be just as bad as
+        # the reverse. These are the two feature sets the desktop ships with.
+        run: |
+          set -euo pipefail
+          cargo +stable check --no-default-features --features ratatui
+          cargo +stable check --no-default-features --features gui
