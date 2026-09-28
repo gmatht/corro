@@ -260,9 +260,21 @@ jobs:
           # a file, and every diagnostic here (the phase markers, the
           # selector tracing, the per-tick log) depends on it. `nohup` plus
           # the redirect is what makes the pty outlive the step.
-          nohup xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
+          nohup xcrun simctl launch "$SIM_UDID" com.corro.corro \
             > /tmp/corro-live.log 2>&1 &
           echo "launch pid $!"
+          disown 2>/dev/null || true
+          # The app's stderr goes to the *simulator's* log, not to a pty this
+          # step owns. `--console-pty` ties the app's lifetime to that pty, and
+          # the app died with it - see the comment above. The simulator's own
+          # log carries the same lines: every Rust message this file greps for
+          # is written with a plain `write(2)` to fd 2, which CoreSimulator
+          # forwards to the system log. A `log stream` filtered to this process
+          # gives the file back.
+          nohup xcrun simctl spawn "$SIM_UDID" log stream --level debug \
+            --style compact --predicate 'process == "corro"' \
+            > /tmp/corro-live.log 2>&1 &
+          echo "log stream pid $!"
           disown 2>/dev/null || true
 
           # Wait for the app's own readiness marker. `ios backend initialised`
