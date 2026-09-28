@@ -909,6 +909,26 @@ pub trait DrawContext {
     fn save(&mut self);
     fn restore(&mut self);
     fn clip(&mut self, x: f64, y: f64, w: f64, h: f64);
+
+    /// Blit a straight-alpha RGBA8 image, top-left at `(x, y)`, at its natural
+    /// size (or scaled by `scale`).
+    ///
+    /// `pixels` is row-major, 4 bytes per pixel, **not** premultiplied. On
+    /// backends whose native format is premultiplied (Cairo) the alpha is
+    /// multiplied in first, because the two are not interchangeable and using
+    /// the wrong one makes translucent edges look too dark.
+    ///
+    /// # Default: no-op
+    ///
+    /// The default implementation does nothing and returns `false`, so a
+    /// backend that cannot blit images does not have to implement it. A caller
+    /// that needs to know gets `false` back and can fall back to vector
+    /// drawing. `jautogui` uses this to draw the screenshot preview on GTK and
+    /// NWG, and to degrade to a placeholder elsewhere.
+    fn draw_rgba_image(&mut self, x: f64, y: f64, pixels: &[u8], width: u32, height: u32, scale: f64) -> bool {
+        let _ = (x, y, pixels, width, height, scale);
+        false
+    }
 }
 
 /// Top-level error type

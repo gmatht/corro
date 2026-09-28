@@ -660,6 +660,16 @@ mod pancurses_adapter {
         }
         pub fn set_wrap_mode(&self, _mode: i32) {}
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
+            /// Append a line to the buffer.
+        ///
+        /// Read-modify-write: this backend has no incremental insert, so the text is
+        /// fetched, extended and written back. Correct, but O(document) per call.
+        /// A high-rate log pane should reimplement this against the native handle.
+        pub fn append_text(&self, text: &str) {
+        let mut buf = self.get_text().unwrap_or_default();
+        buf.push_str(text);
+        self.set_text(&buf);
+        }
     }
 
     // -- Spreadsheet --

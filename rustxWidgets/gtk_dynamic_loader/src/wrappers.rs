@@ -1660,6 +1660,85 @@ impl<'a> CairoContext<'a> {
         if let Some(f) = self.loader.symbols.cairo_clip { unsafe { f(self.cr); } }
     }
 
+    /// Blit a straight-alpha RGBA8 buffer, top-left at `(x, y)`.
+    ///
+    /// Returns `false` when libcairo is missing the image symbols, so the
+    /// caller can fall back rather than drawing nothing silently.
+    ///
+    /// Cairo's `CAIRO_FORMAT_ARGB32` is **premultiplied** and native-endian
+    /// byte order, while the caller's buffer is straight-alpha RGBA. The
+    /// conversion is not optional: handing Cairo straight-alpha data makes
+    /// translucent edges far too dark. Each channel is therefore multiplied by
+    /// `a / 255` and the components are swapped to BGRA.
+    pub fn draw_rgba_image(&self, x: f64, y: f64, pixels: &[u8], width: u32, height: u32, scale: f64) -> bool {
+        let s = &self.loader.symbols;
+        let (Some(create), Some(get_data), Some(mark_dirty)) = (
+            s.cairo_image_surface_create,
+            s.cairo_image_surface_get_data,
+            s.cairo_image_surface_mark_dirty,
+        ) else {
+            return false;
+        };
+        let Some(set_source) = s.cairo_set_source_surface else { return false; };
+
+        let stride = (width as usize) * 4;
+        if pixels.len() < stride * (height as usize) {
+            return false;
+        }
+
+        // Build a premultiplied BGRA surface. Cairo owns the data only until
+        // the surface is destroyed below, so one owned copy is made.
+        let mut buf = vec![0u8; stride * (height as usize)];
+        for row in 0..height as usize {
+            for col in 0..width as usize {
+                let si = row * stride + col * 4;
+                let di = si;
+                let (r, g, b, a) = (pixels[si], pixels[si + 1], pixels[si + 2], pixels[si + 3]);
+                let m = |c: u8| ((c as u32 * a as u32 + 127) / 255) as u8;
+                buf[di] = m(b);
+                buf[di + 1] = m(g);
+                buf[di + 2] = m(r);
+                buf[di + 3] = a;
+            }
+        }
+
+        // CAIRO_FORMAT_ARGB32 == 0.
+        let surface = unsafe { create(0, width as i32, height as i32) };
+        if surface.is_null() {
+            return false;
+        }
+        let dst = unsafe { get_data(surface) };
+        if dst.is_null() {
+            if let Some(destroy) = s.cairo_surface_destroy {
+                unsafe { destroy(surface) };
+            }
+            return false;
+        }
+        for row in 0..height as usize {
+            let src = &buf[row * stride..row * stride + stride];
+            let d = unsafe { std::slice::from_raw_parts_mut(dst.add(row * stride), stride) };
+            d.copy_from_slice(src);
+        }
+        unsafe { mark_dirty(surface) };
+
+        self.save();
+        if scale != 1.0 && scale > 0.0 {
+            if let Some(scale_fn) = s.cairo_scale {
+                unsafe { scale_fn(self.cr, scale, scale) };
+            }
+        }
+        unsafe { set_source(self.cr, surface, x, y) };
+        let (w, h) = (width as f64 * scale, height as f64 * scale);
+        self.rectangle(x, y, w, h);
+        self.fill();
+        self.restore();
+
+        if let Some(destroy) = s.cairo_surface_destroy {
+            unsafe { destroy(surface) };
+        }
+        true
+    }
+
     pub fn paint(&self) {
         if let Some(f) = self.loader.symbols.cairo_paint { unsafe { f(self.cr); } }
     }
@@ -4081,6 +4160,40 @@ impl TextView {
                 Some(s)
             }
         } else { None }
+    }
+
+    /// Append `text` to the end of the buffer.
+    ///
+    /// `set_text` throws away the whole buffer, which is O(document) and also
+    /// moves the cursor and loses the scroll position. A log pane wants the
+    /// opposite: add a line, keep the caret at the bottom. That is what
+    /// `gtk_text_buffer_insert_at_cursor` does once the end iterator is
+    /// fetched.
+    pub fn append_text(&self, text: &str) {
+        guard_widget!(self, "TextView", "append_text");
+        let symbols = &self.loader.symbols;
+        let (Some(get_buf), Some(get_end), Some(insert)) = (
+            symbols.gtk_text_view_get_buffer,
+            symbols.gtk_text_buffer_get_end_iter,
+            symbols.gtk_text_buffer_insert_at_cursor,
+        ) else {
+            // Any symbol missing: fall back to read-modify-write rather than
+            // silently dropping the text.
+            if let Some(existing) = self.get_text() {
+                self.set_text(&format!("{existing}{text}"));
+            }
+            return;
+        };
+        unsafe {
+            let buf = get_buf(self.inner);
+            if buf.is_null() { return; }
+            // GtkTextIter is opaque; 256 bytes matches what get_text uses.
+            let mut end_iter: [u8; 256] = [0; 256];
+            get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
+            if let Ok(c) = CString::new(text) {
+                insert(buf, end_iter.as_mut_ptr() as *mut c_void, c.as_ptr(), -1);
+            }
+        }
     }
 
     pub fn set_wrap_mode(&self, wrap_mode: i32) {

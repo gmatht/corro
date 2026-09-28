@@ -205,6 +205,9 @@ pub type GtkTextBufferSetText = unsafe extern "C" fn(buffer: *mut c_void, text: 
 pub type GtkTextBufferGetText = unsafe extern "C" fn(buffer: *mut c_void, start: *mut c_void, end: *mut c_void, include_hidden_chars: i32) -> *mut c_void;
 pub type GtkTextBufferGetStartIter = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void);
 pub type GtkTextBufferGetEndIter = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void);
+/// `gtk_text_buffer_insert_at_cursor(buffer, iter, text, len)`; the iterator
+/// is honoured, which is how `TextView::append_text` targets the end.
+pub type GtkTextBufferInsertAtCursor = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void, text: *const i8, len: i32);
 pub type GtkTextIterCopy = unsafe extern "C" fn(iter: *mut c_void) -> *mut c_void;
 pub type GtkTextIterFree = unsafe extern "C" fn(iter: *mut c_void);
 pub type GtkTextViewSetWrapMode = unsafe extern "C" fn(text_view: *mut c_void, wrap_mode: i32);
@@ -493,6 +496,19 @@ pub struct Symbols {
     pub cairo_move_to: Option<unsafe extern "C" fn(cr: *mut c_void, x: f64, y: f64)>,
     pub cairo_set_source_rgb: Option<unsafe extern "C" fn(cr: *mut c_void, r: f64, g: f64, b: f64)>,
     pub cairo_set_source_rgba: Option<unsafe extern "C" fn(cr: *mut c_void, r: f64, g: f64, b: f64, a: f64)>,
+    // Image blitting, for `DrawContext::draw_rgba_image`.
+    pub cairo_image_surface_create: Option<unsafe extern "C" fn(format: i32, width: i32, height: i32) -> *mut c_void>,
+    pub cairo_image_surface_create_for_data: Option<unsafe extern "C" fn(data: *mut u8, format: i32, width: i32, height: i32, stride: i32) -> *mut c_void>,
+    pub cairo_image_surface_get_data: Option<unsafe extern "C" fn(surface: *mut c_void) -> *mut u8>,
+    pub cairo_image_surface_get_stride: Option<unsafe extern "C" fn(surface: *mut c_void) -> i32>,
+    pub cairo_image_surface_mark_dirty: Option<unsafe extern "C" fn(surface: *mut c_void)>,
+    pub cairo_surface_destroy: Option<unsafe extern "C" fn(surface: *mut c_void)>,
+    pub cairo_set_source_surface: Option<unsafe extern "C" fn(cr: *mut c_void, surface: *mut c_void, x: f64, y: f64)>,
+    pub cairo_pattern_create_for_surface: Option<unsafe extern "C" fn(surface: *mut c_void) -> *mut c_void>,
+    pub cairo_pattern_set_filter: Option<unsafe extern "C" fn(pattern: *mut c_void, filter: i32)>,
+    pub cairo_set_source_pattern: Option<unsafe extern "C" fn(cr: *mut c_void, pattern: *mut c_void)>,
+    pub cairo_pattern_destroy: Option<unsafe extern "C" fn(pattern: *mut c_void)>,
+    pub cairo_scale: Option<unsafe extern "C" fn(cr: *mut c_void, sx: f64, sy: f64)>,
     pub cairo_rectangle: Option<unsafe extern "C" fn(cr: *mut c_void, x: f64, y: f64, w: f64, h: f64)>,
     pub cairo_fill: Option<unsafe extern "C" fn(cr: *mut c_void)>,
     pub cairo_stroke: Option<unsafe extern "C" fn(cr: *mut c_void)>,
@@ -577,6 +593,7 @@ pub struct Symbols {
     pub gtk_text_buffer_get_text: Option<GtkTextBufferGetText>,
     pub gtk_text_buffer_get_start_iter: Option<GtkTextBufferGetStartIter>,
     pub gtk_text_buffer_get_end_iter: Option<GtkTextBufferGetEndIter>,
+    pub gtk_text_buffer_insert_at_cursor: Option<GtkTextBufferInsertAtCursor>,
     pub gtk_text_iter_copy: Option<GtkTextIterCopy>,
     pub gtk_text_iter_free: Option<GtkTextIterFree>,
     pub gtk_text_view_set_wrap_mode: Option<GtkTextViewSetWrapMode>,
@@ -817,6 +834,21 @@ impl Symbols {
         let cairo_set_source_rgb = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64, f64, f64), "cairo_set_source_rgb").or_else(|| None);
         let cairo_set_source_rgba = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64, f64, f64, f64), "cairo_set_source_rgba").or_else(|| None);
         let cairo_rectangle = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64, f64, f64, f64), "cairo_rectangle").or_else(|| None);
+        // Image blitting for `DrawContext::draw_rgba_image`. All optional: an
+        // older libcairo without them just means the blit reports `false` and
+        // the caller falls back to vector drawing.
+        let cairo_image_surface_create = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(i32, i32, i32) -> *mut c_void, "cairo_image_surface_create").or_else(|| None);
+        let cairo_image_surface_create_for_data = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut u8, i32, i32, i32, i32) -> *mut c_void, "cairo_image_surface_create_for_data").or_else(|| None);
+        let cairo_image_surface_get_data = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void) -> *mut u8, "cairo_image_surface_get_data").or_else(|| None);
+        let cairo_image_surface_get_stride = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void) -> i32, "cairo_image_surface_get_stride").or_else(|| None);
+        let cairo_image_surface_mark_dirty = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_image_surface_mark_dirty").or_else(|| None);
+        let cairo_surface_destroy = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_surface_destroy").or_else(|| None);
+        let cairo_set_source_surface = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *mut c_void, f64, f64), "cairo_set_source_surface").or_else(|| None);
+        let cairo_pattern_create_for_surface = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void) -> *mut c_void, "cairo_pattern_create_for_surface").or_else(|| None);
+        let cairo_pattern_set_filter = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, i32), "cairo_pattern_set_filter").or_else(|| None);
+        let cairo_set_source_pattern = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *mut c_void), "cairo_set_source_pattern").or_else(|| None);
+        let cairo_pattern_destroy = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_pattern_destroy").or_else(|| None);
+        let cairo_scale = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64, f64), "cairo_scale").or_else(|| None);
         let cairo_fill = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_fill").or_else(|| None);
         let cairo_stroke = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_stroke").or_else(|| None);
         let cairo_set_line_width = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64), "cairo_set_line_width").or_else(|| None);
@@ -942,6 +974,7 @@ impl Symbols {
         let gtk_text_buffer_get_text = unsafe { sym::<GtkTextBufferGetText>(gtk, "gtk_text_buffer_get_text") };
         let gtk_text_buffer_get_start_iter = unsafe { sym::<GtkTextBufferGetStartIter>(gtk, "gtk_text_buffer_get_start_iter") };
         let gtk_text_buffer_get_end_iter = unsafe { sym::<GtkTextBufferGetEndIter>(gtk, "gtk_text_buffer_get_end_iter") };
+        let gtk_text_buffer_insert_at_cursor = unsafe { sym::<GtkTextBufferInsertAtCursor>(gtk, "gtk_text_buffer_insert_at_cursor") };
         let gtk_text_iter_copy = unsafe { sym::<GtkTextIterCopy>(gtk, "gtk_text_iter_copy") };
         let gtk_text_iter_free = unsafe { sym::<GtkTextIterFree>(gtk, "gtk_text_iter_free") };
         let gtk_text_view_set_wrap_mode = unsafe { sym::<GtkTextViewSetWrapMode>(gtk, "gtk_text_view_set_wrap_mode") };
@@ -1036,6 +1069,7 @@ impl Symbols {
             pango_layout_new, pango_layout_set_text, pango_layout_get_size,
             cairo_create, cairo_font_face_destroy,
             cairo_move_to, cairo_set_source_rgb, cairo_set_source_rgba, cairo_rectangle, cairo_fill, cairo_stroke, cairo_set_line_width, cairo_select_font_face, cairo_set_font_size, cairo_show_text,
+            cairo_image_surface_create, cairo_image_surface_create_for_data, cairo_image_surface_get_data, cairo_image_surface_get_stride, cairo_image_surface_mark_dirty, cairo_surface_destroy, cairo_set_source_surface, cairo_pattern_create_for_surface, cairo_pattern_set_filter, cairo_set_source_pattern, cairo_pattern_destroy, cairo_scale,
             gtk_widget_queue_draw,
             gtk_widget_set_can_focus,
             gtk_file_chooser_native_new, gtk_native_dialog_run, gtk_file_chooser_get_filename, gtk_file_filter_new, gtk_file_filter_set_name, gtk_file_filter_add_pattern, gtk_file_chooser_add_filter, gtk_file_chooser_set_filter, gtk_file_chooser_set_current_name, gtk_widget_destroy, gtk_window_close, g_free, gdk_display_get_default, gdk_screen_get_default, gtk_style_context_add_provider_for_display, gtk_style_context_add_provider_for_screen, gdk_event_get_keyval, gdk_event_get_state, gdk_event_get_event_type, gdk_keyval_from_name,
@@ -1069,7 +1103,7 @@ impl Symbols {
             gtk_drop_down_new, gtk_drop_down_set_selected, gtk_drop_down_get_selected, gtk_string_list_new,
             gtk_check_button_new_with_label, gtk_check_button_get_active, gtk_check_button_set_active, gtk_check_button_set_group, gtk_toggle_button_get_active, gtk_toggle_button_set_active,
             gtk_radio_button_new_with_label, gtk_radio_button_get_group,
-            gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
+            gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_buffer_insert_at_cursor, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
             gtk_widget_set_hexpand, gtk_widget_set_vexpand,
             gtk_widget_get_hexpand, gtk_widget_get_vexpand,
             gtk_editable_get_text, gtk_editable_set_text, gtk_editable_set_position,

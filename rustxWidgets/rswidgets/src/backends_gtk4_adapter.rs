@@ -436,6 +436,12 @@ impl TextView {
     pub fn set_hexpand(&self, e: bool) { self.0.set_hexpand(e); }
     pub fn set_vexpand(&self, e: bool) { self.0.set_vexpand(e); }
     pub fn set_visible(&self, v: bool) { self.0.set_visible(v); }
+    /// Append without rebuilding the buffer, matching the GTK3 behaviour.
+    /// `set_text` would be O(document) and would reset the scroll position.
+    pub fn append_text(&self, text: &str) {
+        let b = self.0.buffer();
+        b.insert(&mut b.end(), text);
+    }
     pub fn raw_handle(&self) -> *mut std::ffi::c_void { self.0.as_ptr() as *mut _ }
 }
 

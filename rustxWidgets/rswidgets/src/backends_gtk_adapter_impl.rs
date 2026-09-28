@@ -742,6 +742,9 @@ mod gtk_adapter {
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        /// Append a line without rebuilding the buffer (see the loader's
+        /// `TextView::append_text`). Needed by any append-only log pane.
+        pub fn append_text(&self, text: &str) { self.0.append_text(text); }
     }
 
     pub fn create_textview() -> Result<TextView, Error> {
@@ -826,6 +829,13 @@ mod gtk_adapter {
         fn clip(&mut self, x: f64, y: f64, w: f64, h: f64) {
             self.cc.rectangle(x, y, w, h);
             self.cc.clip();
+        }
+        /// Blit an RGBA8 image. Straight-alpha in, premultiplied internally:
+        /// see `gtk_dynamic_loader::wrappers::CairoContext::draw_rgba_image`,
+        /// which does the conversion, because Cairo's ARGB32 is premultiplied
+        /// and the two are not interchangeable.
+        fn draw_rgba_image(&mut self, x: f64, y: f64, pixels: &[u8], width: u32, height: u32, scale: f64) -> bool {
+            self.cc.draw_rgba_image(x, y, pixels, width, height, scale)
         }
     }
 

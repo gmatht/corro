@@ -400,6 +400,17 @@ mod common_types {
     impl TextView {
         pub fn set_hexpand(&self, _expand: bool) {}
         pub fn set_vexpand(&self, _expand: bool) {}
+        /// Append a line to the buffer.
+        ///
+        /// NWG has no incremental insert on its TextView, so this is
+        /// read-modify-write. It is correct but O(document) per call, which is
+        /// fine for the interactive fields this backend covers; a high-rate log
+        /// pane should reimplement it on the native handle instead.
+        pub fn append_text(&self, text: &str) {
+            let mut buf = self.get_text().unwrap_or_default();
+            buf.push_str(text);
+            self.set_text(&buf);
+        }
     }
     impl ScrolledWindow {
         pub fn set_child(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.set_child(child); }
