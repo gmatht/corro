@@ -100,40 +100,47 @@
     // sheet that had gained its first edit and no more, with nothing in the
     // log to say why.
     //
-    // The count is per view, reset whenever a genuinely new layout starts
-    // (a different pass, identified by the bounds changing OR by the counter
-    // being at its cap - see below). What it must guarantee is that a single
-    // cascade cannot spin forever: past the cap the size report is dropped
-    // and the pass is allowed to finish, so a misbehaving layout degrades to
-    // "the size is not reported" rather than to a hung app.
-    static NSUInteger sPasses = 0;
-    static unsigned long long sLastW = 0, sLastH = 0;
-    unsigned long long w = (unsigned long long)CGRectGetWidth(b);
-    unsigned long long h = (unsigned long long)CGRectGetHeight(b);
-    if (w != sLastW || h != sLastH) {
-        sPasses = 0;
-        sLastW = w;
-        sLastH = h;
+    // The count is per VIEW, not per class: a `static` here is shared by every
+    // SheetView, so the sheet canvas's ordinary layout passes spent the tab
+    // bar's budget (and vice versa). The first version did exactly that and
+    // printed "dropping the size report" 2.8 million times - a guard that
+    // never recovers is not a guard.
+    //
+    // It is an associated object rather than an ivar because the class is
+    // declared by the generated header and cannot be re-declared here; the
+    // re-entrancy flag (`corroFillingSuperview`) sets the precedent for
+    // keeping per-instance state in the extension.
+    static const void *kLayoutPassesKey = &kLayoutPassesKey;
+    NSUInteger passes =
+        (NSUInteger)[objc_getAssociatedObject(self, kLayoutPassesKey) unsignedIntegerValue];
+    passes += 1;
+    objc_setAssociatedObject(self, kLayoutPassesKey, @(passes),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (passes > 4) {
+        fprintf(stderr, "[corro] SheetView.layoutSubviews canvas=%llu pass %lu\n",
+                self.corroCanvasId, (unsigned long)passes);
+        fflush(stderr);
     }
-    sPasses += 1;
-    if (sPasses > 64) {
+    if (passes > 64) {
+        // Drop the size report so the cascade can finish. A layout that
+        // misbehaves should cost a warning, never the run.
         fprintf(stderr,
-                "[corro] SheetView.layoutSubviews canvas=%llu: %d passes at "
-                "%llux%llu - dropping the size report to break the cascade\n",
-                self.corroCanvasId, (int)sPasses, w, h);
+                "[corro] SheetView.layoutSubviews canvas=%llu: pass %lu at "
+                "%dx%d - dropping the size report to break the cascade\n",
+                self.corroCanvasId, (unsigned long)passes,
+                (int)CGRectGetWidth(b), (int)CGRectGetHeight(b));
         fflush(stderr);
         return;
-    }
-    if (sPasses > 4) {
-        fprintf(stderr, "[corro] SheetView.layoutSubviews canvas=%llu pass %d\n",
-                self.corroCanvasId, (int)sPasses);
-        fflush(stderr);
     }
     if (CGRectGetWidth(b) > 0 && CGRectGetHeight(b) > 0) {
         corro_ios_canvas_size(self.corroCanvasId,
                               (int32_t)CGRectGetWidth(b),
                               (int32_t)CGRectGetHeight(b));
     }
+    // Reaching here means the size report did not re-enter us, so the cascade
+    // is over and the next one starts from zero.
+    objc_setAssociatedObject(self, kLayoutPassesKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // All rendering is in Rust: hand the live CGContext over and let the

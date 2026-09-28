@@ -127,8 +127,12 @@ jobs:
   # ── The real half: build + boot the app on a Mac ────────────────────
   build-and-boot:
     # A cold simulator boot plus an app launch measured ~15 min on this
-    # runner, so 45 leaves real headroom while still bounding the job.
-    timeout-minutes: 45
+    # runner. 60 rather than 45 because the screenshot retry loop can spend
+    # 56s on its own, and because a run whose whole point is to observe a
+    # mobile app's first minute is a poor place to be impatient - the run that
+    # was cut at 45 had already built the app, launched it, and captured the
+    # frame that proved the layout loop.
+    timeout-minutes: 60
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
