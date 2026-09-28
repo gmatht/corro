@@ -291,7 +291,48 @@ and NWG too, or are not applicable to a phone:
 
 ## 7. How this was verified
 
-`cargo build --target x86_64-linux-android` and
-`cargo build --target aarch64-linux-android` from `android/corro`, clean, no
-warnings from the Android adapter. `build_apk.sh` packages the result; the
-Java shims are compiled by the same script with `javac`/`d8`.
+* `cargo ndk -t x86_64 build` in `android/corro` — clean, no warnings from
+  the Android adapter or the app-level glue.
+* `cargo ndk -t arm64-v8a build` — 76 errors, **all** in
+  `rustxWidgets/gtk_dynamic_loader/{wrappers,signals}.rs`, and **all**
+  pre-existing: the base commit produces the same 76 in the same two files.
+  They are `CString::as_ptr()` giving `*const u8` where a `*const c_char`
+  signature is declared, and that crate is Linux-only code that an Android
+  target compiles but cannot link. Not addressed here because it is a
+  pre-existing, platform-unrelated problem in a crate this work does not
+  otherwise touch; fixing it means cfg-gating the loader out of non-Linux
+  builds, which is a separate change.
+* `cargo build --features gui` (desktop, Linux/GTK) — clean. Several changes
+  here are additions to `common.rs` and the GTK3 loader rather than to the
+  Android adapter, and those had to keep the desktop building.
+* `cargo test --features gui` — 824/824 unit tests pass. The
+  `gui_edit_parity` integration suite has 15–17 failures **on the base commit
+  too** (it needs a headless X display); the same set fails before and after
+  this work, and this branch is one test better than base.
+* `./build_apk.sh` — produces a signed APK. Checked in the artifact: all 19
+  `#[no_mangle]` JNI exports are present in `libcorro_android.so`, all 11
+  host shim classes are in the dex, and the packaged manifest carries the
+  VIEW and SEND intent filters.
+* The Java is also compiled directly against `android-34` with `javac`, which
+  is what caught two real API mistakes: `MessageQueue.next()` is not public
+  API, and `OnScrollChangeListener` has a 5-argument shape, not the 7 one a
+  more familiar widget has. Both would have been runtime failures on a
+  device.
+
+## 8. What is still not implemented, and why
+
+Kept short so this file is not mistaken for "nothing remains":
+
+* `create_spreadsheet`, `create_application`, `create_fixed`,
+  `pump_main_context`, `create_dialog_button` — GTK- or NWG-only widget and
+  lifecycle concepts with no phone analogue. `ScrolledWindow` plus a
+  `Canvas` is corro's answer, and it works.
+* `DropDown::diagnostics` / `has_size_request_symbol` / `is_gtk4` — GTK4
+  loader introspection, for telling which symbols a dlopen'd libgtk
+  actually has. Android binds no symbols, so there is nothing to introspect.
+* `Dialog::mark_destroyed` — a GTK lifetime guard. Android's `dismiss` and
+  the `GlobalRef` keep-alive cover the same ground.
+* Window `set_default_size` / `resize` are honoured against the root layout,
+  but a phone's window size is decided by the system window manager and the
+  device, so these are requests, not guarantees. That is the platform's
+  answer, not a gap in the implementation.
