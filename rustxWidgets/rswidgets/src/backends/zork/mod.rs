@@ -32,7 +32,13 @@ pub use model::{Callback, MenuItemData, MenuItemKind, ZorkKind, ZorkNode, ZorkPr
 
 use crate::backends::BackendApp;
 
-/// Construct the interactive REPL driver over a fresh model.
+/// Construct the interactive REPL driver over the *existing* model.
+///
+/// Adopting rather than starting fresh matters when a host has already built a
+/// widget tree through the adapter — corro builds ~100 widgets (window, canvas,
+/// formula row, tab bar, 67 menu actions) and then hands off here. With a fresh
+/// model the REPL would describe an empty room and none of that would be
+/// reachable.
 pub fn init() -> Result<Box<dyn BackendApp>, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(Box::new(repl::ZorkApp::new()))
+    Ok(Box::new(repl::ZorkApp::adopt_singleton()))
 }

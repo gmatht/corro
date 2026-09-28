@@ -22,7 +22,7 @@
 
 #[cfg(feature = "ratatui")]
 use corro::ui::App as TuiApp;
-#[cfg(any(feature = "gui", feature = "pancurses"))]
+#[cfg(any(feature = "gui", feature = "gui-core", feature = "pancurses"))]
 use corro::gui::App as GuiApp;
 use std::path::PathBuf;
 
@@ -35,7 +35,7 @@ enum UiKind {
     // non-ratatui build warned that `Ratatui` was never constructed.
     #[cfg(feature = "ratatui")]
     Ratatui,
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     Gui,
     #[cfg(feature = "pancurses")]
     Pancurses,
@@ -124,7 +124,7 @@ fn argv0_ui(program: &str) -> Option<UiKind> {
     if _lower.starts_with("pcorro") {
         return Some(UiKind::Pancurses);
     }
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     if _lower.starts_with("gcorro") {
         return Some(UiKind::Gui);
     }
@@ -464,9 +464,9 @@ fn parse_args() -> Result<Args, String> {
             "--gui" => {
                 #[cfg(any(all(target_os = "windows", not(target_family = "rust9x")), all(target_family = "unix", not(target_arch = "wasm32"))))]
                 { ui_explicit = true; }
-                #[cfg(feature = "gui")]
+                #[cfg(any(feature = "gui", feature = "gui-core"))]
                 { ui = UiKind::Gui; }
-                #[cfg(not(feature = "gui"))]
+                #[cfg(not(any(feature = "gui", feature = "gui-core")))]
                 { return Err("GTK GUI not compiled in; rebuild with --features gui".into()); }
             }
             "--pancurses" => {
@@ -512,9 +512,9 @@ fn parse_args() -> Result<Args, String> {
     // and argv[0] names are honored untouched.
     #[cfg(all(target_family = "unix", not(target_arch = "wasm32")))]
     {
-        #[cfg(feature = "gui")]
+        #[cfg(any(feature = "gui", feature = "gui-core"))]
         let gui_fallback = Some(UiKind::Gui);
-        #[cfg(not(feature = "gui"))]
+        #[cfg(not(any(feature = "gui", feature = "gui-core")))]
         let gui_fallback: Option<UiKind> = None;
         // SAFETY: isatty takes a raw fd, no retained state; -1 impossible
         // here (constants), return is a plain 0/1 boolean.
@@ -549,7 +549,7 @@ fn parse_args() -> Result<Args, String> {
             argv0_kind,
             ui,
             console,
-            cfg!(feature = "gui"),
+            any!(cfg!(feature = "gui"), cfg!(feature = "gui-core")),
             cfg!(any(feature = "ratatui", feature = "pancurses")),
         );
         ui = new_ui;
@@ -619,7 +619,7 @@ pub extern "C" fn main() -> i32 {
 #[cfg(all(
     target_family = "rust9x",
     target_env = "msvc",
-    feature = "gui",
+    any(feature = "gui", feature = "gui-core"),
     feature = "gui-subsystem"
 ))]
 #[no_mangle]
@@ -1046,7 +1046,7 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
             let exit_msg = app.take_final_exit_hint();
             (res.map_err(|e| e.into()), exit_msg)
         }
-        #[cfg(feature = "gui")]
+        #[cfg(any(feature = "gui", feature = "gui-core"))]
         UiKind::Gui => {
             // Kept for the movie reset below: `args.files` is moved into the
             // `App` constructor.
@@ -1134,13 +1134,13 @@ fn cli_help_text() -> String {
     let mut ui_opts = String::new();
     #[cfg(feature = "ratatui")]
     { ui_opts.push_str("  --ratatui                Use ratatui terminal UI (default)\n"); }
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     { ui_opts.push_str("  --gui                    Use GTK native GUI\n"); }
     #[cfg(feature = "pancurses")]
     { ui_opts.push_str("  --pancurses              Use pancurses terminal UI\n"); }
     #[cfg(feature = "pancurses")]
     { ui_opts.push_str("  (invoked as pcorro* defaults to pancurses)\n"); }
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     { ui_opts.push_str("  (invoked as gcorro* defaults to the GUI)\n"); }
     #[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
     { ui_opts.push_str("  (a console launch with no UI flag defaults to the terminal UI)\n"); }
@@ -1274,7 +1274,7 @@ mod tests {
     // also Unix-only, matching the function's own `cfg`.
     #[cfg(all(
         feature = "ratatui",
-        feature = "gui",
+        any(feature = "gui", feature = "gui-core"),
         target_family = "unix",
         not(target_arch = "wasm32")
     ))]
@@ -1284,7 +1284,7 @@ mod tests {
     // is used (the Windows console table, and the headless table).
     #[cfg(any(
         all(target_os = "windows", not(target_family = "rust9x")),
-        all(feature = "ratatui", feature = "gui")
+        all(feature = "ratatui", any(feature = "gui", feature = "gui-core"))
     ))]
     use super::UiKind;
     #[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
@@ -1414,7 +1414,7 @@ mod tests {
     // Unix gate matches the function's own, which is Unix-only.
     #[cfg(all(
         feature = "ratatui",
-        feature = "gui",
+        any(feature = "gui", feature = "gui-core"),
         target_family = "unix",
         not(target_arch = "wasm32")
     ))]
@@ -1429,7 +1429,7 @@ mod tests {
 
     #[cfg(all(
         feature = "ratatui",
-        feature = "gui",
+        any(feature = "gui", feature = "gui-core"),
         target_family = "unix",
         not(target_arch = "wasm32")
     ))]
@@ -1451,7 +1451,7 @@ mod tests {
 
     #[cfg(all(
         feature = "ratatui",
-        feature = "gui",
+        any(feature = "gui", feature = "gui-core"),
         target_family = "unix",
         not(target_arch = "wasm32")
     ))]
@@ -1541,7 +1541,7 @@ mod tests {
                     { ui = super::UiKind::Ratatui; }
                 }
                 "--gui" => {
-                    #[cfg(feature = "gui")]
+                    #[cfg(any(feature = "gui", feature = "gui-core"))]
                     { ui = super::UiKind::Gui; }
                 }
                 "--pancurses" => {
@@ -1629,7 +1629,7 @@ mod tests {
             parse_args_from(["corro", "--pancurses"]).ui,
             super::UiKind::Pancurses
         ));
-        #[cfg(feature = "gui")]
+        #[cfg(any(feature = "gui", feature = "gui-core"))]
         assert!(matches!(
             parse_args_from(["corro", "--gui"]).ui,
             super::UiKind::Gui
@@ -1645,7 +1645,7 @@ mod tests {
             parse_args_from(["pcorro"]).ui,
             super::UiKind::Pancurses
         ));
-        #[cfg(feature = "gui")]
+        #[cfg(any(feature = "gui", feature = "gui-core"))]
         assert!(matches!(
             parse_args_from(["gcorro"]).ui,
             super::UiKind::Gui
@@ -1656,7 +1656,7 @@ mod tests {
             parse_args_from(["/usr/local/bin/pcorro-debug"]).ui,
             super::UiKind::Pancurses
         ));
-        #[cfg(feature = "gui")]
+        #[cfg(any(feature = "gui", feature = "gui-core"))]
         assert!(matches!(
             parse_args_from(["C:\\tools\\GCORRO.EXE"]).ui,
             super::UiKind::Gui
@@ -1683,7 +1683,7 @@ mod tests {
     #[test]
     fn explicit_ui_flags_override_argv0() {
         // An explicit flag always beats the program-name default.
-        #[cfg(all(feature = "gui", feature = "ratatui"))]
+        #[cfg(any(feature = "gui", feature = "gui-core", feature = "ratatui"))]
         assert!(matches!(
             parse_args_from(["pcorro", "--gui"]).ui,
             super::UiKind::Gui
@@ -1693,7 +1693,7 @@ mod tests {
             parse_args_from(["gcorro", "--pancurses"]).ui,
             super::UiKind::Pancurses
         ));
-        #[cfg(all(feature = "ratatui", feature = "gui"))]
+        #[cfg(all(feature = "ratatui", any(feature = "gui", feature = "gui-core")))]
         assert!(matches!(
             parse_args_from(["gcorro", "--ratatui"]).ui,
             super::UiKind::Ratatui

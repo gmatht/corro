@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 pub mod actions;
 pub mod agg_picker;
-#[cfg(any(feature = "gui", test))]
+#[cfg(any(feature = "gui", feature = "gui-core", test))]
 mod once_callback;
 mod dialog_widgets;
 pub mod picker_dispatch;
@@ -26,15 +26,13 @@ pub mod render;
 pub mod sheet;
 pub mod special_picker;
 
-#[cfg(any(
-    feature = "gui",
+#[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     all(feature = "wasm", target_arch = "wasm32")
 ))]
 mod gui_backend;
-#[cfg(any(
-    feature = "gui",
+#[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     all(feature = "wasm", target_arch = "wasm32")
@@ -50,7 +48,7 @@ pub mod gui_movie;
 /// after the JNI call returns. `examples/android_ui.rs` builds the same
 /// tree on the host, and `rswidgets::android_generator` writes the Android
 /// resources the tree needs (`android/corro/build.rs`).
-#[cfg(all(any(feature = "gui", feature = "gui-mobile"), target_os = "android"))]
+#[cfg(all(any(feature = "gui", feature = "gui-core", feature = "gui-mobile"), target_os = "android"))]
 pub mod android_backend;
 /// iOS backend: the `extern "C"` entry point + bootstrap the `corro_ios`
 /// cdylib calls (see `ios/corro/src/lib.rs`).
@@ -66,7 +64,7 @@ pub mod android_backend;
 // menu definition — `examples/ios_ui.rs` prints that model on a desktop, and
 // `--features gui-mobile` is checked on Linux CI, so compiling the module
 // everywhere is what keeps those honest.
-#[cfg(any(feature = "gui", feature = "gui-mobile", feature = "gui-macos"))]
+#[cfg(any(feature = "gui", feature = "gui-core", feature = "gui-mobile", feature = "gui-macos"))]
 pub mod ios_backend;
 /// macOS backend: the `extern "C"` entry point + bootstrap for the AppKit
 /// adapter (see `rustxWidgets/docs/MACOS_GUIDELINES.md`).
@@ -88,7 +86,7 @@ pub mod ios_backend;
 /// `scripts/check_corro_macos.sh` checks the macOS cfg paths through that
 /// feature today, and removing it there would make that check compile less
 /// than it does now.
-#[cfg(any(feature = "gui", feature = "gui-mobile", feature = "gui-macos"))]
+#[cfg(any(feature = "gui", feature = "gui-core", feature = "gui-mobile", feature = "gui-macos"))]
 pub mod macos_backend;
 #[cfg(feature = "pancurses")]
 mod pnc_backend;
@@ -394,8 +392,7 @@ impl App {
     /// not perturb the workbook it is replaying, but the viewport math needs
     /// `&mut App`. The clone is read-only from the caller's perspective —
     /// nothing done to it is ever copied back.
-    #[cfg(any(
-    feature = "gui",
+    #[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     all(feature = "wasm", target_arch = "wasm32")
@@ -447,7 +444,7 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
+        #[cfg(any(feature = "gui", feature = "gui-core", all(feature = "wasm", target_arch = "wasm32")))]
         if self.backend.as_ref().map_or(true, |b| matches!(b, Backend::Gui)) {
             return gui_backend::run_gui(self);
         }
@@ -455,7 +452,25 @@ impl App {
         if self.backend.as_ref().map_or(true, |b| matches!(b, Backend::Pancurses)) {
             return pnc_backend::run_pancurses(self);
         }
+        // zork is a `gui-core` build with no toolkit: the widget tree builds
+        // fine but there is no real event loop to drive it. `run_gui` still
+        // builds the whole tree, then hands off here instead of entering
+        // `rxapp.run()`, so the model is populated and can be inspected.
         Err("Unknown backend".into())
+    }
+
+    /// Drive the zork backend's model over the real widget tree that
+    /// [`App::run`] just built.
+    ///
+    /// This is the answer to "can corro run on zork?": the tree above it is
+    /// corro's *actual* GUI construction path — the same `new_window`,
+    /// `new_canvas`, `build_menu`, draw callbacks and all — only the terminal
+    /// is missing. So what this inspects is the real thing, not a stub.
+    #[cfg(feature = "zork")]
+    fn run_zork(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        gui_backend::run_gui(self)
     }
 
     /// `--movie` on a GUI backend: replay the workbook line by line instead of
@@ -466,7 +481,7 @@ impl App {
     /// the screen (a widget tree for `gui`, a pancurses window for
     /// `pancurses`). The workbook parsing and op application are shared
     /// ([`movie::GuiMovie`]) so both read identically.
-    #[cfg(any(feature = "gui", feature = "pancurses"))]
+    #[cfg(any(feature = "gui", feature = "gui-core", feature = "pancurses"))]
     pub fn run_movie(
         &mut self,
         options: movie::GuiMovieOptions,
@@ -486,11 +501,11 @@ impl App {
             }
             _ => {}
         }
-        #[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
+        #[cfg(any(feature = "gui", feature = "gui-core", all(feature = "wasm", target_arch = "wasm32")))]
         {
             return gui_movie::run_gui_movie(self, movie, options);
         }
-        #[cfg(not(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32"))))]
+        #[cfg(not(any(feature = "gui", feature = "gui-core", all(feature = "wasm", target_arch = "wasm32"))))]
         {
             let _ = (movie, options);
             Err("--movie needs a GUI backend (build with --features gui)".into())
@@ -499,7 +514,7 @@ impl App {
 
     /// Resolve and validate the `--movie` input path: the bound file, which
     /// must exist and be a `.corro` log.
-    #[cfg(any(feature = "gui", feature = "pancurses"))]
+    #[cfg(any(feature = "gui", feature = "gui-core", feature = "pancurses"))]
     fn movie_input_path(&self) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         let Some(path) = self.core.path.clone().or(self.core.source_path.clone()) else {
             return Err("--movie requires a .corro file path".into());

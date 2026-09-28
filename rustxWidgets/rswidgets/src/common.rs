@@ -507,7 +507,45 @@ mod common_types {
 }
 
 #[cfg(feature = "zork")]
-mod common_types { common_types_mod!(); }
+mod common_types {
+    common_types_mod!();
+    // The zork backend's ScrolledWindow is a real node, so these forward to
+    // the model rather than being no-ops. They were absent here, which made
+    // `common::ScrolledWindow` unusable for the very code that needs it —
+    // `src/gui/gui_backend.rs` calls all of them.
+    impl Canvas {
+        pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) { self.inner.on_key(cb); }
+        /// The zork model node id of this canvas. See [`Window::model_id`].
+        pub fn model_id(&self) -> usize { self.inner.id() }
+    }
+    impl Window {
+        /// The zork model node id of this window.
+        ///
+        /// The zork backend identifies a widget by a `usize` node id rather
+        /// than a native handle, so an out-of-crate driver (corro's zork
+        /// handoff, tests) needs a way to reach the model from a wrapper.
+        /// GTK/NWG/macOS address widgets by real handles and do not define
+        /// this, which is why it is zork-only.
+        pub fn model_id(&self) -> usize { self.inner.id() }
+    }
+    impl ScrolledWindow {
+        pub fn set_child(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.set_child(child); }
+        pub fn set_policy(&self, hscroll: u32, vscroll: u32) { self.inner.set_policy(hscroll, vscroll); }
+        pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
+        /// Drive the scroll position. The model clamps the value to
+        /// `upper - page`, so a caller cannot scroll past the end.
+        pub fn scroll_to(&self, hval: f64, hupper: f64, hpage: f64, vval: f64, vupper: f64, vpage: f64) {
+            self.inner.scroll_to(hval, hupper, hpage, vval, vupper, vpage);
+        }
+        /// Register a scroll handler. A headless viewport produces no real
+        /// scroll events, so this fires only when something explicitly drives
+        /// one; it exists so shared code compiles and the handler is reachable.
+        pub fn on_scroll(&self, cb: Box<dyn FnMut(bool, f64)>) { self.inner.on_scroll(cb); }
+    }
+    // Note: TextView has no `common::` wrapper (it is not in
+    // `common_types_mod!`'s set), so it gets no impl block here. Callers that
+    // use one go through the adapter types directly, as on every other backend.
+}
 
 #[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};

@@ -43,8 +43,7 @@ pub mod ui;
 /// which do not link on an Apple target), so without this the GUI module
 /// would not exist at all on a Mac and `gui::macos_backend` would be
 /// unreachable. See `Cargo.toml`.
-#[cfg(any(
-    feature = "gui",
+#[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     feature = "pancurses",

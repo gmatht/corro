@@ -1,12 +1,12 @@
 use crate::ops::WorkbookState;
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "gui-core"))]
 use crate::gui::app_alias::App;
 use std::path::PathBuf;
 use crate::balance::BalanceDirection;
 
 #[allow(dead_code, unused_variables)] // only used by the gui feature
 fn log_dialog_action(action: &str, detail: &str) {
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true).append(true)
         .open("/tmp/corro_keylog.txt")
@@ -30,7 +30,7 @@ pub(crate) fn spreadsheet_filter_patterns() -> Vec<String> {
 }
 
 pub fn file_open_dialog() -> Option<PathBuf> {
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     return App::init().ok().and_then(|app| {
         let patterns = spreadsheet_filter_patterns();
         let refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
@@ -59,7 +59,7 @@ pub fn file_save_dialog() -> Option<PathBuf> {
 /// Params feed only the `gui` body; other builds take the None fallback.
 #[allow(unused_variables)]
 pub fn file_save_dialog_named(suggested: &str) -> Option<PathBuf> {
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     return App::init().ok().and_then(|app| {
         app.save_file_filtered(
             "Save Spreadsheet",
@@ -94,7 +94,7 @@ pub fn file_export_dialog(action: &str) -> Option<PathBuf> {
     let pat = format!("*.{ext}");
     let pats = [pat.as_str()];
     let filters = [(filter, pats.as_slice())];
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     return App::init().ok().and_then(|app| {
         app.save_file_filtered(title, &filters, &suggested)
             .ok()
@@ -160,7 +160,7 @@ pub fn show_keybinds_help() {
 ///
 /// `wrap` is the optional `(mode, width, height)` size/wrap request (the
 /// Keybindings text is wide and needs wrapping, the About text does not).
-#[cfg_attr(not(feature = "gui"), allow(unused_variables))]
+#[cfg_attr(not(any(feature = "gui", feature = "gui-core")), allow(unused_variables))]
 fn show_text_dialog(
     action: &str,
     title: &str,
@@ -171,7 +171,7 @@ fn show_text_dialog(
     fallback: &str,
 ) {
     log_dialog_action(action, "");
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     {
         if let Ok(rxapp) = rswidgets::App::init() {
             if let Ok(dialog) = rxapp.new_dialog() {
@@ -207,7 +207,7 @@ fn show_text_dialog(
 /// Focus a dialog's text entry after present(): modeless (NWG) dialogs do
 /// not take focus on their own the way modal GTK dialogs do — without this,
 /// typing goes to whatever had focus before and Enter submits nothing.
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "gui-core"))]
 fn focus_dialog_entry(entry_ptr: usize) {
     use rswidgets::common::Entry as CommonEntry;
     let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
@@ -219,7 +219,7 @@ fn focus_dialog_entry(entry_ptr: usize) {
 /// exactly like the OK button (ratatui parity: type + Enter commits, Esc
 /// cancels); Esc/cancel yields None. Rc-shared because FnOnce can only move
 /// into one closure.
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "gui-core"))]
 fn wire_prompt_confirm<F: FnOnce(Option<String>) + 'static>(
     dialog: &rswidgets::common::Dialog,
     entry_ptr: usize,
@@ -294,7 +294,7 @@ pub fn prompt_dialog<F: FnOnce(Option<String>) + 'static>(
     hint: Option<&str>,
     on_result: F,
 ) {
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     {
         use rswidgets::common::Orientation;
         if let Ok(rxapp) = rswidgets::App::init() {
@@ -340,7 +340,7 @@ pub fn prompt_dialog<F: FnOnce(Option<String>) + 'static>(
 }
 
 pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     {
         if let Ok(rxapp) = rswidgets::App::init() {
             if let Ok(dialog) = rxapp.new_dialog() {
@@ -363,7 +363,7 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
 }
 
 pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: F) {
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     {
         use rswidgets::common::Entry as CommonEntry;
         use rswidgets::common::Orientation;
@@ -496,7 +496,7 @@ pub fn choice_dialog<F: FnOnce(Option<usize>) + 'static>(
 /// The parameters are only consumed with the `gui` feature: without it this
 /// degrades to "no dialog, report cancel" (see the `#[cfg]` block), so they
 /// are unused there by design.
-#[cfg_attr(not(feature = "gui"), allow(unused_variables))]
+#[cfg_attr(not(any(feature = "gui", feature = "gui-core")), allow(unused_variables))]
 pub fn choice_dialog_parented<F: FnOnce(Option<usize>) + 'static>(
     title: &'static str,
     ok_label: &'static str,
@@ -505,7 +505,7 @@ pub fn choice_dialog_parented<F: FnOnce(Option<usize>) + 'static>(
     parent: *mut std::os::raw::c_void,
     on_result: F,
 ) {
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     {
         use super::dialog_widgets::DropDown;
         if let Ok(rxapp) = rswidgets::App::init() {
@@ -565,7 +565,7 @@ pub fn choice_dialog_parented<F: FnOnce(Option<usize>) + 'static>(
 }
 
 pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &WorkbookState, on_result: F) {
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     {
         use super::dialog_widgets::{CheckButton, DropDown};
         use rswidgets::common::Orientation;
@@ -627,12 +627,12 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
 /// `workbook` is only consumed with the `gui` feature (it derives the column
 /// list); without it this degrades to "no dialog, report cancel", so it is
 /// unused there by design.
-#[cfg_attr(not(feature = "gui"), allow(unused_variables))]
+#[cfg_attr(not(any(feature = "gui", feature = "gui-core")), allow(unused_variables))]
 pub fn sort_view_dialog<F: FnOnce(Option<String>) + 'static>(
     workbook: &WorkbookState,
     on_result: F,
 ) {
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     {
         use crate::grid::CellAddr;
         use rswidgets::common::{Entry as CommonEntry, Orientation};
@@ -805,7 +805,7 @@ pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(
     initial_column: usize,
     on_result: F,
 ) {
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     {
         use rswidgets::common::Orientation;
 

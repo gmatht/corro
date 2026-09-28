@@ -38,7 +38,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::backends::headless::DrawOp;
-use crate::backends::zork::model::{MenuItemData, ZorkProps, ZorkState};
+use crate::backends::zork::model::{self as m, MenuItemData, ZorkProps, ZorkState};
 
 /// Opaque, cloneable handle to a node in the harness model.
 ///
@@ -318,9 +318,16 @@ impl Harness {
 
     /// Drive a `ScrolledWindow`'s scroll handler as if the user had scrolled.
     /// A headless viewport produces no real scroll events, so this is how the
-    /// handler gets exercised.
+    /// handler gets exercised. The handler runs with the borrow released, so
+    /// it may touch the model (as corro's does).
     pub fn scroll(&self, w: &impl AsId, vertical: bool, pos: f64) {
-        self.state.borrow_mut().scroll(w.id(), vertical, pos);
+        let id = w.id();
+        self.state.borrow_mut().set_scroll_pos(id, vertical, pos);
+        let mut cbs = m::ZorkState::take_scroll_hooks(&mut self.state.borrow_mut(), id);
+        for cb in cbs.iter_mut() {
+            cb(vertical, pos);
+        }
+        m::ZorkState::put_scroll_hooks(&mut self.state.borrow_mut(), id, cbs);
     }
 
     /// Position a `BoxWidget`'s children along its packing axis.

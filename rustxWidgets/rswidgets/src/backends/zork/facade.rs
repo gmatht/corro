@@ -14,7 +14,7 @@
 use std::os::raw::c_void;
 
 pub use super::model::{MenuItemData, MenuItemKind};
-use super::model::with_state;
+use super::model::{put_callbacks, with_callbacks, with_state, ZorkState};
 
 pub type Callback = Box<dyn FnMut()>;
 
@@ -356,7 +356,28 @@ pub fn canvas_size(id: usize) -> (i32, i32) {
 /// Run the canvas's draw callback against a recording context and return the
 /// recorded ops. This is the model-level `Canvas::force_draw` equivalent.
 pub fn draw_canvas(id: usize) -> Vec<crate::backends::headless::DrawOp> {
-    with_state(|s| s.draw_canvas(id))
+    // The draw callback is the most re-entrant one there is: corro's calls
+    // `scroll_to` on every frame from inside the paint. So it is lifted out,
+    // run with the model borrow released, and put back.
+    let mut ctx = crate::backends::headless::RecordingDrawContext::new();
+    // `take_draw` moves the callback into the slot; run it from *inside* the
+    // slot so the callback is put back afterwards. Calling `slot.take()`
+    // first and putting the emptied slot back would discard the callback
+    // permanently — the canvas would draw exactly once.
+    let mut size = (0, 0);
+    let mut ran = false;
+    {
+        let mut slot = with_callbacks(ZorkState::take_draw, id);
+        if let Some((mut cb, w, h)) = slot.take() {
+            size = (w, h);
+            ran = true;
+            cb(&mut ctx, w, h);        // <- model borrow is NOT held here
+            slot.put_back((cb, w, h));
+        }
+        put_callbacks(ZorkState::put_draw, id, slot);
+    }
+    let _ = (size, ran);
+    ctx.ops
 }
 
 // -- Pointer / key --
@@ -386,16 +407,34 @@ pub fn get_screen_origin(id: usize) -> Option<(i32, i32)> {
     with_state(|s| s.node(id).and_then(|n| n.pointer.screen_origin))
 }
 pub fn pointer_click(id: usize, x: f64, y: f64) {
-    with_state(|s| s.pointer_click(id, x, y));
+    let mut cbs = with_callbacks(ZorkState::take_click_hooks, id);
+    for cb in cbs.iter_mut() {
+        cb(x, y);                        // <- model borrow is NOT held here
+    }
+    put_callbacks(ZorkState::put_click_hooks, id, cbs);
+    fire(id);
 }
 pub fn pointer_click_button(id: usize, x: f64, y: f64, button: u32, state: u32) {
-    with_state(|s| s.pointer_click_button(id, x, y, button, state));
+    let mut cbs = with_callbacks(ZorkState::take_click_button_hooks, id);
+    for cb in cbs.iter_mut() {
+        cb(x, y, button, state);         // <- model borrow is NOT held here
+    }
+    put_callbacks(ZorkState::put_click_button_hooks, id, cbs);
+    pointer_click(id, x, y);
 }
 pub fn pointer_motion(id: usize, x: f64, y: f64, state: u32) {
-    with_state(|s| s.pointer_motion(id, x, y, state));
+    let mut cbs = with_callbacks(ZorkState::take_motion_hooks, id);
+    for cb in cbs.iter_mut() {
+        cb(x, y, state);
+    }
+    put_callbacks(ZorkState::put_motion_hooks, id, cbs);
 }
 pub fn pointer_release(id: usize, x: f64, y: f64, button: u32, state: u32) {
-    with_state(|s| s.pointer_release(id, x, y, button, state));
+    let mut cbs = with_callbacks(ZorkState::take_release_hooks, id);
+    for cb in cbs.iter_mut() {
+        cb(x, y, button, state);
+    }
+    put_callbacks(ZorkState::put_release_hooks, id, cbs);
 }
 pub fn key(id: usize, keyval: u32) -> bool {
     with_state(|s| s.key(id, keyval))
@@ -410,7 +449,12 @@ pub fn add_scroll_callback(id: usize, cb: Box<dyn FnMut(bool, f64)>) {
 /// `vertical` selects the axis and `pos` is the new value. A headless viewport
 /// never produces a real scroll, so this is how the handler gets exercised.
 pub fn scroll(id: usize, vertical: bool, pos: f64) {
-    with_state(|s| s.scroll(id, vertical, pos));
+    with_state(|s| s.set_scroll_pos(id, vertical, pos));
+    let mut cbs = with_callbacks(ZorkState::take_scroll_hooks, id);
+    for cb in cbs.iter_mut() {
+        cb(vertical, pos);                // <- model borrow is NOT held here
+    }
+    put_callbacks(ZorkState::put_scroll_hooks, id, cbs);
 }
 
 // -- Dialog response callbacks --
@@ -445,8 +489,16 @@ pub fn menu_active(id: usize) -> bool {
 }
 
 /// Fire a node's callbacks (`Button::emit_clicked`, `Harness::click`).
+///
+/// Re-entrancy-safe: the callbacks are lifted out and the borrow released
+/// before they run, so a handler may call back into the model (e.g. update a
+/// label) without hitting "RefCell already borrowed".
 pub fn fire(id: usize) {
-    with_state(|s| s.click(id));
+    let mut cbs = with_callbacks(ZorkState::take_callbacks, id);
+    for cb in cbs.iter_mut() {
+        cb();                            // <- model borrow is NOT held here
+    }
+    put_callbacks(ZorkState::put_callbacks, id, cbs);
 }
 /// Flip a `CheckButton`/`RadioButton` and fire its callbacks.
 pub fn toggle(id: usize) {
@@ -491,7 +543,14 @@ pub fn dialog_mark_destroyed(id: usize) {
 /// Deliver a response id to a dialog's `connect_response` handler. Only a
 /// response registered with `dialog_add_button` fires.
 pub fn dialog_respond(id: usize, response_id: i32) {
-    with_state(|s| s.dialog_respond(id, response_id));
+    if !with_state(|s| s.dialog_has_response(id, response_id)) {
+        return;
+    }
+    let mut cbs = with_callbacks(ZorkState::take_response_hooks, id);
+    for cb in cbs.iter_mut() {
+        cb(response_id);                  // <- model borrow is NOT held here
+    }
+    put_callbacks(ZorkState::put_response_hooks, id, cbs);
 }
 
 // -- Spreadsheet --

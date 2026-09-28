@@ -233,6 +233,78 @@ The dungeon starts dark. Lighting and dousing the lantern re-arms the warning,
 because a room that was lit and then went dark is a new hazard rather than the
 same one.
 
+## 7. corro on zork (added after the enumeration)
+
+**corro now runs on this backend.** `cargo run --no-default-features --features zork`.
+
+corro had no feature that selected zork at all, so the answer to "is it usable"
+was "you cannot even ask". Getting it to run took two enabling changes plus
+three real bug fixes.
+
+### Enabling
+
+| # | Change | Why |
+|---|--------|-----|
+| C1 | New `corro` feature `zork = ["gui-core", "rswidgets/zork"]` | no feature reached the backend |
+| C2 | Split `gui` into `gui-core` (the widget pipeline, toolkit-free) + `gui` (adds GTK) | `src/gui` was gated on `feature = "gui"`, so a terminal build could not reach it without dragging in GTK. 59 cfg sites now key on `any(feature = "gui", feature = "gui-core")` |
+| C3 | `run_gui` hands off to `zork_handoff` before `rxapp.run()` | zork has no event loop; everything above that line — the window, formula row, canvas + draw callback, scrolled viewport, tab bar, menu model — is corro's real construction path |
+| C4 | `common::ScrolledWindow`'s `set_child`/`set_policy`/`set_vexpand`/`scroll_to`/`on_scroll` | the zork `common_types` block omitted the tail every other backend has (B6) |
+| C5 | `common::Window::model_id()` / `Canvas::model_id()` | the zork backend addresses widgets by `usize`, so an out-of-crate driver needs a way in |
+| C6 | `ZorkApp::adopt_singleton()`; `backends::zork::init()` adopts | the REPL started from a fresh model, so it could not see the ~100 widgets corro had just built |
+
+### Bugs this exposed (all real, all in zork or the shared layer)
+
+| # | Bug | Symptom |
+|---|-----|---------|
+| Z1 | `with_state` held a `RefMut` across the whole operation | **corro died on first run.** Its draw callback calls `scroll_to` every frame, which panicked `RefCell already borrowed`. Re-entrancy from inside a user callback is routine in GTK/NWG-style code, not exotic. |
+| Z2 | `draw_canvas` put back an *emptied* slot | the canvas would paint exactly once and then be permanently blank — a silent, hard-to-spot data-loss bug |
+| Z3 | The zork `common_types` block lacked the `ScrolledWindow`/`Canvas` tail | `common::ScrolledWindow` was unusable for the very code that needs it |
+
+Z1 is fixed by `with_callbacks`: lift the closure out, **release the borrow**,
+run it, put it back. Every callback-firing facade function (`fire`,
+`draw_canvas`, `pointer_click*`, `motion`, `release`, `scroll`,
+`dialog_respond`, and the harness's `scroll`) goes through it. Three regression
+tests cover it, including the subtle one: a nested call must not operate on a
+detached copy whose writes are silently lost.
+
+### What running it looks like
+
+```
+$ cargo run --no-default-features --features zork
+corro 0.7.0 on the zork backend
+======================================================
+
+Widgets built: 98
+  2 xBoxWidget, 2 xCanvas, 1 xEntry, 4 xLabel, 20 xMenu, 1 xScrolledWindow,
+  67 xSimpleAction, 1 xWindow
+Window title: "corro 0.7.0"
+Cursor at rest: R999999999C702
+Canvas draw: 2891 ops, 146 text runs
+  grid labels: ["~1", "1", "2", "_1", "_2", "_3", "_4", "_5"]
+Menu items: 132
+Model night mode: dark
+```
+
+The 2891 draw ops and the column headers are corro's own `paint` callback run
+against a recording `DrawContext` — the strongest evidence the pipeline is
+genuinely live rather than stubbed. Then the zork REPL takes over, describing
+and editing the same model, so `light` / `examine` / `select` work against
+corro's real widget tree.
+
+### What it is *not*
+
+corro on zork is a **model driver, not an interactive spreadsheet**. There is no
+display, so there is no key routing to the grid, no clicking cells, no
+scrolling. The text REPL explores the widget tree. Making zork a genuinely
+interactive corro UI would need a terminal front-end over the model — the same
+gap pancurses fills, and out of scope here.
+
+### Pre-existing, unrelated
+
+`cargo check --features wasm` fails with 19 errors, and `--features
+pancurses` / `gui-mobile` / `gui-macos` with 2 / 19 / 19. Verified identical
+before this work (`git stash`), so not caused by it.
+
 ## Implementation order
 
 1. **Unblock the build** — B1..B6. Nothing else can be verified until

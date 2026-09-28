@@ -13,14 +13,18 @@
 //! pick the wrong backend's widget, and the platform mapping lives in one
 //! place.
 
+// The toolkit's own adapter, where one applies. Deliberately *not* selected by
+// `gui-core`: that feature is deliberately toolkit-free, so naming GTK/NWG here
+// would drag a toolkit onto a headless build.
 #[cfg(all(feature = "gui", target_os = "linux"))]
 pub use rswidgets::backends_gtk_adapter::{CheckButton, DropDown, RadioButton};
 
 #[cfg(all(feature = "gui", windows))]
 pub use rswidgets::backends_nwg_adapter::{CheckButton, DropDown, RadioButton};
 
-#[cfg(all(
-    feature = "gui",
-    not(any(target_os = "linux", windows))
-))]
+// Everything else — macOS, the mobile backends, and the toolkit-free `gui-core`
+// (which is what `zork` selects) — takes the prelude, i.e. whichever backend
+// `backends::init` will pick. This must not overlap the two arms above, or the
+// names are imported twice.
+#[cfg(not(all(feature = "gui", any(target_os = "linux", windows))))]
 pub use rswidgets::prelude::{CheckButton, DropDown, RadioButton};

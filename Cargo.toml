@@ -60,7 +60,16 @@ ratatui = ["dep:ratatui", "dep:crossterm", "dep:unicode-truncate", "dep:unicode-
 # Android/iOS host crates do NOT use this feature: they depend on corro with
 # `features = ["gui-mobile"]` (below), which selects the same shared GUI
 # pipeline without the GTK half. See ios/corro and android/corro.
-gui = ["dep:rswidgets", "rswidgets/gtk", "rswidgets/headless", "dep:gtk_dynamic_loader"]
+# `gui-core` is the widget-pipeline half of `gui` with no toolkit: the shared
+# spreadsheet GUI (src/gui) compiles against rswidgets' *common* wrapper types
+# and never names a toolkit, so a headless or mobile host can select it without
+# pulling in GTK. `gui` = `gui-core` + the GTK half.
+#
+# Why it exists: `zork` (the headless in-memory model) needs src/gui, but
+# enabling `gui` for it would drag GTK onto a terminal build. Splitting the
+# gate lets both point at the same code.
+gui-core = ["dep:rswidgets", "rswidgets/headless"]
+gui = ["gui-core", "rswidgets/gtk", "dep:gtk_dynamic_loader"]
 # iOS/Android: the shared GUI pipeline without the GTK half. This is what the
 # mobile host crates (ios/corro, android/corro) enable;
 # `src/gui/ios_backend.rs` / `src/gui/android_backend.rs` are gated on
@@ -103,6 +112,10 @@ gui-mobile-host = ["gui-mobile", "gui"]
 gui-macos-host = ["gui-macos", "gui"]
 wasm = ["dep:rswidgets"]
 pancurses = ["rswidgets/pancurses"]
+# Headless zork backend (experiment): the in-memory model + text REPL in
+# rustxWidgets, selected here so `cargo check --features zork` can ask whether
+# corro's GUI pipeline actually runs against it.
+zork = ["gui-core", "rswidgets/zork"]
 gtk = ["gui"]
 combined-gui = ["gui", "pancurses"]
 # Win95 GUI build: link the nwg GUI as a /SUBSYSTEM:WINDOWS exe (entered via

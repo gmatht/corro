@@ -238,8 +238,7 @@ thread_local! {
 
 /// Bounds a pinch may reach. Mirrors `rswidgets::spreadsheet::SpreadsheetModel`'s
 /// limits so the widget and this host agree on what "fully zoomed" means.
-#[cfg(any(
-    feature = "gui",
+#[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     target_os = "android",
@@ -248,8 +247,7 @@ thread_local! {
     test
 ))]
 pub(crate) const MIN_VIEW_ZOOM: f64 = 0.4;
-#[cfg(any(
-    feature = "gui",
+#[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     target_os = "android",
@@ -273,8 +271,7 @@ pub(crate) fn view_zoom() -> f64 {
 /// Gated on the targets whose hosts deliver a pinch: on a desktop nothing can
 /// call it, and an ungated setter would be dead code (the repo builds
 /// warning-free on every feature set).
-#[cfg(any(
-    feature = "gui",
+#[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     target_os = "android",
@@ -295,8 +292,7 @@ pub(crate) fn set_view_zoom(zoom: f64) -> f64 {
 
 /// Multiply the pinch scale (a gesture's span ratio). Returns the applied
 /// scale. `factor <= 0`/NaN is ignored, matching the widget's `zoom_by`.
-#[cfg(any(
-    feature = "gui",
+#[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     target_os = "android",
@@ -326,8 +322,7 @@ pub(crate) fn zoom_view_by(factor: f64) -> f64 {
 // the twin is called instead, so this is dead there — hence the allow
 // rather than a wider gate that would hide a real unused helper.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-#[cfg(any(
-    feature = "gui",
+#[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     target_os = "android",
@@ -347,8 +342,7 @@ pub(crate) fn clamped_view_zoom(factor: f64) -> f64 {
 // the twin is called instead, so this is dead there — hence the allow
 // rather than a wider gate that would hide a real unused helper.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-#[cfg(any(
-    feature = "gui",
+#[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     target_os = "android",
@@ -631,6 +625,23 @@ fn save_before_quit(state: &GuiState) {
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
+
+impl GuiState {
+    /// The grid canvas's zork model node id.
+    ///
+    /// The zork backend addresses widgets by a `usize` node id rather than a
+    /// native handle, and the draw callback lives on that node, so reading back
+    /// what the canvas painted means going through the model.
+    #[cfg(feature = "zork")]
+    pub(crate) fn canvas_id(&self) -> usize {
+        *self.canvas.as_ref() as usize
+    }
+    /// The grid canvas handle, so a zork build can drive its draw callback.
+    #[cfg(feature = "zork")]
+    pub(crate) fn canvas_handle(&self) -> &Canvas {
+        &self.canvas
+    }
+}
 
 pub(crate) struct GuiState {
     app: *mut super::App,
@@ -4539,9 +4550,9 @@ thread_local! {
 // tests exercise the menu state through `dispatch_mobile_menu_action` and
 // `MOBILE_MENU_STATE` instead.
 #[cfg(any(
-    all(any(feature = "gui", feature = "gui-mobile", feature = "gui-macos"), target_os = "android"),
-    all(any(feature = "gui", feature = "gui-mobile", feature = "gui-macos"), target_os = "ios"),
-    all(any(feature = "gui", feature = "gui-mobile", feature = "gui-macos"), target_os = "macos"),
+    all(any(feature = "gui", feature = "gui-core", feature = "gui-mobile", feature = "gui-macos"), target_os = "android"),
+    all(any(feature = "gui", feature = "gui-core", feature = "gui-mobile", feature = "gui-macos"), target_os = "ios"),
+    all(any(feature = "gui", feature = "gui-core", feature = "gui-mobile", feature = "gui-macos"), target_os = "macos"),
 ))]
 pub(crate) fn publish_mobile_menu_state(state: &Rc<GuiState>) {
     MOBILE_MENU_STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
@@ -4594,8 +4605,7 @@ pub(crate) fn dispatch_android_menu_action(action: &str) {
     all(feature = "gui-macos", not(target_os = "macos")),
     allow(dead_code)
 )]
-#[cfg(any(
-    feature = "gui",
+#[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     target_os = "android",
@@ -4665,8 +4675,7 @@ pub(crate) fn scroll_viewport_by_cells(d_rows: i32, d_cols: i32) {
     not(any(target_os = "android", target_os = "macos")),
     allow(dead_code)
 )]
-#[cfg(any(
-    feature = "gui",
+#[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
     target_os = "android",
@@ -6548,11 +6557,153 @@ pub fn run_gui_with_movie(
     // TEMPORARY Win95 diagnosis.
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe { mark95(b"pre-run\n"); }
+
+    // zork has no event loop and no display: everything above this line has
+    // built the real widget tree against the in-memory model, which is the
+    // part worth exercising. Dump what it built and hand off to the backend's
+    // REPL, which reads that same model.
+    #[cfg(feature = "zork")]
+    {
+        return zork_handoff(corro_app, &rxapp, &win, &shared);
+    }
+
+    #[cfg(not(feature = "zork"))]
     rxapp.run()?;
     // TEMPORARY Win95 diagnosis (unreachable if run() loops until quit).
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe { mark95(b"post-run\n"); }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// zork handoff
+// ---------------------------------------------------------------------------
+
+/// What a zork build does once the widget tree exists.
+///
+/// GTK and NWG end this function in `rxapp.run()`, which blocks in their event
+/// loop and never returns until the user quits. zork has neither an event loop
+/// nor a display, so that call would be a no-op or a hang. Everything above it
+/// — the window, the formula row, the canvas and its draw callback, the
+/// scrolled viewport, the tab bar, the menu model — is the real corro GUI
+/// construction path, so the useful thing to do with the result is inspect it
+/// and then hand control to the backend's own text REPL, which reads the very
+/// same in-memory model.
+#[cfg(feature = "zork")]
+fn zork_handoff(
+    corro_app: &mut super::App,
+    rxapp: &rswidgets::App,
+    win: &Window,
+    shared: &Rc<GuiState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rswidgets::backends::zork::model::with_state_for_test as read_state;
+
+    // The cursor the GUI settled on at rest, and the formula buffer it holds.
+    // These are `GuiState`'s own tracked fields, which the draw callback and
+    // the key handlers both write, so they reflect the real pipeline's state
+    // rather than anything reconstructed here.
+    let cursor = (shared.last_row.get(), shared.last_col.get());
+    let edit = shared.formula_entry.get_text().unwrap_or_default();
+
+    println!("corro {} on the zork backend", env!("CARGO_PKG_VERSION"));
+    println!("======================================================");
+    println!();
+    println!("The widget tree above this text is corro's real GUI tree,");
+    println!("built against an in-memory model instead of a display.");
+    println!();
+
+    // --- what the GUI built -------------------------------------------------
+    let snap = read_state(|s| s.snapshot());
+    println!("Widgets built: {}", snap.nodes.len());
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for n in &snap.nodes {
+        *counts.entry(match n.kind.as_str() {
+            "Window" => "Window",
+            "Canvas" => "Canvas",
+            "Label" => "Label",
+            "Entry" => "Entry",
+            "Menu" | "MenuBar" => "Menu",
+            "ScrolledWindow" => "ScrolledWindow",
+            "SimpleAction" => "SimpleAction",
+            k => k,
+        })
+        .or_default() += 1;
+    }
+    println!("  {}", counts.iter().map(|(k, v)| format!("{} x{}", v, k)).collect::<Vec<_>>().join(", "));
+
+    // NB: not inside a `read_state` — the model cell is already borrowed there,
+    // and a nested borrow is a panic. Read the title on its own.
+    if let Some(title) = win_title(win) {
+        println!("Window title: \"{}\"", title);
+    }
+    println!("Cursor at rest: R{}C{}", cursor.0, cursor.1);
+    if !edit.is_empty() {
+        println!("Formula buffer: \"{}\"", edit);
+    }
+
+    // --- the canvas draw callback ------------------------------------------
+    // The strongest evidence the pipeline is live: this is corro's *own*
+    // `paint` callback, run against a recording DrawContext. GTK reaches it
+    // through the frame clock and NWG through WM_PAINT; zork has neither, so
+    // it is invoked explicitly — which is exactly what a headless draw
+    // backend is for.
+    //
+    // `force_draw` is the adapter-level entry point (it supplies the surface
+    // size), and the model records the ops for inspection.
+    let canvas = shared.canvas_handle();
+    canvas.set_size_request(1200, 800);
+    for n in read_state(|s| s.snapshot()).nodes {
+        if n.kind == "Canvas" {
+        }
+    }
+    canvas.force_draw(win.hwnd(), 1200, 800);
+    let canvas_id = shared.canvas_id();
+    let ops = rswidgets::backends::zork::draw_canvas(canvas_id);
+    let texts: Vec<&str> = ops.iter().filter_map(|o| match o {
+        rswidgets::backends::headless::DrawOp::Text { text, .. } => Some(text.as_str()),
+        rswidgets::backends::headless::DrawOp::StyledText { text, .. } => Some(text.as_str()),
+        _ => None,
+    }).collect();
+    println!("Canvas draw: {} ops, {} text runs", ops.len(), texts.len());
+    // The sheet chrome and the row/column headers are the easiest proof that
+    // this is corro's real grid, so show a few of each.
+    let mut headers: Vec<&&str> = texts.iter().filter(|t| t.len() <= 4).collect();
+    headers.dedup();
+    println!("  grid labels: {:?}", &headers[..headers.len().min(8)]);
+    if let Some(t) = snap.nodes.iter().find(|n| n.kind == "Spreadsheet").and_then(|n| n.title.clone()) {
+        println!("  sheet title: {:?}", t);
+    }
+
+    // --- the menu model -----------------------------------------------------
+    let menu_count: usize = snap.menu_items.values().map(|v| v.len()).sum();
+    println!("Menu items: {}", menu_count);
+
+    // --- dark mode ----------------------------------------------------------
+    // corro already has a night mode; report whether the model's light agrees.
+    let night = read_state(|s| s.is_night());
+    println!("Model night mode: {}", if night { "dark" } else { "lit" });
+    if night {
+        println!("  {}", read_state(|s| s.dark_room_description()));
+    }
+
+    println!();
+    println!("Driving the model from the zork REPL. 'help' lists commands.");
+    println!();
+
+    let backend = rswidgets::backends::zork::init()
+        .map_err(|e| format!("zork init failed: {e}"))?;
+    backend.run()
+        .map_err(|e| format!("zork run failed: {e}"))?;
+    let _ = corro_app;
+    Ok(())
+}
+
+/// The window's title as the zork model recorded it.
+#[cfg(feature = "zork")]
+fn win_title(win: &Window) -> Option<String> {
+    use rswidgets::backends::zork::model::with_state_for_test as read_state;
+    let id = win.model_id();
+    read_state(|s| s.get_window_title(id))
 }
 
 // ---------------------------------------------------------------------------

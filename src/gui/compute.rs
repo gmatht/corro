@@ -293,7 +293,7 @@ mod style_bit_roundtrip_tests {
     use super::CellDisplayStyle;
     // `render` (and its `GridSink`) is only compiled with the `gui` feature;
     // the pancurses-only and rswidgets-term sets have no such module.
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "gui-core"))]
     use crate::gui::render::GridSink;
 
     /// Every style must survive a round-trip through its stored bit.
@@ -319,11 +319,11 @@ mod style_bit_roundtrip_tests {
             CellDisplayStyle::InactiveHeader,
             CellDisplayStyle::Hyperlink,
         ] {
-            #[cfg(feature = "gui")]
+            #[cfg(any(feature = "gui", feature = "gui-core"))]
             let bits = GridSink::style_bits(style);
-            #[cfg(all(not(feature = "gui"), feature = "pancurses"))]
+            #[cfg(all(not(any(feature = "gui", feature = "gui-core")), feature = "pancurses"))]
             let bits = style.to_pancurses_style();
-            #[cfg(all(not(feature = "gui"), not(feature = "pancurses")))]
+            #[cfg(all(not(any(feature = "gui", feature = "gui-core")), not(feature = "pancurses")))]
             let bits = match style {
                 CellDisplayStyle::Default => 0,
                 CellDisplayStyle::Cursor => 1,

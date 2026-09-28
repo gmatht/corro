@@ -1842,7 +1842,7 @@ impl App {
                 // it unconditionally would break `cargo build`. On that build
                 // the menu item still dispatches and still reports the state,
                 // it just has no palette to swap.
-                #[cfg(feature = "gui")]
+                #[cfg(any(feature = "gui", feature = "gui-core"))]
                 {
                     let next = match rswidgets::core::color_scheme() {
                         rswidgets::core::ColorScheme::Light => rswidgets::core::ColorScheme::Night,
@@ -1854,7 +1854,7 @@ impl App {
                         if next == rswidgets::core::ColorScheme::Night { "on" } else { "off" }
                     );
                 }
-                #[cfg(not(feature = "gui"))]
+                #[cfg(not(any(feature = "gui", feature = "gui-core")))]
                 {
                     self.status = "Night mode: set your terminal's theme".to_string();
                 }

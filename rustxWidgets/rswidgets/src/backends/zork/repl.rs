@@ -14,8 +14,24 @@ pub struct ZorkApp {
 }
 
 impl ZorkApp {
+    /// A REPL over a fresh, empty model — the standalone case.
     pub fn new() -> Self {
         ZorkApp { state: ZorkState::new() }
+    }
+
+    /// A REPL over the *existing* singleton model.
+    ///
+    /// [`Self::new`] starts empty, so a host that has already built a widget
+    /// tree through the adapter (corro builds ~100 widgets before handing off)
+    /// would get a REPL that can see none of it. This adopts whatever is
+    /// already there.
+    pub fn from_existing_state(state: ZorkState) -> Self {
+        ZorkApp { state }
+    }
+
+    /// Take the singleton model's current contents.
+    pub fn adopt_singleton() -> Self {
+        ZorkApp::from_existing_state(super::model::take_state())
     }
 }
 

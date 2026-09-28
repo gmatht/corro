@@ -16,7 +16,7 @@
 //! is handed to several widget signals; `Rc<OnceCallback>` (or a clone) is
 //! what each `connect_*` closure captures.
 //!
-//! Its only callers live in `dialogs.rs` under `#[cfg(feature = "gui")]`
+//! Its only callers live in `dialogs.rs` under `#[cfg(any(feature = "gui", feature = "gui-core"))]`
 //! (the native GTK/nwg dialog wiring), so the `gui` module gates this module
 //! to `gui` plus `test` — a pancurses-only build otherwise compiled the
 //! struct and both methods and then warned they were never used.

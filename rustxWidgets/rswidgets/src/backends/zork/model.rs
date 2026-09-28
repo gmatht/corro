@@ -264,6 +264,21 @@ pub struct PointerHooks {
     pub redraws: u32,
 }
 
+/// A lifted-out canvas draw callback, carried across the borrow gap.
+pub struct DrawSlot(Option<(Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>, i32, i32)>);
+
+impl DrawSlot {
+    /// Take the callback out for running. Leaves the slot empty, which
+    /// [`Self::put_back`] then restores.
+    pub fn take(&mut self) -> Option<(Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>, i32, i32)> {
+        self.0.take()
+    }
+    /// Put a previously taken callback back into the slot.
+    pub fn put_back(&mut self, d: (Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>, i32, i32)) {
+        self.0 = Some(d);
+    }
+}
+
 impl std::fmt::Debug for PointerHooks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PointerHooks")
@@ -1288,23 +1303,14 @@ impl ZorkState {
         }
     }
 
-    /// Drive a scroll handler as if the user had scrolled, and update the
-    /// recorded offset. A headless viewport produces no real scroll events, so
-    /// this is the only way to exercise the handler.
-    pub fn scroll(&mut self, id: usize, vertical: bool, pos: f64) {
+    /// Record a scroll offset on one axis, without firing any handler.
+    pub fn set_scroll_pos(&mut self, id: usize, vertical: bool, pos: f64) {
         if let Some(n) = self.node_mut(id) {
             if vertical {
                 n.props.vscroll = pos.max(0.0);
             } else {
                 n.props.hscroll = pos.max(0.0);
             }
-        }
-        let mut cbs = self.node_mut(id).map(|n| std::mem::take(&mut n.scroll_cbs)).unwrap_or_default();
-        for cb in cbs.iter_mut() {
-            cb(vertical, pos);
-        }
-        if let Some(n) = self.node_mut(id) {
-            n.scroll_cbs = cbs;
         }
     }
 
@@ -1681,11 +1687,126 @@ impl ZorkState {
 
     // -- Fire --
 
+    // -- Detach / reattach ------------------------------------------------
+    //
+    // A user callback may call back into the model (corro's draw callback
+    // calls `scroll_to` on every frame). If it ran while a `&mut ZorkState`
+    // were live, the nested access would either panic on a `RefCell` borrow or
+    // mutate a detached copy whose writes are then thrown away. So the
+    // discipline is: take the closure out, *release the borrow*, run it, then
+    // put it back. The `take_*`/`put_*` pairs below are that, and the facade
+    // sequences them around the call.
+
+    /// Take a node's callbacks, leaving the node with none.
+    pub fn take_callbacks(s: &mut ZorkState, id: usize) -> Vec<Callback> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.callbacks)).unwrap_or_default()
+    }
+    /// Put a node's callbacks back after they were run.
+    pub fn put_callbacks(s: &mut ZorkState, id: usize, cbs: Vec<Callback>) {
+        if let Some(n) = s.node_mut(id) {
+            n.callbacks = cbs;
+        }
+    }
+
+    /// Take a canvas's draw callback and its drawable size, for running with
+    /// the model borrow released. Pairs with [`Self::put_draw`].
+    pub fn take_draw(s: &mut ZorkState, id: usize) -> DrawSlot {
+        let (w, h) = s.canvas_size(id);
+        let d = s.node_mut(id).and_then(|n| n.draw.take());
+        DrawSlot(d.map(|d| (d, w, h)))
+    }
+    /// Put a canvas's draw callback back, if the slot still holds one.
+    pub fn put_draw(s: &mut ZorkState, id: usize, slot: DrawSlot) {
+        if let Some(n) = s.node_mut(id) {
+            n.draw = slot.0.map(|(d, _, _)| d);
+        }
+    }
+
+    /// Take a canvas's plain click hooks.
+    pub fn take_click_hooks(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut(f64, f64)>> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.pointer.click)).unwrap_or_default()
+    }
+    pub fn put_click_hooks(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut(f64, f64)>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.pointer.click = cbs;
+        }
+    }
+    /// Take a canvas's button/modifier click hooks.
+    pub fn take_click_button_hooks(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut(f64, f64, u32, u32)>> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.pointer.click_button)).unwrap_or_default()
+    }
+    pub fn put_click_button_hooks(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut(f64, f64, u32, u32)>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.pointer.click_button = cbs;
+        }
+    }
+    /// Take a canvas's motion hooks.
+    pub fn take_motion_hooks(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut(f64, f64, u32)>> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.pointer.motion)).unwrap_or_default()
+    }
+    pub fn put_motion_hooks(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut(f64, f64, u32)>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.pointer.motion = cbs;
+        }
+    }
+    /// Take a canvas's release hooks.
+    pub fn take_release_hooks(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut(f64, f64, u32, u32)>> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.pointer.release)).unwrap_or_default()
+    }
+    pub fn put_release_hooks(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut(f64, f64, u32, u32)>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.pointer.release = cbs;
+        }
+    }
+    /// Take a canvas's key hooks, split into plain and raw.
+    pub fn take_key_hooks(s: &mut ZorkState, id: usize) -> (Vec<Box<dyn FnMut(u32) -> bool>>, Vec<Box<dyn FnMut(u32, u32) -> bool>>) {
+        let n = s.node_mut(id);
+        match n {
+            Some(n) => (
+                std::mem::take(&mut n.pointer.key),
+                std::mem::take(&mut n.pointer.key_raw),
+            ),
+            None => (Vec::new(), Vec::new()),
+        }
+    }
+    pub fn put_key_hooks(s: &mut ZorkState, id: usize, key: Vec<Box<dyn FnMut(u32) -> bool>>, raw: Vec<Box<dyn FnMut(u32, u32) -> bool>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.pointer.key = key;
+            n.pointer.key_raw = raw;
+        }
+    }
+    /// Take a scrollable's scroll handlers.
+    pub fn take_scroll_hooks(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut(bool, f64)>> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.scroll_cbs)).unwrap_or_default()
+    }
+    pub fn put_scroll_hooks(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut(bool, f64)>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.scroll_cbs = cbs;
+        }
+    }
+    /// Take a dialog's response handlers.
+    pub fn take_response_hooks(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut(i32)>> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.response_cbs)).unwrap_or_default()
+    }
+    pub fn put_response_hooks(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut(i32)>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.response_cbs = cbs;
+        }
+    }
+    /// Whether a dialog has a response handler for `response_id` registered by
+    /// `dialog_add_button`.
+    pub fn dialog_has_response(&self, id: usize, response_id: i32) -> bool {
+        self.node(id)
+            .map(|n| n.dialog_buttons.iter().any(|(_, r)| *r == response_id))
+            .unwrap_or(false)
+    }
+
     /// Fire the callbacks registered on a node. Does nothing for a missing id.
     ///
-    /// This must be called outside any borrow of `self` that the callback might
-    /// re-take; the implementation releases its borrow before invoking each
-    /// callback.
+    /// Safe only when no `&mut` to the model is live and the callbacks do not
+    /// re-enter — which is the case for the harness (it owns its own
+    /// `Rc<RefCell<_>>` and already releases the borrow) but *not* for the
+    /// facade, so the facade uses the `take_*`/`put_*` pairs above instead.
     pub fn click(&mut self, id: usize) {
         let mut cbs = match self.node_mut(id) {
             Some(n) => std::mem::take(&mut n.callbacks),
@@ -1905,11 +2026,59 @@ thread_local! {
     static ZORK_STATE: RefCell<ZorkState> = RefCell::new(ZorkState::new());
 }
 
+/// Run `f` against the singleton with the cell borrowed for its duration.
+///
+/// This is the *non*-re-entrant primitive. It is exactly right for the ~130
+/// facade functions that only read or write model fields.
+///
+/// The model also fires *user* closures — a canvas draw, a click, a scroll
+/// notification — and those closures may legitimately call back into the model.
+/// Holding this borrow across a callback made every such call panic with
+/// "RefCell already borrowed"; corro's draw callback calls `scroll_to` on every
+/// frame and the first corro run on this backend died there. So the functions
+/// that fire callbacks do **not** use this: they use the `with_callbacks`
+/// pattern below, which releases the borrow before the closure runs.
 pub(crate) fn with_state<F, R>(f: F) -> R
 where
     F: FnOnce(&mut ZorkState) -> R,
 {
     ZORK_STATE.with(|s| f(&mut s.borrow_mut()))
+}
+
+/// Borrow the model, lift a user closure out of it, run the closure with **no
+/// borrow held**, then put the closure back.
+///
+/// This is the re-entrancy-safe way to fire a callback. The closure may call
+/// [`with_state`] freely — the borrow is released — and any model change it
+/// makes is seen both by itself and by the next caller, because it went
+/// through the same cell.
+///
+/// `take` yields the closures, `put` reinstalls them. The split exists so the
+/// two borrow scopes are visibly separate rather than one hidden borrow
+/// spanning a user call.
+pub(crate) fn with_callbacks<T>(
+    take: fn(&mut ZorkState, usize) -> T,
+    id: usize,
+) -> T {
+    with_state(|s| take(s, id))
+}
+
+/// Re-attach a lifted closure set after it has run.
+pub(crate) fn put_callbacks<T>(
+    put: fn(&mut ZorkState, usize, T),
+    id: usize,
+    taken: T,
+) {
+    with_state(|s| put(s, id, taken));
+}
+
+/// Take the singleton's current contents, leaving an empty model behind.
+///
+/// For a driver that wants to *adopt* what a host already built (corro builds
+/// its whole widget tree through the adapter before handing off to the REPL)
+/// rather than start from nothing.
+pub(crate) fn take_state() -> ZorkState {
+    ZORK_STATE.with(|s| std::mem::replace(&mut *s.borrow_mut(), ZorkState::new()))
 }
 
 /// Reset the thread-local singleton. Only for tests that need a clean slate
@@ -1919,6 +2088,15 @@ pub(crate) fn reset_state() {
     ZORK_STATE.with(|s| *s.borrow_mut() = ZorkState::new());
 }
 
+/// Read the singleton without the two-phase dance, for assertions.
+///
+/// A plain read cannot re-enter (it takes no user-closure call path), so it
+/// does not need the guard — but it does go through `with_state` for the
+/// consistency of the re-entrancy check.
+pub fn with_state_for_test<R>(f: impl FnOnce(&ZorkState) -> R) -> R {
+    with_state(|s| f(s))
+}
+
 /// Reset the thread-local singleton, for an *external* test binary driving the
 /// adapter (which has no access to `#[cfg(test)]` items). Each test starts from
 /// a fresh model so they do not interfere through the shared singleton.
@@ -1926,14 +2104,21 @@ pub fn reset_for_test() {
     ZORK_STATE.with(|s| *s.borrow_mut() = ZorkState::new());
 }
 
-/// Borrow the thread-local singleton read-only, for an external test binary.
-pub fn with_state_for_test<R>(f: impl FnOnce(&ZorkState) -> R) -> R {
-    ZORK_STATE.with(|s| f(&s.borrow()))
+/// Mutate the singleton, for an external driver that needs an operation taking
+/// `&mut ZorkState`. Uses the same two-phase `with_state` path, so a callback
+/// fired inside `f` may re-enter no more than anywhere else.
+pub fn with_state_mut_for_test<R>(f: impl FnOnce(&mut ZorkState) -> R) -> R {
+    with_state(f)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These tests drive the model through the *facade* on purpose: the
+    // re-entrancy bug lived in `with_state`, not in `ZorkState`, so a test
+    // that called the methods directly would not have caught it.
+    use super::super::facade as f;
+    use super::super::facade::{create_scrolled_window, set_label_text, set_size_request};
 
     #[test]
     fn radio_group_is_mutually_exclusive() {
@@ -2278,8 +2463,14 @@ mod tests {
             let sv = seen.clone();
             s.add_scroll_callback(sw, Box::new(move |vert, pos| sv.borrow_mut().push((vert, pos))));
         }
-        s.scroll(sw, true, 42.0);
-        s.scroll(sw, false, 7.0);
+        s.set_scroll_pos(sw, true, 42.0);
+        s.set_scroll_pos(sw, false, 7.0);
+        let mut cbs = ZorkState::take_scroll_hooks(&mut s, sw);
+        for cb in cbs.iter_mut() {
+            cb(true, 42.0);
+            cb(false, 7.0);
+        }
+        ZorkState::put_scroll_hooks(&mut s, sw, cbs);
         assert_eq!(*seen.borrow(), vec![(true, 42.0), (false, 7.0)]);
         assert_eq!(s.get_scroll(sw), (7.0, 42.0));
     }
@@ -2406,6 +2597,63 @@ mod tests {
         let text = s.dark_room_description().to_lowercase();
         assert!(text.contains("grue"), "warns about the grue: {text}");
         assert!(text.contains("light"), "says what to do about it: {text}");
+    }
+
+    // -- Re-entrancy --
+    //
+    // The facade's `with_state` used to hold a `RefMut` across the whole
+    // operation, so any model call from inside a user callback panicked with
+    // "RefCell already borrowed". That is not an exotic pattern: corro's draw
+    // callback calls `scroll_to` on every frame to keep the scrollbar in step
+    // with the viewport, and the first corro run on this backend died there.
+
+    #[test]
+    fn a_draw_callback_may_re_enter_the_model() {
+        // Exactly corro's shape: paint, then sync the scrollbar to the viewport
+        // while still inside the draw. Before the re-entrancy fix this died
+        // with "RefCell already borrowed" in `scroll_to`.
+        let c = f::create_canvas().expect("node");
+        f::set_size_request(c, 100, 100);
+        let cid = c;
+        f::set_draw_callback(c, Box::new(move |_ctx, _w, _h| {
+            f::set_size_request(cid, 100, 100);
+            let sc = f::create_scrolled_window().expect("node");
+            f::scroll_to(sc, 0.0, 100.0, 20.0, 0.0, 100.0, 20.0);
+        }));
+        let ops = f::draw_canvas(c);
+        assert!(ops.is_empty(), "the callback ran without panicking");
+    }
+
+    #[test]
+    fn a_click_callback_may_re_enter_the_model() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let b = f::create_button("go").expect("node");
+        let l = f::create_label("0").expect("node");
+        let hits = Rc::new(Cell::new(0));
+        let h = hits.clone();
+        f::add_callback(b, Box::new(move || {
+            f::set_label_text(l, "1");   // a click handler that updates a label
+            h.set(1);
+        }));
+        f::fire(b);
+        assert_eq!(hits.get(), 1);
+        assert_eq!(f::get_label_text(l), Some("1".to_string()));
+    }
+
+    #[test]
+    fn a_nested_call_keeps_both_writes() {
+        // The subtle failure the fix has to avoid: a nested call must not
+        // operate on a detached copy whose changes are thrown away. Here the
+        // click handler *creates* a widget, and the outer state must see it.
+        let b = f::create_button("go").expect("node");
+        f::add_callback(b, Box::new(|| {
+            f::create_label("made inside a callback").expect("node");
+        }));
+        let before = super::with_state_for_test(|s| s.nodes.len());
+        f::fire(b);
+        let after = super::with_state_for_test(|s| s.nodes.len());
+        assert_eq!(after, before + 1, "the nested creation reached the real model");
     }
 
     #[test]
