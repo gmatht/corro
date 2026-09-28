@@ -2982,16 +2982,35 @@ pub fn add_periodic_tick(
     crate::backends_ios_adapter::add_periodic_tick(ms, f)
 }
 
+/// WASM: a `setInterval` on the page, returning `true` from `f` to stop.
+///
+/// WASM used to be in the no-op list below, on the reasoning that a browser
+/// drives its own loop. That is true of the *dispatch* and false of the
+/// *timer*: nothing in a page calls back into Rust on a schedule unless
+/// something asks it to, so an app that armed a periodic tick -- tailing an
+/// append-only log, polling a collaborator -- silently never ran. It is the
+/// same trap the iOS note below describes, and the same fix.
+#[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+pub fn add_periodic_tick(
+    _window: &crate::common::Window,
+    ms: u32,
+    f: Box<dyn FnMut() -> bool>,
+) -> Result<(), Error> {
+    crate::backends_wasm_adapter::add_periodic_tick(ms, f)
+}
+
 /// Backends that drive their own event loop and already poll for external
-/// changes (pancurses/terminal, wasm, zork, android) need no timer, so the
+/// changes (pancurses/terminal, zork, android) need no timer, so the
 /// request is accepted and dropped.
 ///
 /// NOTE: iOS is deliberately NOT in this list - it needs a real timer, and
-/// returning Ok without one hid that for as long as it did.
+/// returning Ok without one hid that for as long as it did. WASM is not in it
+/// either, for the same reason; see the arm above.
 #[cfg(not(any(
     any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))),
     all(windows, not(feature = "zork")),
-    all(target_os = "ios", not(feature = "zork"))
+    all(target_os = "ios", not(feature = "zork")),
+    all(target_arch = "wasm32", not(feature = "zork"))
 )))]
 pub fn add_periodic_tick(
     _window: &crate::common::Window,

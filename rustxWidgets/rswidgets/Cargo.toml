@@ -56,6 +56,10 @@ web-sys = { version = "0.3", features = [
   # MenuBar::popup_submenu_by_mnemonic_at needs a bounding box to turn the
   # caller's screen coordinates into a position inside the bar.
   "TextMetrics", "DomRect", "NodeList",
+  # DrawContext::draw_rgba_image needs ImageData to stage the pixels.
+  # (drawImage needs no extra feature: the overload taking a scaled
+  # destination rect is on CanvasRenderingContext2d itself.)
+  "ImageData",
 ] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

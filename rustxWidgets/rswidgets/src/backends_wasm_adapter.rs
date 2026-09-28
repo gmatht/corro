@@ -30,6 +30,90 @@ mod wasm_adapter {
         document().create_element(tag).unwrap()
     }
 
+    /// Run `f` every `ms` milliseconds until it returns `false`.
+    ///
+    /// `setInterval`, and the closure is leaked: an interval has no natural
+    /// owner here (the backend is a set of free functions, not a window), and
+    /// the `true` return from `f` is what stops it. Leaking the `Closure` is
+    /// therefore not a leak in practice -- a repeating tick is meant to
+    /// outlive the call that armed it, and the interval handle stops firing
+    /// as soon as `f` says so.
+    ///
+    /// `ms` is clamped to 1: `setInterval` treats 0 as "as fast as the
+    /// browser allows" and a negative value as 0, so a caller asking for
+    /// 0 ms would get an unthrottled loop rather than the one-shot-per-tick
+    /// behaviour a 0 interval suggests.
+    pub fn add_periodic_tick(
+        ms: u32,
+        f: Box<dyn FnMut() -> bool>,
+    ) -> Result<(), Error> {
+        let cell = Rc::new(RefCell::new(f));
+        // The interval id, shared with the callback so that returning `false`
+        // can actually cancel the interval.
+        //
+        // This has to exist: `setInterval` keeps firing until something calls
+        // `clearInterval`, and the only thing that knows the tick is finished
+        // is `f` itself. A cell holding the id is set *after* the first
+        // `setInterval` call, and a tick that fires before that reads 0 --
+        // which is not a valid interval id, so `clearInterval(0)` is a no-op
+        // and the next scheduled run does the cancelling. In practice the
+        // delay is `ms`, far longer than the microseconds the assignment
+        // needs, so the common case cancels on the first tick.
+        let handle: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+        let handle_for_cb = handle.clone();
+        let closure = Closure::<dyn FnMut()>::new(move || {
+            // A panic inside `f` would unwind through a JS callback, which
+            // wasm-bindgen cannot do safely. `try_borrow_mut` degrades to a
+            // skipped tick instead, which is also what a re-entrant call from
+            // `f` needs.
+            let keep_going = match cell.try_borrow_mut() {
+                Ok(mut guard) => guard(),
+                Err(_) => true,
+            };
+            if !keep_going {
+                if let Some(w) = web_sys::window() {
+                    w.clear_interval_with_handle(handle_for_cb.get());
+                }
+            }
+        });
+        let ms = ms.max(1);
+        let Some(w) = web_sys::window() else {
+            return Err(Error::Backend("no window: no event loop to schedule on".into()));
+        };
+        let id = w
+            .set_interval_with_callback_and_timeout_and_arguments_0(
+                closure.as_ref().unchecked_ref(),
+                ms as i32,
+            )
+            .map_err(|e| Error::Backend(format!("setInterval: {e:?}")))?;
+        handle.set(id);
+        // Keep the closure alive for as long as the page is; the interval
+        // owns the callback, and a dropped `Closure` would free the JS
+        // trampoline that callback still points at.
+        std::mem::forget(closure);
+        Ok(())
+    }
+
+    /// Run `f` once, `ms` milliseconds from now.
+    pub fn timeout_add_once(ms: u32, f: Box<dyn FnOnce()>) -> Result<(), Error> {
+        let closure = Closure::<dyn FnMut()>::once_into_js(move || f());
+        let ms = ms.max(1) as i32;
+        let _ = web_sys::window().map(|w| {
+            let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
+                closure.as_ref().unchecked_ref(),
+                ms,
+            );
+        });
+        std::mem::forget(closure);
+        Ok(())
+    }
+
+    /// A repeating tick on `window`. `timeout_add_repeating` is the GTK and
+    /// NWG spelling; `add_periodic_tick` above is what `core.rs` calls.
+    pub fn timeout_add_repeating(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), Error> {
+        add_periodic_tick(ms, f)
+    }
+
     pub fn quit_main_loop() {
         // On WASM there is no message loop to quit.  Signal the test
         // framework that the app has quit, and try to close the tab.
@@ -2410,6 +2494,104 @@ impl SimpleAction {
             let w = canvas.width() as f64;
             let h = canvas.height() as f64;
             self.ctx.fill_rect(0.0, 0.0, w, h);
+        }
+
+        /// Blit a straight-alpha RGBA8 image at `(x, y)`, scaled by `scale`.
+        ///
+        /// The only `DrawContext` method GTK overrides that this backend did
+        /// not, so every caller fell through to the trait default and got
+        /// `false` -- which is the "I could not draw this, degrade to vector
+        /// primitives" answer, and is why an image preview on a page showed
+        /// nothing at all.
+        ///
+        /// Two steps, because there is no `putImageDataAt`-with-transform:
+        /// `putImageData` writes at integer device pixels and ignores the
+        /// transform, and `putImageData` is the only way to get *premultiplied*
+        /// semantics right. The DOM wants **straight** alpha, which is what
+        /// the caller supplies, so the pixels are staged verbatim into an
+        /// `ImageData`; the scale and the sub-pixel origin are then applied by
+        /// `drawImage` from that staging canvas, which does honour the
+        /// transform.
+        ///
+        /// Scaling is done by `drawImage` with a destination rectangle rather
+        /// than by resampling the `ImageData`, because the DOM's image
+        /// smoothing is what a caller expects from a scaled blit (and matches
+        /// what Cairo's own filter does on GTK).
+        fn draw_rgba_image(
+            &mut self,
+            x: f64,
+            y: f64,
+            pixels: &[u8],
+            width: u32,
+            height: u32,
+            scale: f64,
+        ) -> bool {
+            if width == 0 || height == 0 {
+                // A zero-sized image has nothing to blit; `false` tells the
+                // caller to fall back, which is the honest answer rather than
+                // a silent no-op that looks like success.
+                return false;
+            }
+            let expected = (width as usize) * (height as usize) * 4;
+            if pixels.len() < expected {
+                // Short buffer: the DOM would throw a DataCloneError on an
+                // `ImageData` of the wrong length. Reporting `false` keeps the
+                // caller's fallback path instead of panicking across the FFI
+                // boundary.
+                return false;
+            }
+            // `Clamped` is a marker wrapper the DOM's byte array type uses;
+            // the slice is wrapped, not reinterpreted, so the bytes cross
+            // unmodified. The argument order is (data, width, height).
+            let Ok(image_data) = web_sys::ImageData::new_with_u8_clamped_array_and_sh(
+                wasm_bindgen::Clamped(pixels),
+                width,
+                height,
+            ) else {
+                return false;
+            };
+
+            // A scratch canvas to hold the unscaled image, so the destination
+            // rectangle can scale it. Created on demand and dropped after --
+            // `drawImage` needs a source, and an `ImageData` is not one.
+            let Ok(scratch) = create_element("canvas").dyn_into::<HtmlCanvasElement>() else {
+                return false;
+            };
+            scratch.set_width(width);
+            scratch.set_height(height);
+            let Some(sctx) = scratch
+                .get_context("2d")
+                .ok()
+                .flatten()
+                .and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
+            else {
+                return false;
+            };
+            // Both calls below are fallible (they return `Result<_, JsValue>`
+            // because a DOM exception is reportable across the boundary: a
+            // detached canvas, or a scratch canvas with no 2d context). A
+            // failure means the blit did not happen, so `false` is the
+            // honest answer and lets the caller fall back to vector drawing
+            // rather than silently drawing nothing.
+            if sctx.put_image_data(&image_data, 0.0, 0.0).is_err() {
+                return false;
+            }
+
+            let dw = width as f64 * scale;
+            let dh = height as f64 * scale;
+            // The `and_dw_and_dh` overload is the one that scales; the plain
+            // form blits at the source's natural size and would ignore
+            // `scale` entirely. There is no single 6-argument overload: each
+            // source type has its own, so this names the canvas one.
+            self.ctx
+                .draw_image_with_html_canvas_element_and_dw_and_dh(
+                    scratch.as_ref(),
+                    x,
+                    y,
+                    dw,
+                    dh,
+                )
+                .is_ok()
         }
 
         fn save(&mut self) { self.ctx.save(); }
