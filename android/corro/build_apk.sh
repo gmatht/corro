@@ -15,10 +15,25 @@ PLATFORM="${PLATFORM:-android-34}"
 PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/build-tools/$BUILD_TOOLS:$ANDROID_HOME/emulator:$PATH"
 
 ABI="${1:-x86_64}"
-# cargo-ndk target triple per ABI
+# cargo-ndk target triple per ABI.
+#
+# `TARGET` is cargo-ndk's *ABI* name and `TRIPLE` is the rustc target triple.
+# They are NOT the same string: cargo-ndk accepts the ABI names (`x86_64`,
+# `arm64-v8a`, `x86`, `armeabi-v7a`), not the triples. Passing the triple's
+# first component instead — which is what this used to do — makes
+# `cargo ndk -t aarch64` fail with
+#
+#   error: invalid value 'aarch64' for '--target <TARGET>'
+#     [possible values: armeabi-v7a, arm64-v8a, x86, x86_64]
+#
+# and because the build line pipes cargo through `tail -1`, the error is
+# swallowed and the script exits with no message at all. So `arm64-v8a` built
+# nothing and said nothing, which is exactly the shape of bug that makes
+# someone conclude "arm64 does not build" — while in fact the compiler had
+# never been asked to.
 case "$ABI" in
   x86_64)    TARGET="x86_64";    TRIPLE="x86_64-linux-android";    LIBDIR="x86_64" ;;
-  arm64-v8a) TARGET="aarch64";   TRIPLE="aarch64-linux-android";   LIBDIR="arm64-v8a" ;;
+  arm64-v8a) TARGET="arm64-v8a"; TRIPLE="aarch64-linux-android";   LIBDIR="arm64-v8a" ;;
   *) echo "unknown ABI: $ABI (want x86_64 or arm64-v8a)" >&2; exit 1 ;;
 esac
 
@@ -33,7 +48,9 @@ rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"/{classes,dex,staging}
 # theme, palette, strings and manifest stay reproducible.
 echo "==> Building Rust .so for $TRIPLE..."
 cd "$CORRO_ROOT/android/corro"
-cargo ndk -t "$TARGET" build --release --features generate-android-resources 2>&1 | tail -1
+# No `| tail`: piping cargo's output hides its error messages, and a failed
+# build then looks like a script that stopped for no reason.
+cargo ndk -t "$TARGET" build --release --features generate-android-resources
 
 # 1b. Fetch the AndroidX/Material AARs the generated theme needs.
 # The generated theme parents against Theme.Material3.*, which lives in the

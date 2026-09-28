@@ -636,6 +636,16 @@ mod gtk_adapter {
             self.0.connect_response(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
         pub fn close(&self) { self.0.close(); }
+        /// Measure the dialog without mapping it; see the loader's
+        /// `layout_dialog`. A caller attaching a custom view needs the size
+        /// settled before the window opens.
+        pub fn layout_dialog(&self) { self.0.layout_dialog(); }
+        /// Hide or show without destroying. `close` would destroy a
+        /// `GtkDialog`, so this is a different operation, not an alias.
+        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        /// Run the nested main loop and return the response id. Falls back to
+        /// present-and-return-0 when `gtk_dialog_run` is unavailable.
+        pub fn run(&self) -> i32 { self.0.run() }
         pub fn mark_destroyed(&self) { self.0.mark_destroyed(); }
 
     }

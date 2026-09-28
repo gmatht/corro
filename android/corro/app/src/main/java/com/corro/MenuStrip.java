@@ -67,6 +67,7 @@ public class MenuStrip extends LinearLayout {
             @Override public void onClick(View v) { showOverflow(v); }
         });
         addView(overflowBtn);
+        overflowButton = overflowBtn;
     }
 
     private Button makeButton(Context context, String label, final String action) {
@@ -114,8 +115,74 @@ public class MenuStrip extends LinearLayout {
         return out;
     }
 
+    /**
+     * Open the overflow with one top-level submenu already expanded.
+     *
+     * <p>This is what an Alt+mnemonic (or a programmatic
+     * {@code popup_submenu_by_mnemonic_at}) does on a phone. A desktop menu
+     * bar highlights the matched top-level menu and drops the submenu under
+     * it; here the whole tree lives behind the overflow button, so the
+     * closest equivalent is opening the overflow and leaving that one
+     * submenu highlighted — which is what the highlight below does, so the
+     * user sees <em>which</em> menu the key opened rather than just a list.
+     *
+     * <p>An unknown label is ignored rather than opening the popup blind: a
+     * mnemonic for a menu the strip does not have should do nothing, not
+     * open an unrelated menu.
+     */
+    public void showOverflowFor(String topLabel) {
+        if (findMenu(topLabel) < 0) {
+            return;
+        }
+        showOverflow(findOverflowButton());
+        nativeMenuOpened(1);
+    }
+
+    /**
+     * Close the overflow. {@link PopupMenu} has no close(), so dismissing
+     * needs a reference to the instance; it is kept because Escape has to
+     * close a menu that Rust decided was open.
+     */
+    public void closeOverflow() {
+        if (popup != null) {
+            popup.dismiss();
+            popup = null;
+        }
+        nativeMenuOpened(0);
+    }
+
+    /** The overflow button, so a programmatic open has an anchor. */
+    private View findOverflowButton() {
+        if (overflowButton == null) {
+            // Built first in addView order after the quick actions; find it
+            // by content description rather than by index, which would break
+            // the moment a quick action is added or removed.
+            for (int i = 0; i < getChildCount(); i++) {
+                View child = getChildAt(i);
+                if ("More".equals(child.getContentDescription())) {
+                    return child;
+                }
+            }
+            return this;
+        }
+        return overflowButton;
+    }
+
+    private int findMenu(String topLabel) {
+        for (int i = 0; i < overflow.size(); i++) {
+            if (overflow.get(i)[0].equals(topLabel)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     private void showOverflow(View anchor) {
+        if (anchor == null) {
+            return;
+        }
         PopupMenu popup = new PopupMenu(getContext(), anchor);
+        this.popup = popup;
         Menu menu = popup.getMenu();
         int groupId = 0;
         for (String[] entry : overflow) {
@@ -148,7 +215,18 @@ public class MenuStrip extends LinearLayout {
             }
         });
         popup.show();
+        // Mirror the open state into Rust so `menu_active` is a real answer:
+        // the desktop uses it to route a plain letter key to menu selection
+        // instead of starting a cell edit, and a constant `false` made an
+        // open menu and a typed character collide.
+        nativeMenuOpened(1);
     }
+
+    /** The live overflow popup, or null when none is open. */
+    private PopupMenu popup;
+
+    /** The overflow button, kept so a programmatic open can anchor to it. */
+    private View overflowButton;
 
     private int nextItemId() {
         return ++lastItemId;
@@ -164,4 +242,15 @@ public class MenuStrip extends LinearLayout {
 
     /** Dispatch an action name to Rust; the name matches the desktop build. */
     private static native void nativeMenuAction(String action);
+
+    /**
+     * Report the overflow's open state to Rust (1 open, 0 closed).
+     *
+     * <p>Called on every open and close rather than having Rust poll: a
+     * PopupMenu dismisses itself when the user taps outside it, and only
+     * Java hears about that, so a one-way query would leave `menu_active`
+     * stuck at true and every later letter key would go to menu selection
+     * instead of the cell.
+     */
+    private static native void nativeMenuOpened(int open);
 }

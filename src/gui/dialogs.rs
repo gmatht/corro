@@ -41,10 +41,54 @@ pub fn file_open_dialog() -> Option<PathBuf> {
         app.open_file_filtered("Open Spreadsheet", &filters)
             .ok()
             .flatten()
-            .map(PathBuf::from)
+            .as_deref()
+            .and_then(resolve_picked_document)
     });
     #[allow(unreachable_code)]
     None
+}
+
+/// Turn a chosen document into something the loaders can read.
+///
+/// On a desktop the file dialog returns a **path**. On Android the Storage
+/// Access Framework returns a `content://` **URI**, and there is no filesystem
+/// path behind one — `std::fs` cannot open it and `Path::exists` is false for
+/// it, so handing the URI on unchanged (which is what the code did before,
+/// via `PathBuf::from`) made File &rarr; Open load nothing and say nothing.
+///
+/// So on Android the document is copied once into the app's private storage
+/// and a real path is returned, which every existing loader works with
+/// unchanged. The copy is what makes the *import* direction work at all: the
+/// permission granted by the picker is per-document and does not survive a
+/// reboot, while the copy does.
+///
+/// A path is passed straight through, so a host that substituted a plain file
+/// chooser (or a test) still works and the check costs one `starts_with`.
+#[cfg(any(feature = "gui", feature = "gui-core"))]
+fn resolve_picked_document(picked: &str) -> Option<PathBuf> {
+    if !picked.starts_with("content://") && !picked.starts_with("file://") {
+        return Some(PathBuf::from(picked));
+    }
+    // Keep the extension in the copied name: the loaders dispatch on it
+    // (`load_initial` matches "corro"/"ods"/"tsv"/"csv"), and a document
+    // provider's display name is the only place the type survives.
+    let name = picked
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("document");
+    #[cfg(target_os = "android")]
+    {
+        let local = rswidgets::backends::android::materialize_document(picked, name)?;
+        Some(PathBuf::from(local))
+    }
+    // Off Android no dialog can hand back a URI, so this arm is unreachable.
+    // It returns `None` rather than a fake path so a substituted file
+    // chooser that *did* return one reports a failed open honestly.
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = name;
+        None
+    }
 }
 
 /// Save As dialog: filtered to `.corro`, suggesting a `.corro` name, and
@@ -54,11 +98,24 @@ pub fn file_save_dialog() -> Option<PathBuf> {
     file_save_dialog_named("Sheet1.corro")
 }
 
-/// Save As dialog with a suggested filename (e.g. the current workbook
-/// name); the `.corro` default still applies.
-/// Params feed only the `gui` body; other builds take the None fallback.
+/// Save As with a suggested filename, returning a [`SaveTarget`] rather than a
+/// `PathBuf`.
+///
+/// The distinction is not cosmetic. A desktop returns a path and that is
+/// where the bytes go; Android returns a `content://` URI, and
+/// `write_workbook_log` writes through `std::fs` to a *temp sibling* and
+/// renames it — neither of which means anything for a document provider. So
+/// the URI is carried as [`SaveTarget::Document`] and the writer
+/// ([`write_workbook`]) routes it through the content resolver instead.
+///
+/// [`file_save_dialog_named`] keeps the `PathBuf` signature for the desktop
+/// callers that genuinely have a path, and delegates here.
 #[allow(unused_variables)]
-pub fn file_save_dialog_named(suggested: &str) -> Option<PathBuf> {
+pub(crate) fn file_save_target(suggested: &str) -> Option<SaveTarget> {
+    // `gui-core` alongside `gui`, for the reason the rest of this file now
+    // spells: a build that has the dialog *model* but not a GUI backend
+    // still compiles it. The body is a no-op there, which is what the
+    // `unreachable_code` arm below is for.
     #[cfg(any(feature = "gui", feature = "gui-core"))]
     return App::init().ok().and_then(|app| {
         app.save_file_filtered(
@@ -70,10 +127,109 @@ pub fn file_save_dialog_named(suggested: &str) -> Option<PathBuf> {
         )
         .ok()
         .flatten()
-        .map(|p| crate::ui_core::force_extension(&PathBuf::from(p), "corro"))
+        .as_deref()
+        .map(save_target)
     });
     #[allow(unreachable_code)]
     None
+}
+
+/// Save As dialog with a suggested filename (e.g. the current workbook
+/// name); the `.corro` default still applies.
+/// Params feed only the `gui` body; other builds take the None fallback.
+#[allow(unused_variables)]
+pub fn file_save_dialog_named(suggested: &str) -> Option<PathBuf> {
+#[cfg(any(feature = "gui", feature = "gui-core"))]
+    {
+        // A path only on the backends that have one; a `SaveTarget` knows
+        // whether it is a document, so the flattening here is the only place
+        // that distinction is lost, and it is a caller that has already
+        // decided it cannot use a URI.
+        return file_save_target(suggested).and_then(|t| match t {
+            SaveTarget::Path(p) => Some(p),
+            SaveTarget::Document(_) => None,
+        });
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Where a save should actually be written, given what the dialog returned.
+///
+/// A desktop returns a path and that is where the bytes go. Android returns a
+/// `content://` URI, and `write_workbook_log` writes through `std::fs` to a
+/// *temp sibling* and renames it — neither of which means anything for a
+/// document provider. So the URI is returned unchanged, recognised by the
+/// writer (see [`write_workbook`]), which routes it through the content
+/// resolver instead.
+///
+/// The `.corro` extension is still forced, but on the *filename* rather than
+/// the URI: the platform picker appends the extension itself when the name
+/// lacks one, and a URI is not something an extension can be appended to.
+#[cfg(any(feature = "gui", feature = "gui-core"))]
+fn save_target(picked: &str) -> SaveTarget {
+    if picked.starts_with("content://") {
+        return SaveTarget::Document(picked.to_string());
+    }
+    SaveTarget::Path(crate::ui_core::force_extension(&PathBuf::from(picked), "corro"))
+}
+
+/// Where a save goes: a real file, or a Storage Access Framework document.
+#[cfg(any(feature = "gui", feature = "gui-core"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SaveTarget {
+    Path(PathBuf),
+    /// A `content://` URI. Written through the content resolver.
+    Document(String),
+}
+
+impl SaveTarget {
+    /// The name to show in a status line. A URI is a long opaque string, so
+    /// only its last segment is shown — which is the document's own name.
+    pub(crate) fn display(&self) -> String {
+        match self {
+            SaveTarget::Path(p) => p.display().to_string(),
+            SaveTarget::Document(uri) => uri
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or(uri)
+                .to_string(),
+        }
+    }
+}
+
+/// Write a workbook log to a [`SaveTarget`].
+///
+/// For a path this is exactly `write_workbook_log`, including the
+/// write-temp-then-rename that makes a save atomic. For a document it is a
+/// *stream* write through the content resolver, and the temp-and-rename step
+/// is simply unavailable: a document provider exposes a single stream with no
+/// sibling to rename over, so the log is written in one go. That is a real
+/// difference in failure behaviour — a document save interrupted part-way
+/// leaves a truncated file, where a path save leaves the old one intact — and
+/// it is inherent to SAF, not a choice: there is no other handle to write to.
+#[cfg(any(feature = "gui", feature = "gui-core"))]
+pub(crate) fn write_workbook(target: &SaveTarget, workbook: &WorkbookState, sorts: &std::collections::HashMap<u32, Vec<crate::grid::SortSpec>>) -> Result<(), String> {
+    match target {
+        SaveTarget::Path(p) => crate::io::write_workbook_log(p, workbook, sorts).map_err(|e| e.to_string()),
+        SaveTarget::Document(uri) => {
+            // Only Android can produce a Document, so this is the one place
+            // that needs the platform call. The cfg keeps the desktop build
+            // free of an Android-only dependency rather than reaching for a
+            // trait method that does nothing.
+            #[cfg(target_os = "android")]
+            {
+                let text = crate::io::serialize_workbook_log(workbook, sorts);
+                if rswidgets::backends::android::write_document(uri, text.as_bytes()) {
+                    return Ok(());
+                }
+            }
+            Err(format!(
+                "could not write {}",
+                SaveTarget::Document(uri.clone()).display()
+            ))
+        }
+    }
 }
 
 /// Export dialog for `action` (`export_tsv/csv/ods/ascii`): matching type

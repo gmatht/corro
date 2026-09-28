@@ -3,6 +3,7 @@ package com.corro;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.view.GestureDetector;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
@@ -92,10 +93,32 @@ public class SheetView extends View {
         // "reset view".
         gestureDetector = new GestureDetector(
                 context, new GestureDetector.SimpleOnGestureListener() {
+            /**
+             * A long press is ambiguous on a touch screen: it can mean
+             * "start a range selection" or "open this cell's menu". Rust owns
+             * the gesture state and decides which; this only reports the press
+             * and acts on the code that comes back.
+             *
+             * <p>corro's sheet uses {@code MENU_MODE = true}, so a long press
+             * is its right-click. That leaves range selection to a
+             * mouse/stylus drag, and on a finger to a long press when
+             * {@code MENU_MODE} is false — the two cannot share one gesture,
+             * and the menu is the better default for a phone: it is reachable
+             * from anywhere, and a selection is still reachable by dragging.
+             */
             @Override
             public void onLongPress(MotionEvent e) {
-                if (gestureActive) {
-                    nativeGestureLongPress(canvasId, e.getX(), e.getY());
+                if (!gestureActive) {
+                    return;
+                }
+                int outcome = nativeGestureLongPress(
+                        canvasId, e.getX(), e.getY(), MENU_MODE);
+                if (outcome == OUTCOME_LONG_PRESS_MENU) {
+                    // The gesture is consumed by the menu: a following release
+                    // must not also fire a tap, or the cursor would jump to
+                    // the pressed cell *after* the menu already acted.
+                    gestureActive = false;
+                    nativeCellContextMenu(e.getX(), e.getY());
                 }
             }
 
@@ -147,6 +170,17 @@ public class SheetView extends View {
     /** Outcome codes shared with Rust ({@code rswidgets::gridview::DragOutcome}). */
     private static final int OUTCOME_SCROLL = 2;
     private static final int OUTCOME_TAP = 3;
+    /** The long press opened a context menu rather than arming a selection. */
+    private static final int OUTCOME_LONG_PRESS_MENU = 5;
+
+    /**
+     * Whether a long press opens the cell's context menu.
+     *
+     * <p>True for corro's sheet: on a phone a long press is the platform's
+     * own gesture for "this thing has a menu", and it is the only route to
+     * the cell actions a desktop gets from a right-click.
+     */
+    private static final boolean MENU_MODE = true;
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
@@ -254,13 +288,64 @@ public class SheetView extends View {
         pendingY -= applied[0] * cellH;
     }
 
+    /**
+     * Hardware keyboard, {@code adb shell input keyevent}, and the soft
+     * keyboard's own arrow/delete keys.
+     *
+     * <p>This is what makes corro's shared {@code handle_key} reachable on a
+     * phone. Android sends a key event to the focused view, and the sheet
+     * takes focus on {@code ACTION_DOWN} and on the first tap, so it is the
+     * view that sees them.
+     *
+     * <p>Returning true only when corro consumed the key matters: an
+     * unconsumed key must reach the platform, or the system Back button and
+     * the volume keys would stop working. That is why the *decision* lives in
+     * Rust — only it knows whether a key was a cell navigation or something
+     * the platform should have.
+     */
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (CorroKeyBridge.dispatch(this, event, canvasId)) {
+            return true;
+        }
+        return super.onKeyDown(keyCode, event);
+    }
+
+    /**
+     * A secondary-button click, which on Android means a <em>mouse</em> right
+     * click: touch has no buttons, but the emulator's pointer and a stylus do
+     * report one.
+     *
+     * <p>Handled here rather than in {@code onTouchEvent} because a
+     * {@code MotionEvent} only exposes the button as a modifier on a
+     * secondary click, which arrives as {@code ACTION_DOWN} with
+     * {@code BUTTON_SECONDARY} in the meta state. The gesture recogniser
+     * above would otherwise treat it as a tap and move the cursor, so a
+     * right-click opened the cell under the pointer's *previous* position
+     * instead of the one clicked.
+     */
+    @Override
+    public boolean onGenericMotionEvent(MotionEvent event) {
+        if (event.getAction() == MotionEvent.ACTION_BUTTON_PRESS
+                && (event.getButtonState() & MotionEvent.BUTTON_SECONDARY) != 0) {
+            nativeClickButton(canvasId, event.getX(), event.getY(), 3 /* right */, 0);
+            return true;
+        }
+        return super.onGenericMotionEvent(event);
+    }
+
     private static native void nativeOnDraw(long canvasId, Canvas canvas, int w, int h);
+    private static native void nativeClickButton(long canvasId, float x, float y,
+                                                 int button, int mods);
     private static native void nativeOnTouch(long canvasId, float x, float y);
     private static native float[] nativeCellSize();
     private static native float nativeZoom(float factor);
     private static native float nativeResetZoom();
     private static native void nativeGestureDown(long canvasId, float x, float y, boolean isTouch);
-    private static native void nativeGestureLongPress(long canvasId, float x, float y);
+    private static native int nativeGestureLongPress(long canvasId, float x, float y,
+                                                     boolean menuMode);
+    /** Open the cell's context menu, the actions for the cell at (x, y). */
+    private static native void nativeCellContextMenu(float x, float y);
     private static native int nativeGestureMove(long canvasId, float x, float y);
     private static native int nativeGestureUp(long canvasId, float x, float y);
     private static native void nativeGestureCancel(long canvasId);
