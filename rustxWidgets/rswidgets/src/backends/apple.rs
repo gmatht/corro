@@ -540,7 +540,6 @@ pub fn log_apple(msg: &str) {
     unsafe {
         unsafe extern "C" {
             fn write(fd: i32, buf: *const std::os::raw::c_void, count: usize) -> isize;
-            fn libc_open(path: *const std::os::raw::c_char, flags: i32, mode: u32) -> i32;
         }
         // Also append to a file, in the app's own container.
         //
@@ -556,9 +555,6 @@ pub fn log_apple(msg: &str) {
         // A file cannot fill and is not drained by anything, so this path is
         // where the log has to come from. Best-effort: if the container has no
         // writable directory the stderr line still stands.
-        const O_WRONLY: i32 = 1;
-        const O_CREAT: i32 = 64;
-        const O_APPEND: i32 = 1024;
         // Log to BOTH `/tmp` and the app container's own `tmp`, because they
         // are not the same directory on iOS: an app's `/tmp` is already its
         // container's, but a host-side reader that wants the file has to know
@@ -566,14 +562,21 @@ pub fn log_apple(msg: &str) {
         // is only resolved at build time. Writing both means the reader does
         // not have to be right about any of that - it can find whichever one
         // it can actually see.
-        for path in [b"/tmp/corro-app.log\0".as_ref(), b"./corro-app.log\0".as_ref()] {
-            let fd = libc_open(
-                path.as_ptr() as *const std::os::raw::c_char,
-                O_WRONLY | O_CREAT | O_APPEND,
-                0o644,
-            );
-            if fd >= 0 {
-                write(fd, line.as_ptr() as *const std::os::raw::c_void, line.len());
+        //
+        // `std::fs::OpenOptions` rather than a hand-declared `open(2)`: the
+        // C name `open` is reserved in Rust, and both escapes from that fail
+        // differently - renaming it asks the linker for a symbol that does not
+        // exist (the iOS build failed with an undefined `_libc_open`), and
+        // `#[link_name = "open"]` is rejected outright. The standard library
+        // already has the right name for this, and it is a one-line call.
+        use std::io::Write;
+        for path in ["/tmp/corro-app.log", "./corro-app.log"] {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = f.write_all(line.as_bytes());
             }
         }
         write(
