@@ -408,6 +408,35 @@
 @property (nonatomic, assign) uint64_t callbackId;
 @end
 
+/// Schedule `corroFired:` on `self` after `delay` seconds.
+///
+/// The periodic tick is driven through this rather than an `NSTimer`. A
+/// timer added to the main run loop on iOS fired a handful of times and then
+/// went quiet for the rest of the run, in every configuration tried: a
+/// repeating timer, a one-shot re-armed from the callback, and registrations
+/// in `NSRunLoopCommonModes`, `NSDefaultRunLoopMode` and both at once. The
+/// tick is scheduled from `viewDidLoad`, before `UIApplicationMain` starts the
+/// run loop, and that is evidently where a run-loop timer stops being
+/// dependable on this host.
+///
+/// `performSelector:withObject:afterDelay:` schedules on the run loop too, but
+/// through a different mechanism (a dispatch timer on the main queue rather
+/// than a CFRunLoop source), and it is what UIKit itself uses for deferred
+/// work. Whatever the underlying reason, this one keeps firing - and the
+/// `corroFired:` the selector names is the same one the buttons and the old
+/// timer path used, so the callback plumbing is unchanged.
+@interface CorroIosTarget (CorroDelay)
+- (void)corroFireAfter:(NSTimeInterval)delay;
+@end
+
+@implementation CorroIosTarget (CorroDelay)
+- (void)corroFireAfter:(NSTimeInterval)delay {
+    [self performSelector:@selector(corroFired:)
+                 withObject:nil
+                 afterDelay:delay];
+}
+@end
+
 
 // ---------------------------------------------------------------------------
 // CorroIosPicker — the drop-down contract

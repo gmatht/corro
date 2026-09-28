@@ -2653,33 +2653,6 @@ mod tests {
     }
 
     #[test]
-    fn test_timer_run_loop_mode_is_the_nsrunloop_name() {
-        // `-addTimer:forMode:` takes an NSRunLoop *mode name* and does not
-        // validate it, so a timer registered under a name no run loop enters
-        // fires once (the add queues an initial fire) and then stops forever.
-        //
-        // The near-identical `kCFRunLoopCommonModes` is the CoreFoundation
-        // constant, a different namespace: it registers the timer under a
-        // mode nothing ever runs in. That bug stopped the iOS edit-script
-        // timer after a single fire, which left the sheet blank and made the
-        // screenshot check report "no cell text" - a symptom with no obvious
-        // link to a run-loop mode string.
-        //
-        // The mode is named in exactly one place, as a constant the send reads,
-        // so the assertion is on the constant rather than on a count of
-        // strings in the file: a count is satisfied equally well by the wrong
-        // spelling, which is the bug itself.
-        // Not the CoreFoundation constant: `-addTimer:forMode:` takes an
-        // NSRunLoop mode name and does not validate it, so a timer
-        // registered under a name no run loop enters never fires.
-        assert!(RUN_LOOP_MODES.contains(&"NSRunLoopCommonModes"));
-        assert!(RUN_LOOP_MODES.contains(&"NSDefaultRunLoopMode"));
-        for m in RUN_LOOP_MODES {
-            assert_ne!(*m, "kCFRunLoopCommonModes", "{m} is the CF constant");
-        }
-    }
-
-    #[test]
     fn test_stack_view_is_never_built_with_plain_init() {
         // A UIStackView sent plain `-init` raises
         // NSInternalInconsistencyException, which unwinds through the
@@ -2743,21 +2716,6 @@ mod tests {
 /// Split out so the liveness probe in [`add_periodic_tick`] uses the identical
 /// scheduling path - a probe taking a different route would prove nothing about
 /// the real timer.
-/// The run-loop mode the periodic-tick timers are registered in.
-///
-/// The `NSRunLoop` **mode name**, which is what `-addTimer:forMode:` takes.
-/// It is not `kCFRunLoopCommonModes`: that is the CoreFoundation constant, a
-/// different namespace that reads almost identically, and `addTimer:forMode:`
-/// does not validate the name it is given. A repeating timer registered under
-/// a mode no run loop enters fires exactly once - the add queues one fire -
-/// and then stops, which is a silent failure with a very distant symptom.
-///
-/// Named once so the tests can assert on the value rather than on a string
-/// occurring somewhere in the file (a count is satisfied just as well by the
-/// wrong spelling, which is the bug).
-#[cfg(target_os = "ios")]
-const RUN_LOOP_MODES: &[&str] = &["NSRunLoopCommonModes", "NSDefaultRunLoopMode"];
-
 #[cfg(target_os = "ios")]
 fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::core::Error> {
     if !crate::backends::apple::is_initialized() {
@@ -2788,9 +2746,6 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
         // than propagated: the tick is already gone (it returned true but
         // nothing is scheduled to call it again), and the honest report is a
         // log line, not a silent stop.
-        crate::backends::apple::log_apple(&format!(
-            "ios: re-arming the {ms_for_cb}ms one-shot"
-        ));
         if let Err(e) = arm_one_shot(ms_for_cb, id_for_cb.get()) {
             crate::backends::apple::log_apple(&format!(
                 "ios: could not re-arm the {ms_for_cb}ms tick: {e}"
@@ -2808,24 +2763,38 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
     Ok(())
 }
 
-/// Create and schedule ONE one-shot `NSTimer` that calls back into `callback_id`.
+/// Arm ONE delayed call to `callback_id`, `ms` from now, via the host's
+/// `corroFireAfter:`.
 ///
-/// Split out of [`schedule_timer`] because the tick re-arms itself: each fire
-/// calls this again for the next interval. The repeat is therefore a fact of
-/// our bookkeeping, not of the timer's internal state.
+/// The tick re-arms itself: each fire calls this again for the next interval,
+/// so the repeat is a fact of our bookkeeping rather than of a timer object's
+/// internal state.
+///
+/// # Why not an NSTimer
+///
+/// An `NSTimer` was the original design and it did not survive contact with
+/// this host. Every run-loop-timer shape tried fired a few times and then went
+/// quiet for the rest of the run: a repeating timer, a one-shot re-armed from
+/// inside its own callback, and registrations in `NSRunLoopCommonModes`,
+/// `NSDefaultRunLoopMode`, and both at once. They are all armed from
+/// `viewDidLoad`, before `UIApplicationMain` starts the run loop, and the
+/// per-tick log showed the last tick 240ms in with the first edit due at
+/// 400ms - so the sheet never gained a value and the screenshot check reported
+/// a blank workbook.
+///
+/// `performSelector:withObject:afterDelay:` schedules through the main queue
+/// rather than a CFRunLoop source, and keeps firing. Which of the two is at
+/// fault is not worth further runs to establish: this one works, and the
+/// `corroFired:` it names is the same trampoline the buttons use, so the
+/// callback plumbing is unchanged.
 #[cfg(target_os = "ios")]
 fn arm_one_shot(ms: u32, callback_id: u64) -> Result<(), crate::core::Error> {
-    use crate::backends::apple::{cls, own, selector};
+    use crate::backends::apple::{cls, own};
 
-    // `CorroIosTarget targetWithCallbackId:` - the host's trampoline class,
-    // which calls corro_ios_callback(id) -> dispatch_callback(id).
     let shim = cls("CorroIosTarget");
     if shim.is_null() {
-        crate::backends::apple::log_apple(
-            "ios: CorroIosTarget shim missing; periodic tick not scheduled",
-        );
         return Err(crate::core::Error::Backend(
-            "CorroIosTarget shim missing (cannot schedule a timer)".into(),
+            "CorroIosTarget shim missing (cannot schedule the tick)".into(),
         ));
     }
     let target =
@@ -2835,113 +2804,16 @@ fn arm_one_shot(ms: u32, callback_id: u64) -> Result<(), crate::core::Error> {
             "CorroIosTarget targetWithCallbackId: returned nil".into(),
         ));
     }
+    // Neither an NSTimer nor the delay scheduler retains its target, so this
+    // retain is what keeps the trampoline alive until it fires.
     let target = own(target);
 
-    let timer_cls = cls("NSTimer");
-    if timer_cls.is_null() {
-        return Err(crate::core::Error::Backend("NSTimer unavailable".into()));
-    }
-    let interval = (ms.max(1) as f64) / 1000.0;
-    unsafe {
-        // `+[NSTimer timerWithTimeInterval:target:selector:userInfo:repeats:]`
-        // then added to the MAIN run loop in NSRunLoopCommonModes.
-        //
-        // Deliberately NOT `scheduledTimerWithTimeInterval:...`: that adds the
-        // timer to the *current* run loop in the *default* mode, and it was
-        // observed to fire exactly once and then stop - a repeating timer in a
-        // mode the loop is not running in (UIKit switches modes, e.g. while a
-        // scroll is being tracked) simply never fires again. Naming
-        // NSRunLoopCommonModes covers the modes UIKit actually runs.
-        //
-        // id (*)(id, SEL, double, id, SEL, id, BOOL)
-        let send: unsafe extern "C" fn(
-            *mut std::os::raw::c_void,
-            *mut std::os::raw::c_void,
-            f64,
-            *mut std::os::raw::c_void,
-            *mut std::os::raw::c_void,
-            *mut std::os::raw::c_void,
-            bool,
-        ) -> *mut std::os::raw::c_void =
-            std::mem::transmute(crate::backends::apple::msg_shim());
-        // `repeats:NO`, and re-armed from Rust on every fire.
-        //
-        // A repeating NSTimer was the original design and it did not survive
-        // contact with this host: every timer fired exactly once and then went
-        // quiet for the rest of the run, which the per-tick log made visible
-        // (step 0/8 at 221, 227, 251, 276ms, then nothing for 56 seconds).
-        // Whether the `repeats:YES` flag survived the arm64 `objc_msgSend`
-        // cast or CFRunLoop was refusing the coalescing source, arming a
-        // one-shot and re-arming it ourselves does not depend on the answer:
-        // the repeat is a fact of our bookkeeping rather than of the timer's
-        // internal state, and it cannot be lost silently.
-        let timer = send(
-            timer_cls,
-            selector("timerWithTimeInterval:target:selector:userInfo:repeats:"),
-            interval,
-            target,
-            selector("corroFired:"),
-            std::ptr::null_mut(),
-            false,
-        );
-        if timer.is_null() {
-            return Err(crate::core::Error::Backend(
-                "timerWithTimeInterval: returned nil".into(),
-            ));
-        }
-        // Hold it: an unscheduled timer is not retained by anything yet.
-        let timer = own(timer);
-
-        // `[[NSRunLoop mainRunLoop] addTimer:forMode:]`
-        let run_loop_cls = cls("NSRunLoop");
-        if run_loop_cls.is_null() {
-            return Err(crate::core::Error::Backend("NSRunLoop unavailable".into()));
-        }
-        let main_loop = crate::backends::apple::msg0(run_loop_cls, "mainRunLoop");
-        if main_loop.is_null() {
-            return Err(crate::core::Error::Backend("mainRunLoop returned nil".into()));
-        }
-        // void (*)(id, SEL, id, id)
-        let add: unsafe extern "C" fn(
-            *mut std::os::raw::c_void,
-            *mut std::os::raw::c_void,
-            *mut std::os::raw::c_void,
-            *mut std::os::raw::c_void,
-        ) = std::mem::transmute(crate::backends::apple::msg_shim());
-        //
-        // Registered in BOTH `NSRunLoopCommonModes` and `NSDefaultRunLoopMode`.
-        //
-        // A timer is only ever fired when the run loop is running in a mode
-        // the timer was registered for, and `-addTimer:forMode:` does not
-        // validate the mode name. `NSRunLoopCommonModes` is a *set* name: a
-        // timer added under it is meant to match any mode in the set, and it
-        // is the documented spelling - but with the timer's first real
-        // opportunity to fire arriving only after `UIApplicationMain` starts
-        // the loop, a single registration here produced a timer that was
-        // scheduled, logged as live, and then never fired at all.
-        //
-        // Registering in both is belt and braces at a cost of one message
-        // send: `NSDefaultRunLoopMode` is the mode UIKit's main run loop
-        // actually runs in, so it is the one that matters, and the common-modes
-        // entry is what keeps the timer valid when UIKit switches modes (a
-        // scroll being tracked, a gesture in progress). Duplicating an NSTimer
-        // across modes is exactly what `NSRunLoopCommonModes` exists to
-        // abstract over, and two entries cannot double-fire: CFRunLoop
-        // de-duplicates by (timer, mode) and a timer only fires when the loop
-        // is in a mode it matches.
-        for mode in RUN_LOOP_MODES {
-            add(
-                main_loop,
-                selector("addTimer:forMode:"),
-                timer,
-                crate::backends::apple::nsstring(mode),
-            );
-        }
-    }
+    // `corroFireAfter:` takes an NSTimeInterval, which is a `double` on every
+    // 64-bit Apple target - the same width `msg1cv` sends.
+    let delay_secs = (ms.max(1) as f64) / 1000.0;
+    unsafe { crate::backends::apple::msg1cv(target, "corroFireAfter:", delay_secs) };
     Ok(())
 }
-
-
 
 /// Schedule `f` to run every `ms` milliseconds on the main run loop, returning
 /// `false` from `f` to stop.
@@ -2980,13 +2852,17 @@ pub fn add_periodic_tick(
         250,
         Box::new(move || {
             let n = fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            // Every fire, unconditionally. This used to log only at 1, 4 and
-            // 20, which cannot distinguish "the timer stopped after one fire"
-            // from "it fired 3 times": there was no way to see the tail. A
-            // 250ms timer is ~4 lines/sec, so the log stays readable.
-            crate::backends::apple::log_apple(&format!(
-                "ios: periodic tick has fired {n} times (timer is live)"
-            ));
+            // First fire only. This used to log at 1, 4 and 20, which
+            // cannot distinguish "stopped after one fire" from "fired three
+            // times" - there was no tail to look at - and then logged on every
+            // fire, which is 4 lines a second forever. "Fired at least once"
+            // is the question the probe exists to answer, and one line answers
+            // it; a count that grows forever does not.
+            if n == 1 {
+                crate::backends::apple::log_apple(
+                    "ios: periodic tick fired (the timer is live)",
+                );
+            }
             true
         }),
     )
