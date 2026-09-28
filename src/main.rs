@@ -75,8 +75,10 @@ fn cli_option_suggestion(arg: &str) -> Option<&'static str> {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn determine_default_ui() -> UiKind { UiKind::Gui }
+// Deliberately NOT `target_arch = "wasm32"`: the wasm entry point builds an
+// App directly and never asks for a default UI, and `UiKind::Gui` is
+// `#[cfg(feature = "gui")]` -- a feature the wasm build (`--features wasm`)
+// does not enable, so an arm here would name a variant that does not exist.
 
 // Terminal-first: a compiled-in terminal UI is always the default; the GUI
 // is opt-in via an explicit --gui flag (see --help text). Without this,
@@ -364,6 +366,18 @@ fn win95_args() -> Vec<String> {
 // platform gates below; allow the lint's flow analysis across cfg'd-out
 // reader configurations instead of warning on each writer.
 #[allow(unused_assignments)]
+/// Parse the CLI's flags.
+///
+/// Gated with the rest of the CLI: the wasm entry point reads `argv[1]` as a
+/// single workbook path and never parses flags, and the body below resolves a
+/// `determine_default_ui` for the `--ui` choice, which has no wasm arm (its
+/// `UiKind::Gui` variant needs `feature = "gui"`, which `--features wasm` does
+/// not enable). Without the gate this compiled on wasm and failed to resolve
+/// that name.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(all(target_family = "rust9x", target_env = "msvc"))
+))]
 fn parse_args() -> Result<Args, String> {
     let mut revision = None;
     let mut export = None;
@@ -797,7 +811,7 @@ fn win9x_redirect_console_output() {
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    let mut app = if let Some(path) = std::env::args().nth(1) {
+    let app = if let Some(path) = std::env::args().nth(1) {
         let mut a = corro::gui::App::new_with_paths(vec![std::path::PathBuf::from(path)]);
         if let Err(e) = a.load_initial() {
             eprintln!("corro: load error: {e}");
@@ -828,6 +842,17 @@ fn main() {
     corro_main();
 }
 
+/// The CLI entry point's body.
+///
+/// Gated to match the `main` that calls it (above). Without this the wasm
+/// build compiled the whole CLI as dead code and then failed on `try_main`
+/// -- itself `#[cfg(not(target_arch = "wasm32"))]`, because the wasm entry
+/// point never parses argv the same way -- and on `UiKind::Gui`, which is
+/// `#[cfg(feature = "gui")]` and so does not exist under `--features wasm`.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(all(target_family = "rust9x", target_env = "msvc"))
+))]
 fn corro_main() {
     // Log every panic to a file as well as stderr: release profiles use
     // panic="abort" (silent death, no message), and GUI launches often

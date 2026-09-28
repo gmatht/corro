@@ -64,7 +64,13 @@ pub mod android_backend;
 // menu definition — `examples/ios_ui.rs` prints that model on a desktop, and
 // `--features gui-mobile` is checked on Linux CI, so compiling the module
 // everywhere is what keeps those honest.
-#[cfg(any(feature = "gui", feature = "gui-core", feature = "gui-mobile", feature = "gui-macos"))]
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-core",
+    feature = "gui-mobile",
+    feature = "gui-macos",
+    feature = "wasm"
+))]
 pub mod ios_backend;
 /// macOS backend: the `extern "C"` entry point + bootstrap for the AppKit
 /// adapter (see `rustxWidgets/docs/MACOS_GUIDELINES.md`).

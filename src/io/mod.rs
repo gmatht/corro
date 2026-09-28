@@ -13,6 +13,12 @@ use crate::ops::{
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
 use notify::{RecursiveMode, Watcher};
 use std::fs;
+// `Read`/`Seek`/`SeekFrom` are only used by the notify-backed `LogWatcher`,
+// which is compiled out on wasm (the `#[cfg(target_arch = "wasm32")]` polling
+// arm below replaces it). Gating the import with the watcher keeps the wasm
+// build warning-free without `#[allow(unused_imports)]`, which would also
+// hide a genuinely-unused import on the platforms that do compile it.
+#[cfg(any(not(target_arch = "wasm32"), target_os = "ios"))]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]

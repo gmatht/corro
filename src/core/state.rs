@@ -757,6 +757,15 @@ impl CoreApp {
                 }
                 Err(e) => {
                     // Cross-device: copy + rename.
+                    //
+                    // `libc` is excluded on wasm (Cargo.toml:139), so the
+                    // errno constant is not nameable there. This is the right
+                    // shape for the whole branch: a browser has no
+                    // cross-device rename because it has no devices, and the
+                    // `std::fs` call above it already failed with an error
+                    // this code is reporting, so there is nothing to recover
+                    // on that platform.
+                    #[cfg(not(target_arch = "wasm32"))]
                     if e.raw_os_error() == Some(libc::EXDEV) {
                         let tmp = crate::io::temp_sibling_path(path.parent(), &path);
                         std::fs::copy(&cur, &tmp)
@@ -783,6 +792,15 @@ impl CoreApp {
                         return Ok(());
                     }
                     // Other errors fall through to serialize.
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        // A browser cannot rename, copy or stat, so there is
+                        // no recovery to attempt and the `std::fs` error
+                        // already carries the whole explanation. Falling
+                        // through to the serialize path below would produce
+                        // a second, more confusing failure.
+                        return Err(format!("save: {e}"));
+                    }
                 }
             }
         }

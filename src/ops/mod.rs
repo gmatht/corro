@@ -2858,6 +2858,7 @@ pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
         // On WASM there is no real filesystem. Store the line in a JS global
         // variable so the browser test framework can read it after the app
         // quits and verify the recording replay output.
+        let _ = path;
         rswidgets::backends_wasm_adapter::append_wasm_output_line(line);
         eprintln!("CORRO_WASM_OUTPUT: {}", line);
         return Ok(());
