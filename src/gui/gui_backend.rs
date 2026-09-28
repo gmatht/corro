@@ -5595,9 +5595,12 @@ unsafe fn probe95(hwnd: *mut std::os::raw::c_void, tag: [u8; 5]) {
         fn GetWindowRect(h: *mut c_void, r: *mut [i32; 4]) -> i32;
         fn IsWindowVisible(h: *mut c_void) -> i32;
         fn GetWindowTextLengthA(h: *mut c_void) -> i32;
+        // TEMPORARY ReactOS diagnosis: the window's own style, so WS_VISIBLE
+        // (0x10000000) and WS_CHILD (0x40000000) can be read directly.
+        fn GetWindowLongA(h: *mut c_void, i: i32) -> i32;
     }
     let hx = b"0123456789abcdef";
-    let mut msg = [0u8; 110];
+    let mut msg = [0u8; 160];
     let mut p = 0;
     for i in 0..5 { msg[p] = tag[i]; p += 1; }
     msg[p] = b' '; p += 1;
@@ -5615,6 +5618,13 @@ unsafe fn probe95(hwnd: *mut std::os::raw::c_void, tag: [u8; 5]) {
     msg[p] = b' '; p += 1;
     msg[p] = if IsWindowVisible(hwnd) != 0 { b'V' } else { b'h' }; p += 1;
     msg[p] = b' '; p += 1;
+    {
+        let style = GetWindowLongA(hwnd, -16); // GWL_STYLE
+        for sh in [28u32, 24, 20, 16, 12, 8, 4, 0] {
+            msg[p] = hx[((style as u32 >> sh) & 0xf) as usize]; p += 1;
+        }
+        msg[p] = b' '; p += 1;
+    }
     let mut r = [0i32; 4];
     GetWindowRect(hwnd, &mut r);
     for v in [r[0], r[1], r[2], r[3]] {
@@ -6461,6 +6471,7 @@ pub fn run_gui_with_movie(
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe {
         probe95(win.hwnd(), *b"main ");
+        probe95(*scrolled.as_ref(), *b"scrol");
         probe95(*formula_entry.inner.as_ref(), *b"entry");
         probe95(*canvas.inner.as_ref(), *b"canv ");
         probe95(*addr_label.inner.as_ref(), *b"label");

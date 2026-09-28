@@ -13,16 +13,63 @@ mod nwg_adapter {
 
     fn set_window_pos(hwnd: *mut c_void, x: i32, y: i32, w: i32, h: i32) {
         unsafe {
-            // Do NOT pass SWP_SHOWWINDOW. ReactOS re-shows a shown child
-            // anyway, but for a window with a real frame (the scrolled
-            // grid's NWG Frame) the show makes ReactOS run its full
-            // WM_WINDOWPOSCHANGING / NCCALCSIZE / size-restore cycle, which
-            // recurses back into the frame proc and never returns - the
-            // layout pass then wedges inside this one SetWindowPos and the
-            // window is never painted. The child is already visible (its
-            // box called ShowWindow(SW_SHOW) when it was built), so the
-            // show is redundant. Positioning with SWP_NOZORDER only is the
-            // Win32-correct way to move a visible window.
+            // Show the child explicitly. ReactOS drops the WS_VISIBLE that
+            // SetWindowPos(SWP_SHOWWINDOW) sets on a child of a window that is
+            // itself still being shown, so a child laid out during the setup
+            // cascade ends up hidden forever: IsWindowVisible stays false, it
+            // never receives WM_PAINT, and the grid canvas never paints
+            // (probe95 reported the scrolled frame and the canvas as 'h' with
+            // otherwise-correct geometry). An explicit ShowWindow is honoured
+            // at any depth, so show first and then position without the flag.
+            winapi::um::winuser::ShowWindow(
+                hwnd as winapi::shared::windef::HWND,
+                winapi::um::winuser::SW_SHOW,
+            );
+            // TEMPORARY ReactOS diagnosis: ShowWindow did not set WS_VISIBLE?
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            {
+                let style = winapi::um::winuser::GetWindowLongW(
+                    hwnd as _, winapi::um::winuser::GWL_STYLE,
+                ) as i32;
+                mark95xy(
+                    b"wsviz",
+                    if style & winapi::um::winuser::WS_VISIBLE as i32 != 0 {
+                        1
+                    } else {
+                        0
+                    },
+                    style,
+                );
+            }
+            // Bring the child to the top of its siblings. A child laid out
+            // into a container that is itself being shown can end up BEHIND an
+            // older sibling on ReactOS, and a window behind something else
+            // still gets its WM_PAINT (so the draw callback runs and the log
+            // shows healthy paints) while none of its pixels reach the
+            // screen - the grid renders and the canvas stays white.
+            winapi::um::winuser::SetWindowPos(
+                hwnd as winapi::shared::windef::HWND,
+                winapi::um::winuser::HWND_TOP,
+                0, 0, 0, 0,
+                winapi::um::winuser::SWP_NOMOVE
+                    | winapi::um::winuser::SWP_NOSIZE
+                    | winapi::um::winuser::SWP_NOACTIVATE,
+            );
+            // TEMPORARY ReactOS diagnosis: was the child visible right after
+            // the explicit ShowWindow? (class, parent visible, self visible)
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            {
+                let selfv =
+                    winapi::um::winuser::IsWindowVisible(hwnd as _) as i32;
+                let pwnd =
+                    winapi::um::winuser::GetParent(hwnd as _) as *mut c_void;
+                let selv = if pwnd.is_null() {
+                    -1
+                } else {
+                    winapi::um::winuser::IsWindowVisible(pwnd as _) as i32
+                };
+                mark95xy(b"showv", selfv, selv);
+            }
             winapi::um::winuser::SetWindowPos(
                 hwnd as winapi::shared::windef::HWND,
                 std::ptr::null_mut(), x, y, w, h,
@@ -1220,17 +1267,32 @@ mod nwg_adapter {
             };
             let mut desired_sizes: Vec<i32> = Vec::with_capacity(n);
             // Children that were deliberately hidden (set_visible(false)).
-            // `set_window_pos` below passes SWP_SHOWWINDOW for every child,
-            // so a hidden child would be resurrected by the very layout pass
-            // that is meant to honour the hide. Remember them and re-hide
-            // after positioning.
+            // `set_window_pos` below shows every child, so a hidden child
+            // would be resurrected by the very layout pass that is meant to
+            // honour the hide. Remember them and re-hide after positioning.
+            // A child is "deliberately hidden" only if its OWN WS_VISIBLE bit
+            // is clear - see the note on the test below.
             let mut hidden_children: Vec<*mut c_void> = Vec::new();
             for i in 0..n {
                 // Hidden children take no space (e.g. the sheet tab strip
                 // with a single sheet): hiding alone would otherwise leave
                 // a blank gap in the layout.
+                //
+                // Test the child's OWN WS_VISIBLE style bit, never
+                // IsWindowVisible: that call is *recursive*, so a child whose
+                // toplevel is not mapped yet reports invisible. Every child
+                // was then misfiled as "deliberately hidden" and the
+                // re-hide pass below hid the whole tree for good - the grid
+                // canvas stayed invisible forever and never received a
+                // single WM_PAINT (probe95 showed the scrolled frame and the
+                // canvas as 'h' with correct geometry). WS_VISIBLE is
+                // per-window, so it reports exactly what set_visible(false)
+                // did.
                 let hidden = unsafe {
-                    winapi::um::winuser::IsWindowVisible(children[i] as _) == 0
+                    let style = winapi::um::winuser::GetWindowLongW(
+                        children[i] as _, winapi::um::winuser::GWL_STYLE,
+                    ) as i32;
+                    style & winapi::um::winuser::WS_VISIBLE as i32 == 0
                 };
                 if hidden {
                     desired_sizes.push(0);
@@ -3093,6 +3155,9 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                     &nwg::ControlHandle::Hwnd(raw_hwnd), pid,
                     move |_h, msg, _w, _l| {
                         if msg != winapi::um::winuser::WM_PAINT { return None; }
+                        // TEMPORARY ReactOS diagnosis: canvas WM_PAINT entry.
+                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                        { mark95a(b"cvpaint\n"); }
                         if *paint_flag.borrow() { return Some(0); }
                         *paint_flag.borrow_mut() = true;
                         unsafe {
@@ -3102,10 +3167,28 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                             winapi::um::winuser::GetClientRect(hwnd as _, &mut rect);
                             let w = rect.right;
                             let h = rect.bottom;
+                            // TEMPORARY ReactOS diagnosis: the canvas size the
+                            // paint actually ran at.
+                            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                            mark95xy(b"cvsz ", w, h);
                             if w > 0 && h > 0 {
                                 let mem_dc = winapi::um::wingdi::CreateCompatibleDC(hdc);
+                                // TEMPORARY ReactOS diagnosis: did GDI give us a
+                                // usable memory DC and a non-null bitmap?
+                                #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                                mark95xy(
+                                    b"gdidc",
+                                    if mem_dc.is_null() { 0 } else { 1 },
+                                    hdc as i32,
+                                );
                                 if !mem_dc.is_null() {
                                     let bmp = winapi::um::wingdi::CreateCompatibleBitmap(hdc, w, h);
+                                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                                    mark95xy(
+                                        b"gdibm",
+                                        if bmp.is_null() { 0 } else { 1 },
+                                        w,
+                                    );
                                     if !bmp.is_null() {
                                         let old = winapi::um::wingdi::SelectObject(mem_dc, bmp as _);
                                         // Paint the buffer with a neutral
@@ -3118,7 +3201,11 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                                         // would BitBlt that garbage onto the
                                         // window as a black band.
                                         {
-                                            let color = winapi::um::wingdi::RGB(240, 240, 240);
+                                            // TEMPORARY ReactOS diagnosis: paint the
+                                            // buffer bright RED so it is obvious on
+                                            // a screenshot whether this canvas's
+                                            // pixels reach the screen at all.
+                                            let color = winapi::um::wingdi::RGB(255, 0, 0);
                                             let brush = winapi::um::wingdi::CreateSolidBrush(color);
                                             if !brush.is_null() {
                                                 let mut rect = winapi::shared::windef::RECT {
@@ -3128,11 +3215,55 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                                                 winapi::um::wingdi::DeleteObject(brush as _);
                                             }
                                         }
+                                        // TEMPORARY ReactOS diagnosis: did the
+                                        // paint find a registered draw callback?
+                                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                                        {
+                                            mark95xy(
+                                                b"hascb",
+                                                if cb.borrow().is_some() { 1 } else { 0 },
+                                                0,
+                                            );
+                                        }
                                         if let Some(ref mut draw_fn) = *cb.borrow_mut() {
                                             let mut ctx = NwgDrawContext { hdc: mem_dc, w, h };
                                             draw_fn(&mut ctx, w, h);
                                         }
-                                        winapi::um::wingdi::BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, winapi::um::wingdi::SRCCOPY);
+                                        // TEMPORARY ReactOS diagnosis: BitBlt the
+                                        // buffer onto the window.
+                                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                                        {
+                                            let r = winapi::um::wingdi::BitBlt(
+                                                hdc, 0, 0, w, h, mem_dc, 0, 0,
+                                                winapi::um::wingdi::SRCCOPY,
+                                            );
+                                            extern "system" {
+                                                fn GetLastError() -> u32;
+                                            }
+                                            mark95xy(
+                                                b"blt  ",
+                                                r,
+                                                GetLastError() as i32,
+                                            );
+                                        }
+                                        // BitBlt returns NONZERO on success, so
+                                        // this is just the mark; the copy itself
+                                        // is the plain SRCCopy below.
+                                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                                        {
+                                            extern "system" {
+                                                fn GetLastError() -> u32;
+                                            }
+                                            let r = winapi::um::wingdi::BitBlt(
+                                                hdc, 0, 0, w, h, mem_dc, 0, 0,
+                                                winapi::um::wingdi::SRCCOPY,
+                                            );
+                                            mark95xy(b"blt  ", r, GetLastError() as i32);
+                                        }
+                                        winapi::um::wingdi::BitBlt(
+                                            hdc, 0, 0, w, h, mem_dc, 0, 0,
+                                            winapi::um::wingdi::SRCCOPY,
+                                        );
                                         winapi::um::wingdi::SelectObject(mem_dc, old);
                                         winapi::um::wingdi::DeleteObject(bmp as _);
                                     }
@@ -3338,6 +3469,9 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                     winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
                 );
             }
+            // TEMPORARY ReactOS diagnosis: scrolled.set_child showed the child.
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            { mark95xy(b"setc ", 1, ptr as i32); }
             *self.child.borrow_mut() = Some(ptr);
             // Size the child to the frame's client area on the next WM_SIZE.
             // (Scroll ranges are driven by the host via scroll_to; the child
@@ -3432,6 +3566,36 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
 
         let mut handlers: Vec<nwg::RawEventHandler> = Vec::new();
 
+        // Claim WM_ERASEBKGND on the frame. The frame is the canvas's PARENT
+        // and paints over the same pixels the canvas occupies, and this frame
+        // has no background of its own - so on a repaint ReactOS erased the
+        // frame (and with it the freshly drawn grid) before the canvas could
+        // be composited. The canvas already refuses to erase; the frame must
+        // too, or the erase lands on top of the grid and the sheet comes out
+        // blank white even though the draw callback ran.
+        if hwnd != std::ptr::null_mut() {
+            static SCROLLED_ERASE_ID: AtomicUsize = AtomicUsize::new(0xA0000000);
+            let eid = SCROLLED_ERASE_ID.fetch_add(1, Ordering::SeqCst);
+            if let Some(h) = nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd as _), eid,
+                move |_h, msg, _w, _l| {
+                    // TEMPORARY ReactOS diagnosis: which messages the scrolled
+                    // frame actually sees, in order, so an overpaint after the
+                    // canvas is visible in the trace.
+                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                    {
+                        use std::sync::atomic::{AtomicU32, Ordering};
+                        static SEEN: AtomicU32 = AtomicU32::new(0);
+                        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+                        if n < 24 {
+                            mark95xy(b"fmsg ", msg as i32, n as i32);
+                        }
+                    }
+                    if msg == winapi::um::winuser::WM_ERASEBKGND { Some(1) } else { None }
+                },
+            ).ok() { handlers.push(h); }
+        }
+
         // WM_SIZE on frame to reposition scrollbars and update range
         if hwnd != std::ptr::null_mut() {
             let vscroll_sz = vscroll.clone();
@@ -3504,10 +3668,19 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                                 0, 0, (w - scroll_w).max(0), (h - scroll_h).max(0),
                                 winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_SHOWWINDOW,
                             );
+                            // TEMPORARY ReactOS diagnosis: does a direct
+                            // invalidate of the canvas produce a WM_PAINT?
+                            winapi::um::winuser::RedrawWindow(
+                                child_ptr as _, std::ptr::null_mut(), std::ptr::null_mut(),
+                                winapi::um::winuser::RDW_INVALIDATE
+                                    | winapi::um::winuser::RDW_UPDATENOW
+                                    | winapi::um::winuser::RDW_ERASE,
+                            );
                         }
                     }
                     // TEMPORARY ReactOS diagnosis: scrolled frame WM_SIZE exit.
                     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
                     { mark95a(b"scsz-out\n"); }
                     None
                 },
