@@ -246,3 +246,18 @@ pub extern "system" fn Java_com_corro_MenuStrip_nativeMenuAction(
     let action: String = action.into();
     corro::gui::android_backend::run_menu_action_by_name(&action);
 }
+
+/// Called from `CorroTimer.run` (a `Handler.postDelayed` callback): runs the
+/// timer Rust registered under `timer_id` and re-posts it if it repeats.
+///
+/// This is the Android counterpart of GTK's `g_timeout_add` and NWG's message
+/// timers, which the same `rswidgets::core::add_periodic_tick` drives on the
+/// desktop backends.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_CorroTimer_nativeFire(
+    _env: JNIEnv,
+    _class: JClass,
+    timer_id: i64,
+) {
+    rswidgets::backends::android::dispatch_timeout(timer_id as u64);
+}

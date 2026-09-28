@@ -1,6 +1,6 @@
 #[cfg(target_os = "android")]
 mod android_backend {
-    use jni::objects::{GlobalRef, JObject};
+    use jni::objects::{GlobalRef, JObject, JString};
     use jni::JNIEnv;
     use once_cell::sync::OnceCell;
     use once_cell::sync::Lazy;
@@ -821,6 +821,367 @@ mod android_backend {
                 &[(&child).into(), 0i32.into(), (&params).into()],
             )?;
             Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    /// Call a no-argument `void` method on a view handle, swallowing failure.
+    ///
+    /// The raw `jobject` handles are kept alive by [`KEEP_ALIVE`], and the
+    /// JVM is attached by [`with_env_and_activity`], so reconstructing the
+    /// `JObject` for the duration of one call is the pattern every method
+    /// here uses. This is the short form of it, for the many
+    /// `setSomething(boolean)` / `setSomething(int)` view properties that
+    /// have no business being a dozen lines of JNI each.
+    fn call_view_method(
+        view_ptr: *mut std::os::raw::c_void,
+        name: &str,
+        sig: &str,
+        args: &[jni::objects::JValue<'_, '_>],
+    ) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        if view_ptr.is_null() {
+            return Ok(());
+        }
+        with_env_and_activity(|env, _activity| {
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            env.call_method(&view, name, sig, args)?;
+            Ok(())
+        })
+    }
+
+    /// `View.setVisibility`, with `visible` mapped to the platform constants
+    /// (`VISIBLE`/`INVISIBLE`/`GONE`). Used by every `set_visible`, so the
+    /// choice of `INVISIBLE` over `GONE` is made in one place.
+    pub fn set_view_visible(view_ptr: *mut std::os::raw::c_void, visible: bool) {
+        // View.VISIBLE = 0, View.INVISIBLE = 4.
+        let _ = call_view_method(
+            view_ptr,
+            "setVisibility",
+            "(I)V",
+            &[if visible { 0i32.into() } else { 4i32.into() }],
+        );
+    }
+
+    /// `View.setMinimumWidth` / `setMinimumHeight`, clamped the way GTK
+    /// clamps a `-1` size request back to the natural size. A caller asking
+    /// for "no minimum" passes a negative value, which is a no-op here rather
+    /// than a minimum of `-1` pixels.
+    pub fn set_view_min_size(view_ptr: *mut std::os::raw::c_void, w: i32, h: i32) {
+        if w > 0 {
+            let _ = call_view_method(
+                view_ptr,
+                "setMinimumWidth",
+                "(I)V",
+                &[w.into()],
+            );
+        }
+        if h > 0 {
+            let _ = call_view_method(
+                view_ptr,
+                "setMinimumHeight",
+                "(I)V",
+                &[h.into()],
+            );
+        }
+    }
+
+    /// `View.setLayoutParams` with explicit width/height/weight, creating a
+    /// `LinearLayout.LayoutParams` first.
+    ///
+    /// `MATCH_PARENT = -1`, `WRAP_CONTENT = -2`, so the caller passes the raw
+    /// Android constants and this function only supplies the weight field,
+    /// which is what expansion means in a `LinearLayout`.
+    pub fn set_view_layout(
+        view_ptr: *mut std::os::raw::c_void,
+        width: i32,
+        height: i32,
+        weight: f32,
+    ) {
+        if view_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let params = env.new_object(
+                "android/widget/LinearLayout$LayoutParams",
+                "(IIF)V",
+                &[width.into(), height.into(), weight.into()],
+            )?;
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            env.call_method(
+                &view,
+                "setLayoutParams",
+                "(Landroid/view/ViewGroup$LayoutParams;)V",
+                &[(&params).into()],
+            )?;
+            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    /// `View.setPadding(left, top, right, bottom)`.
+    pub fn set_view_padding(
+        view_ptr: *mut std::os::raw::c_void,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    ) {
+        let _ = call_view_method(
+            view_ptr,
+            "setPadding",
+            "(IIII)V",
+            &[left.into(), top.into(), right.into(), bottom.into()],
+        );
+    }
+
+    /// `View.setFocusable` + `setFocusableInTouchMode`, then `requestFocus`.
+    ///
+    /// Both flags are needed: a `View` in a touch-mode activity is not
+    /// focusable by default, and a `requestFocus` on a view that is not
+    /// focusable in touch mode is a silent no-op — which is exactly the bug
+    /// that would make the formula bar unreachable by tapping it.
+    pub fn focus_view(view_ptr: *mut std::os::raw::c_void) {
+        let _ = call_view_method(view_ptr, "setFocusable", "(Z)V", &[true.into()]);
+        let _ = call_view_method(
+            view_ptr,
+            "setFocusableInTouchMode",
+            "(Z)V",
+            &[true.into()],
+        );
+        let _ = call_view_method(view_ptr, "requestFocus", "()Z", &[]);
+    }
+
+    /// `View.setGravity`, from a raw bitmask. The callers in the adapter
+    /// resolve the constant (`Gravity.START`, `CENTER`, ...) through JNI once.
+    pub fn set_view_gravity(view_ptr: *mut std::os::raw::c_void, gravity: i32) {
+        let _ = call_view_method(view_ptr, "setGravity", "(I)V", &[gravity.into()]);
+    }
+
+    /// Read a `TextView`-shaped string property (`getText().toString()`).
+    /// Shared by `Label::get_text` and the entry/buffer getters.
+    pub fn get_view_text(view_ptr: *mut std::os::raw::c_void) -> Option<String> {
+        if view_ptr.is_null() {
+            return None;
+        }
+        with_env_and_activity(|env, _activity| {
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            let value = env.call_method(&view, "getText", "()Ljava/lang/CharSequence;", &[])?;
+            let obj = value.l()?;
+            let obj = unsafe { jni::objects::JObject::from_raw(obj.as_raw()) };
+            let jstr: JString = JString::from(obj);
+            let text: String = env.get_string(&jstr)?.into();
+            Ok(text)
+        })
+        .ok()
+    }
+
+    /// `View.setTextSize(complexSizeP)` with a sp size, so a label's font
+    /// scales with the user's font-size preference instead of being pinned in
+    /// pixels. `sp` is the size in scale-independent pixels.
+    pub fn set_view_text_size_sp(view_ptr: *mut std::os::raw::c_void, sp: f32) {
+        let _ = call_view_method(view_ptr, "setTextSize", "(F)V", &[sp.into()]);
+    }
+
+    /// `View.setTypeface(android.graphics.Typeface, int style)`.
+    ///
+    /// `style` is `Typeface.NORMAL` (0) or `Typeface.BOLD` (1), which is
+    /// also what GTK's `set_font_style(PANGO_STYLE_*)` and NWG's
+    /// `set_font_style` mean. The style constants are stable ints, so they
+    /// are named here rather than resolved through a JNI static lookup on
+    /// every call.
+    pub fn set_view_typeface(view_ptr: *mut std::os::raw::c_void, bold: bool) {
+        if view_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let typeface_cls = env.find_class("android/graphics/Typeface")?;
+            let typeface = env
+                .get_static_field(&typeface_cls, "DEFAULT", "Landroid/graphics/Typeface;")?
+                .l()?;
+            let typeface = unsafe { jni::objects::JObject::from_raw(typeface.as_raw()) };
+            // Typeface.create(Typeface, int style) -> Typeface
+            let styled = env
+                .call_static_method(
+                    &typeface_cls,
+                    "create",
+                    "(Landroid/graphics/Typeface;I)Landroid/graphics/Typeface;",
+                    &[(&typeface).into(), if bold { 1i32 } else { 0i32 }.into()],
+                )?
+                .l()?;
+            let styled = unsafe { jni::objects::JObject::from_raw(styled.as_raw()) };
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            env.call_method(
+                &view,
+                "setTypeface",
+                "(Landroid/graphics/Typeface;)V",
+                &[(&styled).into()],
+            )?;
+            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    /// `View.getContext()` -> `Context`, as a local ref for the caller.
+    /// Used where a new object needs the Activity context but the caller
+    /// already holds a view handle (dialogs, popups).
+    pub fn with_view_context<F, T>(view_ptr: *mut std::os::raw::c_void, f: F) -> Option<T>
+    where
+        F: FnOnce(&mut JNIEnv<'_>, &JObject<'_>) -> T,
+    {
+        if view_ptr.is_null() {
+            return None;
+        }
+        with_env_and_activity(|env, _activity| {
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            let ctx = env
+                .call_method(&view, "getContext", "()Landroid/content/Context;", &[])?
+                .l()?;
+            let ctx = unsafe { jni::objects::JObject::from_raw(ctx.as_raw()) };
+            Ok(f(env, &ctx))
+        })
+        .ok()
+    }
+
+    /// `Handler.postDelayed` timers, the Android counterpart of GTK's
+    /// `timeout_add` and NWG's message timers.
+    ///
+    /// There is no event loop to run a source on, so a timer is a
+    /// `Handler` posting a `Runnable`. The `Runnable` is the host's
+    /// `com.corro.RustCallback`-shaped class resolved through the app
+    /// ClassLoader and handed the timer id; it calls back into
+    /// [`dispatch_timeout`]. A repeating timer re-posts itself there, which
+    /// is why `repeat` lives in the registry rather than in Java.
+    ///
+    /// Each timer also holds a `Runnable` handle so [`cancel_timeout`] can
+    /// `removeCallbacks` it: `removeCallbacksAndMessages` on a token is the
+    /// only way to cancel one repeating post without cancelling the others.
+    static TIMERS: Lazy<Mutex<HashMap<u64, TimerEntry>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+    static NEXT_TIMER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    struct TimerEntry {
+        delay_ms: u32,
+        f: extern "C" fn(),
+        repeat: bool,
+    }
+
+    /// Create (or look up) the host's runnable class. `com.corro.CorroTimer`
+    /// takes the timer id as its only constructor argument, exactly like
+    /// `RustCallback`; a host that does not ship one gets a silent no-op
+    /// timer, so the rest of the UI still builds.
+    fn timer_runnable<'a>(
+        env: &mut JNIEnv<'a>,
+        id: u64,
+    ) -> Result<JObject<'a>, Box<dyn StdError + Send + Sync>> {
+        let cls = match load_app_class(env, "com.corro.CorroTimer") {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = env.exception_clear();
+                return Err("com.corro.CorroTimer not found".into());
+            }
+        };
+        Ok(env.new_object(&cls, "(J)V", &[(id as i64).into()])?.into())
+    }
+
+    /// Register a timer and post its first run. Returns the timer id, or 0
+    /// when the host supplies no timer runnable class.
+    pub fn schedule_timeout(
+        delay_ms: u32,
+        f: extern "C" fn(),
+        repeat: bool,
+    ) -> u64 {
+        let Ok((id, runnable)) = with_env_and_activity(|env, activity| {
+            let id = NEXT_TIMER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TIMERS.lock().unwrap().insert(
+                id,
+                TimerEntry {
+                    delay_ms,
+                    f,
+                    repeat,
+                },
+            );
+            let runnable = timer_runnable(env, id)?;
+            // Handler() uses the creating thread's Looper. The UI thread is
+            // the one that built the widget tree, so this is the UI looper.
+            let handler = env.new_object("android/os/Handler", "()V", &[])?;
+            let posted = env.call_method(
+                &handler,
+                "postDelayed",
+                "(Ljava/lang/Runnable;J)Z",
+                &[(&runnable).into(), (delay_ms as i64).into()],
+            )?;
+            // Keep the Handler reachable for cancellation; without it the
+            // only handle on the post is the id.
+            HANDLERS.lock().unwrap().insert(id, env.new_global_ref(&handler)?);
+            let _ = activity;
+            Ok((id, posted.i()?))
+        }) else {
+            return 0;
+        };
+        if runnable == 0 {
+            TIMERS.lock().unwrap().remove(&id);
+            HANDLERS.lock().unwrap().remove(&id);
+            return 0;
+        }
+        logcat_rs(&format!("timer {id} armed ({delay_ms}ms, repeat={repeat})"));
+        id
+    }
+
+    /// Timer `Runnable` -> Handler, for `cancel_timeout`.
+    static HANDLERS: Lazy<Mutex<HashMap<u64, GlobalRef>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+    /// Cancel a timer and free its `Handler`. Safe to call twice.
+    pub fn cancel_timeout(id: u64) {
+        let Some(handler) = HANDLERS.lock().unwrap().remove(&id) else {
+            return;
+        };
+        let _ = with_env_and_activity(|env, _activity| {
+            // postAtTime with no runnable is the documented way to drop a
+            // single pending post without touching the rest of the queue.
+            env.call_method(
+                handler.as_obj(),
+                "removeCallbacks",
+                "(Ljava/lang/Runnable;)V",
+                &[],
+            )?;
+            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
+        TIMERS.lock().unwrap().remove(&id);
+    }
+
+    /// Called from the host's timer `Runnable` (on the UI thread). Runs the
+    /// registered function and re-posts a repeating timer.
+    ///
+    /// The entry is taken out of the map *before* the call so a function
+    /// that cancels itself does not deadlock on the registry, and so a
+    /// function that re-arms registers a fresh id rather than racing the
+    /// re-post below.
+    pub fn dispatch_timeout(id: u64) {
+        let Some(entry) = TIMERS.lock().unwrap().remove(&id) else {
+            return;
+        };
+        (entry.f)();
+        if !entry.repeat {
+            HANDLERS.lock().unwrap().remove(&id);
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let runnable = timer_runnable(env, id)?;
+            let Some(handler) = HANDLERS.lock().unwrap().get(&id).cloned() else {
+                let _ = env.exception_clear();
+                return Ok(());
+            };
+            env.call_method(
+                handler.as_obj(),
+                "postDelayed",
+                "(Ljava/lang/Runnable;J)Z",
+                &[(&runnable).into(), (entry.delay_ms as i64).into()],
+            )?;
+            TIMERS.lock().unwrap().insert(
+                id,
+                TimerEntry {
+                    delay_ms: entry.delay_ms,
+                    f: entry.f,
+                    repeat: true,
+                },
+            );
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
         });
     }
 

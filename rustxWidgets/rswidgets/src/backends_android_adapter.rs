@@ -84,9 +84,56 @@ mod android_adapter {
     }
 
     impl Window {
-        pub fn set_title(&self, _title: &str) {}
+        /// The Activity's title bar caption.
+        ///
+        /// Not a no-op like it was: on Android the window is the Activity, so
+        /// `setTitle` is the only way a caller can put a document name in the
+        /// system title (recents, the task switcher, a split-screen header).
+        /// A spreadsheet that silently refused to name its window also refused
+        /// to say which file was open in the Android recents list.
+        pub fn set_title(&self, title: &str) {
+            let _ = crate::backends::android::with_env_and_activity(|env, activity| {
+                let j_title = env.new_string(title)?;
+                env.call_method(
+                    activity.as_obj(),
+                    "setTitle",
+                    "(Ljava/lang/CharSequence;)V",
+                    &[(&j_title).into()],
+                )?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            });
+        }
 
-        pub fn set_default_size(&self, _w: i32, _h: i32) {}
+        /// Request `w`x`h` for the root layout, in device px.
+        ///
+        /// `WRAP_CONTENT` is deliberately *not* used: a `LinearLayout` that
+        /// wraps would let the sheet collapse to its minimal size, which is
+        /// the "small white patch in a field of grey" failure. MATCH_PARENT
+        /// in both axes with weight 1 makes the sheet fill the Activity, and
+        /// the explicit minimum keeps it from collapsing on a phone that
+        /// reports a transient zero during the first layout pass.
+        pub fn set_default_size(&self, w: i32, h: i32) {
+            let root = match crate::backends::android::root_layout() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let ptr = root.as_obj().as_raw() as *mut c_void;
+            let (w, h) = (w.max(1), h.max(1));
+            crate::backends::android::set_view_min_size(ptr, w, h);
+        }
+
+        /// Immediate resize.
+        ///
+        /// GTK needs this because `set_default_size` is advisory there (and
+        /// is ignored entirely with no window manager). Android needs it for
+        /// the same reason: the Activity's size is decided by the system
+        /// window manager and the device, and a caller that wants a different
+        /// one (a preview pane, a landscape-locked tool) cannot get it from a
+        /// *request*. The closest equivalent is asking the root layout for
+        /// those exact dimensions, which is what this does.
+        pub fn resize(&self, w: i32, h: i32) {
+            self.set_default_size(w, h);
+        }
 
         /// # Safety
         /// Kept for API compatibility with the GTK backend; no-op on Android.
@@ -122,11 +169,62 @@ mod android_adapter {
             self.set_child(bx);
         }
 
-        pub fn present(&self) {}
+        /// No-op, but no longer for the reason it used to be: the Activity is
+        /// already attached and visible by the time a widget tree is built
+        /// (`nativeInit` runs from `onCreate`), so there is nothing to
+        /// present. Android's analogue is `View.requestLayout`, which
+        /// [`Window::set_default_size`] already triggers.
+        pub fn present(&self) {
+            if let Ok(root) = crate::backends::android::root_layout() {
+                let ptr = root.as_obj().as_raw() as *mut c_void;
+                let _ = crate::backends::android::with_env_and_activity(|env, _activity| {
+                    let view =
+                        unsafe { jni::objects::JObject::from_raw(ptr as jni::sys::jobject) };
+                    env.call_method(&view, "requestLayout", "()V", &[])?;
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+                });
+            }
+        }
         pub fn queue_redraw(&self) {}
         pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
         pub fn on_event_key(&self, _cb: Box<dyn FnMut(u32, u32) -> i32>) {}
         pub fn on_close(&self, _cb: Box<dyn FnMut()>) {}
+    }
+
+    /// Leave the app: `Activity.finish()`, which unwinds this Activity and
+    /// shows whatever launched it. The module-level counterpart of GTK's
+    /// `gtk_main_quit` and NWG's event-loop stop.
+    ///
+    /// Best-effort: a host with no Activity (a unit test, a headless run) is
+    /// a no-op, matching every other Android adapter method.
+    pub fn quit_main_loop() {
+        let _ = crate::backends::android::with_env_and_activity(|env, activity| {
+            env.call_method(activity.as_obj(), "finish", "()V", &[])?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        });
+    }
+
+    /// `Handler.postDelayed` with a no-op runnable, returning the removal
+    /// token. This is the Android spelling of GTK's `timeout_add` and NWG's
+    /// message-timer, and it is the only timer available: there is no event
+    /// loop to run a source on.
+    ///
+    /// `fn_ptr` is a `extern "C" fn()` registered in [`crate::backends::android`]
+    /// and dispatched by id from a Java `Runnable`, so the closure keeps the
+    /// same lifetime story as every other callback in the adapter.
+    pub fn timeout_add_once(delay_ms: u32, fn_ptr: extern "C" fn()) -> u64 {
+        crate::backends::android::schedule_timeout(delay_ms, fn_ptr, false)
+    }
+
+    /// See [`timeout_add_once`]; repeats every `delay_ms` until
+    /// [`cancel_timeout`] or [`quit_main_loop`].
+    pub fn timeout_add_repeating(delay_ms: u32, fn_ptr: extern "C" fn()) -> u64 {
+        crate::backends::android::schedule_timeout(delay_ms, fn_ptr, true)
+    }
+
+    /// Cancel a timer from [`timeout_add_once`] / [`timeout_add_repeating`].
+    pub fn cancel_timeout(id: u64) {
+        crate::backends::android::cancel_timeout(id);
     }
 
     // ------------------------------------------------------------------
@@ -231,29 +329,136 @@ mod android_adapter {
         }
 
         pub fn get_text(&self) -> Option<String> {
-            let result = crate::backends::android::with_env_and_activity(|env, _activity| {
-                let tv = unsafe { jni::objects::JObject::from_raw(self.0 as jni::sys::jobject) };
-                let j_value = env.call_method(&tv, "getText", "()Ljava/lang/CharSequence;", &[])?;
-                let j_obj_ref = j_value.l()?;
-                let j_obj = unsafe { jni::objects::JObject::from_raw(j_obj_ref.as_raw()) };
-                let j_str = JString::from(j_obj);
-                let text: String = env.get_string(&j_str)?.into();
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(text)
-            });
-            result.ok()
+            crate::backends::android::get_view_text(self.0)
         }
 
         pub fn set_visible(&self, visible: bool) {
-            let _ = crate::backends::android::with_env_and_activity(|env, _activity| {
-                let tv = unsafe { jni::objects::JObject::from_raw(self.0 as jni::sys::jobject) };
-                let visibility = if visible { 0i32 } else { 8i32 };
-                env.call_method(&tv, "setVisibility", "(I)V", &[visibility.into()])?;
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-            });
+            crate::backends::android::set_view_visible(self.0, visible);
         }
 
         pub fn set_markup(&self, markup: &str) {
             self.set_text(markup);
+        }
+
+        /// Pin the label's measured width, in device px. `None` releases it.
+        ///
+        /// GTK's `set_size_request` and NWG's fixed-width label both answer
+        /// the same question: "keep this slot from reflowing when the text
+        /// changes". On Android a `TextView` in a `LinearLayout` reflows its
+        /// siblings when its text changes, so the same corruption appears.
+        /// The pin is a `LinearLayout.LayoutParams` width, which is what a
+        /// `WRAP_CONTENT` slot needs: the sibling positions stop moving
+        /// while the text still draws inside the pinned box.
+        pub fn set_fixed_width(&self, w: Option<i32>) {
+            match w {
+                Some(px) if px > 0 => {
+                    // WRAP_CONTENT height, fixed width, no weight: the label
+                    // keeps its box but never steals space from a sibling.
+                    crate::backends::android::set_view_layout(self.0, px, -2, 0.0);
+                }
+                _ => {
+                    // MATCH_PARENT would expand, so fall back to WRAP_CONTENT
+                    // for both axes: that is the unpinned behaviour.
+                    crate::backends::android::set_view_layout(self.0, -2, -2, 0.0);
+                }
+            }
+        }
+
+        /// Left margin of the label's contents, in device px.
+        ///
+        /// Pairs with [`Label::set_fixed_width`]: a pinned, left-aligned
+        /// label sits flush against its slot's edge, and this restores the
+        /// inset that a GTK `margin_start` provides. Implemented as padding
+        /// rather than a layout margin because that is what a pinned width
+        /// keeps constant — a layout margin would be inside the pinned box
+        /// only if the box is the one being measured.
+        pub fn set_margin_start(&self, px: i32) {
+            let left = px.max(0);
+            let _ = crate::backends::android::with_env_and_activity(|env, _activity| {
+                let tv = unsafe { jni::objects::JObject::from_raw(self.0 as jni::sys::jobject) };
+                let _cur = env
+                    .call_method(&tv, "getPaddingLeft", "()I", &[])?
+                    .i()?;
+                let cur_right = env
+                    .call_method(&tv, "getPaddingRight", "()I", &[])?
+                    .i()?;
+                env.call_method(
+                    &tv,
+                    "setPaddingRelative",
+                    "(IIII)V",
+                    &[left.into(), 0i32.into(), cur_right.into(), 0i32.into()],
+                )?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            });
+        }
+
+        /// Vertical outer spacing, in device px. Pairs with
+        /// [`Label::set_margin_start`]; see its note on padding vs margin.
+        pub fn set_margin_top(&self, px: i32) {
+            let top = px.max(0);
+            let _ = crate::backends::android::with_env_and_activity(|env, _activity| {
+                let tv = unsafe { jni::objects::JObject::from_raw(self.0 as jni::sys::jobject) };
+                let cur_left = env
+                    .call_method(&tv, "getPaddingLeft", "()I", &[])?
+                    .i()?;
+                let cur_bottom = env
+                    .call_method(&tv, "getPaddingBottom", "()I", &[])?
+                    .i()?;
+                env.call_method(
+                    &tv,
+                    "setPaddingRelative",
+                    "(IIII)V",
+                    &[cur_left.into(), top.into(), 0i32.into(), cur_bottom.into()],
+                )?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            });
+        }
+
+        /// Horizontal alignment of the text within the label's box, 0.0 left
+        /// .. 1.0 right.
+        ///
+        /// A `TextView`'s own gravity, not the layout's: a caller that pins
+        /// a width and then wants the text flush right asks for gravity, and
+        /// only gravity moves the glyphs inside the box.
+        pub fn set_xalign(&self, x: f32) {
+            let frac = x.clamp(0.0, 1.0);
+            let gravity = crate::backends::android::with_env_and_activity(|env, _activity| {
+                let g = env.get_static_field("android/view/Gravity", "START", "I")?.i()?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(g)
+            })
+            .unwrap_or(0x0080_0003); // Gravity.START
+            // Snap to the nearest of left/center/right, the way the platform
+            // spells horizontal gravity. `center_horizontal` is bit 0 of the
+            // horizontal axis; the caller never asked for vertical centring,
+            // so only the horizontal half of the constant changes.
+            let h = if frac < 0.25 {
+                gravity // START
+            } else if frac < 0.75 {
+                gravity | 0x1 // CENTER_HORIZONTAL
+            } else {
+                0x0080_0005 // Gravity.END
+            };
+            crate::backends::android::set_view_gravity(self.0, h);
+        }
+
+        /// Whether the label may take extra horizontal space. Android has no
+        /// expand flag; the request is recorded and honoured by
+        /// `BoxWidget::append` as `LinearLayout` weight, like `TextView`'s.
+        pub fn set_hexpand(&self, expand: bool) {
+            crate::backends::android::set_view_expanding(self.0, expand);
+        }
+
+        /// See [`Label::set_hexpand`]. Recorded and honoured as weight too:
+        /// `LinearLayout` has one weight field, so a view that expands in
+        /// either axis expands in both, which is what a vertical box wants.
+        pub fn set_vexpand(&self, expand: bool) {
+            crate::backends::android::set_view_expanding(self.0, expand);
+        }
+
+        /// Minimum width/height in device px. A negative value (GTK's "no
+        /// request") releases the minimum, matching GTK's `-1` convention.
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            crate::backends::android::set_view_min_size(self.0, w, h);
         }
 
         pub fn raw_handle(&self) -> *mut c_void {
