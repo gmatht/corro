@@ -383,6 +383,13 @@ impl TextInput {
         // unchanged client rect, recursing until the stack overflows.
         // Only re-assert the frame when the size actually changed.
         let last_size = std::cell::Cell::new((-1i32, -1i32));
+        // (Fix-ReactOS, part 2) Bound the frame re-assertions: ReactOS
+        // re-fires WM_SIZE from SetWindowPos(SWP_FRAMECHANGED) with a
+        // recomputed client rect that can differ slightly each pass, so
+        // the size guard alone never converges (see label.rs). A couple
+        // of passes settle a real layout; after that we stop re-asserting
+        // rather than livelock.
+        let reassigns = std::cell::Cell::new(0u32);
         let handler = bind_raw_event_handler_inner(&self.handle, 0, move |hwnd, msg, w, l| {
             match msg {
                 WM_NCCALCSIZE  => {
@@ -463,12 +470,26 @@ impl TextInput {
                     let now = ((size & 0xffff) as i32, ((size >> 16) & 0xffff) as i32);
                     if last_size.get() != now {
                         last_size.set(now);
+                        // (Fix-ReactOS) No frame re-assert on rust9x: the
+                        // WM_NCCALCSIZE body above is disabled on this
+                        // target, so the frame ReactOS already computed
+                        // is the one we want. Re-asserting it with
+                        // SetWindowPos(SWP_FRAMECHANGED) only makes
+                        // ReactOS re-run WM_NCCALCSIZE -> WM_GETFONT ->
+                        // WM_SIZE on this control, which re-enters this
+                        // handler; because the recomputed rect is not
+                        // perfectly idempotent the cycle never settles
+                        // and livelocks the UI thread inside present().
+                        // Other targets keep the bounded re-assert.
                         #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-                        crate::win32::window::mark95w(b"sz\n");
-                        SetWindowPos(hwnd, ptr::null_mut(), 0, 0, 0, 0, SWP_NOOWNERZORDER | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
-                    } else {
-                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-                        crate::win32::window::mark95w(b"sk\n");
+                        {
+                            reassigns.set(reassigns.get() + 1);
+                        }
+                        #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+                        if reassigns.get() < 2 {
+                            reassigns.set(reassigns.get() + 1);
+                            SetWindowPos(hwnd, ptr::null_mut(), 0, 0, 0, 0, SWP_NOOWNERZORDER | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
+                        }
                     }
                 },
                 _ => {}
