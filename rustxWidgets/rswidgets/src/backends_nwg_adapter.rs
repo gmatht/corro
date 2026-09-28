@@ -13,10 +13,20 @@ mod nwg_adapter {
 
     fn set_window_pos(hwnd: *mut c_void, x: i32, y: i32, w: i32, h: i32) {
         unsafe {
+            // Do NOT pass SWP_SHOWWINDOW. ReactOS re-shows a shown child
+            // anyway, but for a window with a real frame (the scrolled
+            // grid's NWG Frame) the show makes ReactOS run its full
+            // WM_WINDOWPOSCHANGING / NCCALCSIZE / size-restore cycle, which
+            // recurses back into the frame proc and never returns - the
+            // layout pass then wedges inside this one SetWindowPos and the
+            // window is never painted. The child is already visible (its
+            // box called ShowWindow(SW_SHOW) when it was built), so the
+            // show is redundant. Positioning with SWP_NOZORDER only is the
+            // Win32-correct way to move a visible window.
             winapi::um::winuser::SetWindowPos(
                 hwnd as winapi::shared::windef::HWND,
                 std::ptr::null_mut(), x, y, w, h,
-                winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_SHOWWINDOW,
+                winapi::um::winuser::SWP_NOZORDER,
             );
         }
     }
@@ -1294,6 +1304,17 @@ mod nwg_adapter {
                 crate::backends::nwg::Orientation::Horizontal => w - 10,
                 crate::backends::nwg::Orientation::Vertical => h - 10,
             };
+            // TEMPORARY ReactOS diagnosis: the per-child expand flags this box
+            // is about to distribute with (box id, then i, vex, hex).
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            {
+                let id = self.debug_id();
+                for i in 0..n {
+                    let packed = (i as i32) * 100 + (vex[i] as i32) * 10 + (hex[i] as i32);
+                    mark95xy(b"flags", id * 1000 + packed, desired_sizes[i]);
+                }
+            }
+
             // TEMPORARY ReactOS diagnosis: reached span distribution for
             // this box (id, avail, n children).
             #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
@@ -1367,7 +1388,20 @@ mod nwg_adapter {
                 // Hide it and leave its geometry alone; a later pass with a
                 // real span positions it normally.
                 if cw > 0 || ch > 0 {
+                    // TEMPORARY ReactOS diagnosis: entering/leaving
+                    // set_window_pos, which can block on ReactOS.
+                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                    {
+                        let id = self.debug_id();
+                        mark95xy(b"preSW", id * 1000 + i as i32, cw);
+                    }
                     set_window_pos(child, cx, cy, cw, ch);
+                    // TEMPORARY ReactOS diagnosis: set_window_pos returned.
+                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                    {
+                        let id = self.debug_id();
+                        mark95xy(b"pswX ", id * 1000 + i as i32, cw);
+                    }
                 } else {
                     unsafe {
                         winapi::um::winuser::ShowWindow(
@@ -1419,6 +1453,12 @@ mod nwg_adapter {
                         winapi::um::winuser::SW_HIDE,
                     );
                 }
+            }
+            // TEMPORARY ReactOS diagnosis: layout() returned.
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            {
+                let id = self.debug_id();
+                mark95xy(b"ltout", id, w);
             }
         }
         /// Re-run layout with the box's current client size. Called after
@@ -3400,15 +3440,37 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
             let c_hwnd = hwnd;
             static SIZE_ID: AtomicUsize = AtomicUsize::new(0x80000000);
             let sid = SIZE_ID.fetch_add(1, Ordering::SeqCst);
+            // (Fix-ReactOS) Per-frame size history. ReactOS re-fires WM_SIZE on
+            // a frame every time it resizes it, and this handler resizes the
+            // scrollbars and the child, which makes ReactOS re-fire WM_SIZE on
+            // the frame again. With no guard the sizes oscillate and the frame
+            // resizes in a tight infinite loop: present() never returns, the
+            // grid is never painted, and the app is dead on arrival (observed
+            // as an endless scsz-in/scsz-out trace). Laying the children out
+            // once per *distinct* frame size is all a settled viewport needs -
+            // the same settle rule the box WM_SIZE handler already uses.
+            let last_size = std::rc::Rc::new(std::cell::RefCell::new((-1i32, -1i32)));
             if let Some(h) = nwg::bind_raw_event_handler(
                 &nwg::ControlHandle::Hwnd(hwnd as _), sid,
                 move |_h, msg, _w, _l| {
                     if msg != winapi::um::winuser::WM_SIZE { return None; }
+                    // TEMPORARY ReactOS diagnosis: scrolled frame WM_SIZE entry.
+                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                    { mark95a(b"scsz-in\n"); }
                     unsafe {
                         let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
                         winapi::um::winuser::GetClientRect(c_hwnd as _, &mut rect);
                         let w = rect.right;
                         let h = rect.bottom;
+                        // (Fix-ReactOS) Settle guard: only re-lay-out the
+                        // scrollbars and child when the frame size actually
+                        // changed, so ReactOS's repeated WM_SIZE deliveries
+                        // cannot drive an endless resize loop.
+                        {
+                            let mut last = last_size.borrow_mut();
+                            if *last == (w, h) { return None; }
+                            *last = (w, h);
+                        }
                         // Drop zero sizes (stale setup-storm leftovers):
                         // resizing the canvas to 0x0 would silence its
                         // WM_PAINT forever (empty update region, nothing
@@ -3444,6 +3506,9 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                             );
                         }
                     }
+                    // TEMPORARY ReactOS diagnosis: scrolled frame WM_SIZE exit.
+                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                    { mark95a(b"scsz-out\n"); }
                     None
                 },
             ).ok() { handlers.push(h); }
