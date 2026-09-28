@@ -1250,14 +1250,30 @@ mod nwg_adapter {
                         continue;
                     }
                     unsafe {
+                        // Measure the CLIENT rect, not the window rect. The
+                        // window rect includes the frame, and a control that
+                        // has not been laid out yet reports a degenerate
+                        // window rect on ReactOS - so measuring the window
+                        // rect here collapses a vertical box's child to the
+                        // hardcoded default height, leaving the box 28px tall
+                        // instead of filling its parent (the whole tree is
+                        // then sized wrong and the first paint never happens).
                         let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
-                        if winapi::um::winuser::GetWindowRect(children[i] as _, &mut rect) != 0 {
-                            let sz = match self.orientation {
-                                crate::backends::nwg::Orientation::Horizontal => rect.right - rect.left,
-                                crate::backends::nwg::Orientation::Vertical => rect.bottom - rect.top,
-                            };
-                            desired_sizes.push(if sz > 10 { sz } else { hardcoded });
+                        let ok = winapi::um::winuser::GetClientRect(children[i] as _, &mut rect) != 0;
+                        let sz = match self.orientation {
+                            crate::backends::nwg::Orientation::Horizontal => rect.right - rect.left,
+                            crate::backends::nwg::Orientation::Vertical => rect.bottom - rect.top,
+                        };
+                        if ok && sz > 10 {
+                            desired_sizes.push(sz);
                         } else {
+                            // TEMPORARY ReactOS diagnosis: the measurement
+                            // that fell back to the hardcoded default.
+                            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                            {
+                                let id = self.debug_id();
+                                mark95xy(b"falbk", (id as i32) * 1000 + i as i32, sz);
+                            }
                             desired_sizes.push(hardcoded);
                         }
                     }
