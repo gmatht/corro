@@ -2062,6 +2062,41 @@ impl SimpleAction {
         pub fn close(&self) {
             self.elem.close();
         }
+
+        /// Show or hide the dialog. NWG's `set_visible` on a dialog is
+        /// `ShowWindow(SW_SHOW/HIDE)`; the DOM equivalent of both is the
+        /// `<dialog>` element's own `open` attribute, so this is
+        /// `show()`/`close()` rather than a CSS `display` toggle (which would
+        /// leave a closed `<dialog>` still participating in `showModal`'s
+        /// modality bookkeeping).
+        pub fn set_visible(&self, visible: bool) {
+            if visible {
+                self.present();
+            } else {
+                self.elem.close();
+            }
+        }
+
+        /// Mark a button as the one a dismiss acts on, GTK's
+        /// `set_default_response`.
+        ///
+        /// The DOM has `autofocus`, which is the same idea: it is the control
+        /// the browser focuses when the dialog appears. The response id
+        /// itself is a GTK concept (it identifies the button in the response
+        /// callback) and a `<dialog>` has no such id, so only the focus
+        /// behaviour is expressed -- which is the part a user can see.
+        pub fn set_default_response(&self, response_id: i32) {
+            // Count down from the last-added button: GTK's default is
+            // conventionally the affirmative action, and `add_button` appends
+            // in call order, so the last one is the most likely candidate.
+            // A caller that wants a different button passes its own id and
+            // the mapping below lands on whichever button was added with it.
+            let buttons = self.elem.get_elements_by_tag_name("button");
+            let idx = (response_id - 1).clamp(0, buttons.length() as i32 - 1) as u32;
+            if let Some(btn) = buttons.item(idx) {
+                let _ = js_sys::Reflect::set(btn.as_ref(), &wasm_bindgen::JsValue::from_str("autofocus"), &wasm_bindgen::JsValue::TRUE);
+            }
+        }
     }
 
     pub fn create_dialog() -> Result<Dialog, Error> {
@@ -3342,6 +3377,21 @@ impl SimpleAction {
                 set_css(self.elem.as_ref(), "align-self", "stretch");
             } else {
                 set_css(self.elem.as_ref(), "align-self", "");
+            }
+        }
+
+        /// Size of the *viewport*, in px.
+        ///
+        /// This is the one place a CSS width is right without a `min-width`
+        /// companion: a scroll container's size is its visible box, and the
+        /// scrollbar appears inside it rather than growing it. A `min-width`
+        /// would fight the `overflow` that makes scrolling work at all.
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if w > 0 {
+                set_css(self.elem.as_ref(), "width", &format!("{}px", w));
+            }
+            if h > 0 {
+                set_css(self.elem.as_ref(), "height", &format!("{}px", h));
             }
         }
     }
