@@ -24,8 +24,22 @@
 use corro::ui::App as TuiApp;
 #[cfg(any(feature = "gui", feature = "gui-core", feature = "pancurses"))]
 use corro::gui::App as GuiApp;
+// `PathBuf` is named by the CLI items below (`Args::files`, the export
+// helpers). The wasm entry point builds its one path with a fully-qualified
+// `std::path::PathBuf::from`, so gating the import to the same condition
+// keeps a non-CLI build from carrying an import nothing uses.
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
+// The wasm entry point (`fn main`, below) reads `argv[1]` as a single workbook
+// path and hands straight to a `gui::App`: it never parses flags, picks a UI,
+// or builds help text. These items exist only for the CLI, so on wasm they
+// have no caller and rustc's dead-code lint fires once per item -- noise in a
+// build that is otherwise warning-free. Gating each one on
+// `not(target_arch = "wasm32")` keeps it compiled and tested on every platform
+// that has a CLI, and out of a wasm binary. The test module below is gated the
+// same way, so a test is never separated from the item it exercises.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiKind {
     // The three variants are referenced by every compiled-in UI match arm and
@@ -41,6 +55,7 @@ enum UiKind {
     Pancurses,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Args {
     revision: Option<RevisionMode>,
     files: Vec<PathBuf>,
@@ -62,11 +77,13 @@ struct Args {
     convert_ansi: Option<PathBuf>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 enum RevisionMode {
     Browse,
     Limit(usize),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn cli_option_suggestion(arg: &str) -> Option<&'static str> {
     match arg {
@@ -105,7 +122,7 @@ fn determine_default_ui() -> UiKind { UiKind::Gui }
 // (returns NULL), so `std::env::args()` cannot be used there. Read the ANSI
 // command line instead. DBCS bytes decode lossily, which is fine for the
 // ASCII-only options corro takes.
-#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+#[cfg(all(not(target_arch = "wasm32"), target_family = "rust9x", target_env = "msvc"))]
 fn cli_args() -> impl Iterator<Item = String> {
     win95_args().into_iter().skip(1)
 }
@@ -115,6 +132,7 @@ fn cli_args() -> impl Iterator<Item = String> {
 /// Returns None when the name requests nothing or the requested backend is
 /// not compiled in (callers fall back to [`determine_default_ui`]); explicit
 /// `--gui`/`--ratatui`/`--pancurses` flags always win over this default.
+#[cfg(not(target_arch = "wasm32"))]
 fn argv0_ui(program: &str) -> Option<UiKind> {
     let base = program.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(program);
     let base = base
@@ -319,7 +337,7 @@ fn windows_console_action(
     }
 }
 
-#[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+#[cfg(all(not(target_arch = "wasm32"), not(all(target_family = "rust9x", target_env = "msvc"))))]
 fn cli_args() -> impl Iterator<Item = String> {
     std::env::args().skip(1)
 }
@@ -1155,6 +1173,7 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
     (res, exit_msg)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn cli_help_text() -> String {
     let mut ui_opts = String::new();
     #[cfg(feature = "ratatui")]
@@ -1192,6 +1211,7 @@ OPTIONS:\n\
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_workbook_for_export(path: &std::path::Path) -> Result<corro::ops::WorkbookState, String> {
     let ext = path
         .extension()
@@ -1234,6 +1254,7 @@ fn load_workbook_for_export(path: &std::path::Path) -> Result<corro::ops::Workbo
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn export_workbook_to_path(
     workbook: &corro::ops::WorkbookState,
     path: &std::path::Path,

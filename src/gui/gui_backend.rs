@@ -212,6 +212,14 @@ pub(crate) fn char_w() -> f64 { CHAR_W_BASE * metrics_scale() * view_zoom() }
 /// number of rows the moment the display was not 1x or the sheet was pinched.
 /// That is a divergence between what is drawn and what is scrolled, which is
 /// exactly the desynchronisation the zoom plumbing exists to prevent.
+// `macos_backend::cell_size` is the only caller, and `macos_backend` is
+// compiled only under the gui / gui-mobile / gui-macos features (see the
+// module gate in `src/gui/mod.rs`). The wasm build has no such host that needs
+// to convert its own pixel deltas into whole cells, so without this gate the
+// helper is dead there and rustc says so. Gating on the caller's own
+// condition keeps the invariant the doc comment above states -- that a host
+// uses *these* numbers -- true for every host that exists.
+#[cfg(any(feature = "gui", feature = "gui-mobile", feature = "gui-macos"))]
 pub(crate) fn cell_size() -> (f64, f64) { (row_h(), char_w()) }
 
 // ---------------------------------------------------------------------------
