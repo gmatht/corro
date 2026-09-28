@@ -34,7 +34,22 @@ mod nwg_adapter {
                     ov: *mut c_void) -> i32;
                 fn CloseHandle(h: *mut c_void) -> i32;
             }
-            let h = CreateFileA(b"c:\\gcorro.log\0".as_ptr(), 0x4000_0000, 1,
+            // Honour CORRO_WIN95_LOG like the rest of the rust9x diagnostics.
+            // Hardcoding c:\\gcorro.log sent this marker's output to the
+            // read-only LiveCD, where the adapter-level trace was lost.
+            static PATH: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+            let path = PATH.get_or_init(|| {
+                let mut p = std::env::var("CORRO_WIN95_LOG")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "c:\\gcorro.log".to_string())
+                    .into_bytes();
+                p.truncate(259);
+                p.push(0);
+                p
+            });
+            let h = CreateFileA(path.as_ptr(), 0x4000_0000, 1,
                 std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
             if !h.is_null() && h as isize != -1 {
                 SetFilePointer(h, 0, std::ptr::null_mut(), 2);
@@ -198,6 +213,23 @@ mod nwg_adapter {
     /// Returns None for non-text controls / single-line content (callers keep
     /// the measured window height then).
     fn text_natural_height(hwnd: winapi::shared::windef::HWND) -> Option<i32> {
+        // TEMPORARY ReactOS diagnosis: this is the app's only remaining
+        // WM_GETFONT sender (it sends it directly rather than through nwg's
+        // get_window_font, so the nwg-side counter did not see it). Capped.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static TNH: AtomicU32 = AtomicU32::new(0);
+            let n = TNH.fetch_add(1, Ordering::Relaxed);
+            if n < 12 {
+                let hx = b"0123456789abcdef";
+                let mut mb = [0u8; 12];
+                mb[0] = b't'; mb[1] = b'n'; mb[2] = b'h';
+                for i in 0..8 { mb[3 + i] = hx[((n >> ((7 - i) * 4)) & 0xf) as usize]; }
+                mb[11] = b'\n';
+                mark95a(&mb);
+            }
+        }
         unsafe {
             let mut cls: [u16; 64] = [0; 64];
             let n = winapi::um::winuser::GetClassNameW(hwnd, cls.as_mut_ptr(), 64);
@@ -338,6 +370,9 @@ mod nwg_adapter {
         layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>>,
         event_key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> i32>>>>,
         close_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
+        /// (Fix-ReactOS) Last size the toplevel was laid out at; see the
+        /// WM_SIZE handler for why a repeat at the same size must be dropped.
+        last_size: std::cell::RefCell<(i32, i32)>,
     }
 
     impl Clone for Window {
@@ -350,6 +385,10 @@ mod nwg_adapter {
                 layout_cb: self.layout_cb.clone(),
                 event_key_cb: self.event_key_cb.clone(),
                 close_cb: self.close_cb.clone(),
+                // A clone re-derives its own layout history: it has not
+                // laid anything out yet, so starting empty is correct (a
+                // shared cell would suppress this clone's first layout).
+                last_size: std::cell::RefCell::new((-1, -1)),
             }
         }
     }
@@ -559,6 +598,8 @@ mod nwg_adapter {
         if hwnd != std::ptr::null_mut() {
             // Bind raw WM_SIZE handler
             let cb = layout_cb.clone();
+            let last_size = std::rc::Rc::new(std::cell::RefCell::new((-1i32, -1i32)));
+            let last_size_h = last_size.clone();
             static RAW_HANDLER_ID: AtomicUsize = AtomicUsize::new(0x10000000);
             let handler_id = RAW_HANDLER_ID.fetch_add(1, Ordering::SeqCst);
             nwg::bind_raw_event_handler(
@@ -572,6 +613,22 @@ mod nwg_adapter {
                         // zero-size toplevel has nothing to lay out and the
                         // next real size repairs). See the box handler below.
                         if w <= 0 || h <= 0 { return None; }
+                        // (Fix-ReactOS) Re-entrancy guard. Laying out calls
+                        // set_window_pos on every child, and on ReactOS that
+                        // re-fires WM_NCCALCSIZE on the children, which
+                        // re-queries fonts and re-enters this handler.
+                        // Re-running a layout from inside a layout of the
+                        // same window never converges: each pass re-positions
+                        // the children, so the WM_GETFONT traffic never
+                        // stops and the UI thread livelocks inside present()
+                        // (the window never completes its first paint).
+                        // Skip a repeat at a size already laid out; a
+                        // genuinely new size still lays out normally.
+                        {
+                            let mut last = last_size_h.borrow_mut();
+                            if *last == (w, h) { return None; }
+                            *last = (w, h);
+                        }
                         if let Some(ref mut cb) = *cb.borrow_mut() {
                             cb(w, h);
                         }
@@ -691,7 +748,23 @@ mod nwg_adapter {
                                         len: u32, w: *mut u32, ov: *mut std::os::raw::c_void) -> i32;
                                     fn CloseHandle(h: *mut std::os::raw::c_void) -> i32;
                                 }
-                                let h = CreateFileA(b"c:\\gcorro.log\0".as_ptr(), 0x4000_0000, 1,
+                                // Honour CORRO_WIN95_LOG like the rest of the rust9x diagnostics: a
+            // harness that points the log at a writable volume must see these
+            // marks too. Hardcoding c:\gcorro.log sent the adapter-level
+            // trace to the read-only LiveCD, where it was lost.
+            static PATH: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+            let path = PATH.get_or_init(|| {
+                let mut p = std::env::var("CORRO_WIN95_LOG")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "c:\\gcorro.log".to_string())
+                    .into_bytes();
+                p.truncate(259);
+                p.push(0);
+                p
+            });
+            let h = CreateFileA(path.as_ptr(), 0x4000_0000, 1,
                                     std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
                                 if !h.is_null() && h as isize != -1 {
                                     SetFilePointer(h, 0, std::ptr::null_mut(), 2);
@@ -714,7 +787,7 @@ mod nwg_adapter {
             }
         }
 
-        Ok(Window { hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler), root_child, layout_cb, event_key_cb, close_cb })
+        Ok(Window { hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler), root_child, layout_cb, event_key_cb, close_cb, last_size: std::cell::RefCell::new((-1, -1)) })
     }
 
     // -- Button --
@@ -1306,6 +1379,8 @@ mod nwg_adapter {
         // Auto-layout on WM_SIZE — now shares children via Rc<RefCell>
         if hwnd != std::ptr::null_mut() {
             let bw2 = bw.clone();
+            // (Fix-ReactOS) Per-box layout history; see the guard below.
+            let last_size = std::rc::Rc::new(std::cell::RefCell::new((-1i32, -1i32)));
             static BOX_SIZE_ID: AtomicUsize = AtomicUsize::new(0xB0000000);
             let id = BOX_SIZE_ID.fetch_add(1, Ordering::SeqCst);
             let _ = nwg::bind_raw_event_handler(
@@ -1321,6 +1396,21 @@ mod nwg_adapter {
                         // screen never repairs (nothing re-invalidates).
                         // The next real (non-zero) size re-runs layout.
                         if w <= 0 || h <= 0 { return None; }
+                        // (Fix-ReactOS) Re-entrancy guard, same reason as the
+                        // toplevel: layout() repositions every child, which on
+                        // ReactOS re-fires WM_NCCALCSIZE on them and re-enters
+                        // this handler for any nested box. Because a nested
+                        // box's own size is what its parent just computed,
+                        // each pass reports a fresh size, so the cascade never
+                        // settles: WM_GETFONT traffic continues forever and the
+                        // UI thread livelocks inside present() instead of ever
+                        // completing the first paint. Laying out once per
+                        // distinct size is all a settled layout needs.
+                        {
+                            let mut last = last_size.borrow_mut();
+                            if *last == (w, h) { return None; }
+                            *last = (w, h);
+                        }
                         bw2.layout(0, 0, w, h);
                     }
                     None

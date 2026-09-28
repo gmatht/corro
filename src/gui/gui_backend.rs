@@ -6330,6 +6330,16 @@ pub fn run_gui_with_movie(
     let _ = std::fs::write("/tmp/gui_setup_phase1.txt", "before_set_draw_callback\n");
     canvas.set_draw_callback(Box::new(move |dc: &mut dyn DrawContext, w: i32, h: i32| {
         eprintln!("DRAW_CALLBACK called: w={} h={}", w, h);
+        // TEMPORARY ReactOS diagnosis: prove the grid renderer actually runs
+        // (and how many times) instead of inferring it from a blank window.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        unsafe {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static DRAWS: AtomicU32 = AtomicU32::new(0);
+            if DRAWS.fetch_add(1, Ordering::Relaxed) < 16 {
+                mark95(b"draw\n");
+            }
+        }
         let _ = std::fs::write("/tmp/dim.txt", format!("{} {}\n", w, h));
         // Size the viewport from the live canvas every frame (cheap: a few
         // visible_col_indices passes) so the sheet always fills the canvas
