@@ -12,7 +12,11 @@
 //! sense for a headless model is now wired through.
 
 use std::os::raw::c_void;
+<<<<<<< HEAD
 use crate::backends::zork::{MenuItemData, MenuItemKind};
+=======
+use crate::backends::zork::MenuItemData;
+>>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
 use crate::core::{Error, Widget};
 
 /// Extract a model node id from a widget handle's raw pointer.
@@ -250,12 +254,32 @@ impl Label {
 pub enum Orientation {
     Horizontal,
     Vertical,
+<<<<<<< HEAD
 }
 
 #[derive(Clone)]
 pub struct BoxWidget {
     pub(crate) id: usize,
     pub(crate) orientation: Orientation,
+    pub(crate) spacing: i32,
+}
+
+impl Widget for BoxWidget {
+    fn raw_handle(&self) -> *mut c_void {
+        &self.id as *const usize as *mut c_void
+    }
+=======
+>>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
+}
+
+#[derive(Clone)]
+pub struct BoxWidget {
+    pub(crate) id: usize,
+    /// Kept so a caller can recover the orientation/spacing it asked for; the
+    /// model is authoritative and is read back through `ZorkState`.
+    #[allow(dead_code)]
+    pub(crate) orientation: Orientation,
+    #[allow(dead_code)]
     pub(crate) spacing: i32,
 }
 
@@ -764,7 +788,13 @@ impl DropDown {
     pub fn set_items(&self, items: &[&str]) {
         crate::backends::zork::set_dropdown_items(self.id, items);
     }
-    pub fn set_active(&self, idx: i32) {
+    /// GTK/NWG take `Option<u32>` (a `None` = "no selection"); the model stores
+    /// an `Option<usize>`, so keep the same external contract.
+    pub fn set_active(&self, index: Option<u32>) {
+        let idx = match index {
+            Some(i) => i as i32,
+            None => -1,
+        };
         crate::backends::zork::set_dropdown_selected(self.id, idx);
     }
     pub fn get_active(&self) -> i32 {

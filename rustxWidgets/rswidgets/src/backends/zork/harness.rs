@@ -336,7 +336,12 @@ impl DropDown {
     pub fn set_items(&self, items: &[&str]) {
         self.0.state.borrow_mut().set_dropdown_items(self.0.id, items);
     }
-    pub fn set_active(&self, idx: i32) {
+    /// `None` selects nothing, matching the adapter's GTK/NWG-style signature.
+    pub fn set_active(&self, index: Option<u32>) {
+        let idx = match index {
+            Some(i) => i as i32,
+            None => -1,
+        };
         self.0.state.borrow_mut().set_dropdown_selected(self.0.id, idx);
     }
     pub fn connect_changed(&self, f: impl FnMut() + 'static) {

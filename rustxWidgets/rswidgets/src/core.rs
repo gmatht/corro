@@ -1447,6 +1447,19 @@ impl App {
         crate::backends_zork_adapter::create_textview()
     }
 
+    /// Zork's spreadsheet is a real cell map, not a rasterisation shortcut.
+    /// `rows`/`cols` are accepted for signature parity with the GTK and
+    /// pancurses backends; the model's cells are sparse, so the extents are
+    /// advisory (see `docs/ZORK_MISSING.md` §2.4 F3).
+    #[cfg(feature = "zork")]
+    pub fn create_spreadsheet(&self, rows: u32, cols: u32) -> Result<crate::backends_zork_adapter::Spreadsheet, Error> {
+        let ss = crate::backends_zork_adapter::create_spreadsheet()?;
+        let w = (cols as i32) * 80;
+        let h = (rows as i32) * 20;
+        crate::backends::zork::set_size_request(ss.id, w, h);
+        Ok(ss)
+    }
+
     // -- WASM paths --
 
     #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
@@ -1765,6 +1778,15 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_macos_adapter::create_box(mac_orient, spacing)?;
             return Ok(crate::common::WidgetBox { inner });
         }
+        #[cfg(feature = "zork")]
+        {
+            let zork_orient = match orientation {
+                crate::common::Orientation::Horizontal => crate::backends_zork_adapter::Orientation::Horizontal,
+                crate::common::Orientation::Vertical => crate::backends_zork_adapter::Orientation::Vertical,
+            };
+            let inner = crate::backends_zork_adapter::create_box(zork_orient, spacing)?;
+            return Ok(crate::common::WidgetBox { inner });
+        }
     }
 
     /// Create a new Label with the given text.
@@ -1804,6 +1826,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_os = "macos", not(feature = "zork")))]
         {
             let inner = crate::backends_macos_adapter::create_label(text)?;
+            return Ok(crate::common::Label { inner });
+        }
+        #[cfg(feature = "zork")]
+        {
+            let inner = crate::backends_zork_adapter::create_label(text)?;
             return Ok(crate::common::Label { inner });
         }
     }
@@ -1846,6 +1873,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_macos_adapter::create_entry()?;
             return Ok(crate::common::Entry::new(inner));
         }
+        #[cfg(feature = "zork")]
+        {
+            let inner = crate::backends_zork_adapter::create_entry()?;
+            return Ok(crate::common::Entry::new(inner));
+        }
     }
 
     /// Create a new Canvas (custom drawing surface).
@@ -1884,6 +1916,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_os = "macos", not(feature = "zork")))]
         {
             let inner = crate::backends_macos_adapter::create_canvas()?;
+            return Ok(crate::common::Canvas { inner });
+        }
+        #[cfg(feature = "zork")]
+        {
+            let inner = crate::backends_zork_adapter::create_canvas()?;
             return Ok(crate::common::Canvas { inner });
         }
     }
@@ -1983,6 +2020,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_macos_adapter::create_menu()?;
             return Ok(crate::common::Menu { inner });
         }
+        #[cfg(feature = "zork")]
+        {
+            let inner = crate::backends_zork_adapter::create_menu()?;
+            return Ok(crate::common::Menu { inner });
+        }
     }
 
     /// Create a new SimpleAction that will dispatch to the given name.
@@ -2021,6 +2063,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_os = "macos", not(feature = "zork")))]
         {
             let inner = crate::backends_macos_adapter::create_simple_action(name)?;
+            return Ok(crate::common::SimpleAction { inner });
+        }
+        #[cfg(feature = "zork")]
+        {
+            let inner = crate::backends_zork_adapter::create_simple_action(name)?;
             return Ok(crate::common::SimpleAction { inner });
         }
     }
@@ -2063,6 +2110,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_os = "macos", not(feature = "zork")))]
         {
             let inner = crate::backends_macos_adapter::create_menubar(&model.inner, _action_group)?;
+            return Ok(crate::common::MenuBar { inner });
+        }
+        #[cfg(feature = "zork")]
+        {
+            let inner = crate::backends_zork_adapter::create_menubar(&model.inner, _action_group)?;
             return Ok(crate::common::MenuBar { inner });
         }
     }
@@ -2126,6 +2178,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_os = "macos", not(feature = "zork")))]
         {
             let inner = crate::backends_macos_adapter::create_dialog()?;
+            return Ok(crate::common::Dialog { inner });
+        }
+        #[cfg(feature = "zork")]
+        {
+            let inner = crate::backends_zork_adapter::create_dialog()?;
             return Ok(crate::common::Dialog { inner });
         }
     }

@@ -1004,9 +1004,18 @@ impl ZorkState {
         }
     }
 
+<<<<<<< HEAD
     /// Compute the size of a `BoxWidget` from its children: the sum of the
     /// children along the packing axis (plus `spacing` between them) and the
     /// max on the cross axis. Returns `None` for a non-box node.
+=======
+    /// Compute the size a `BoxWidget` needs for its visible children: the sum
+    /// of the children's extent along the *packing* axis (plus `spacing`
+    /// between them) and the largest extent on the cross axis.
+    ///
+    /// A horizontal box packs along x, so its width is the sum of the child
+    /// widths and its height the tallest child. Returns `None` for a non-box.
+>>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
     pub fn measure_box(&self, id: usize) -> Option<(i32, i32)> {
         let n = self.node(id)?;
         let (horizontal, spacing) = match n.kind {
@@ -1022,6 +1031,7 @@ impl ZorkState {
         if kids.is_empty() {
             return Some((0, 0));
         }
+<<<<<<< HEAD
         let main: i32 = kids.iter().filter_map(|c| c.props.width).sum::<i32>()
             + spacing * (kids.len() as i32 - 1).max(0);
         let cross: i32 = kids
@@ -1038,6 +1048,24 @@ impl ZorkState {
     ///
     /// This is what makes `BoxWidget::layout(x, y, w, h)` a real operation
     /// rather than a discarded argument list.
+=======
+        // `pick` selects a child's extent on the requested axis.
+        let main_of = |k: &ZorkNode| if horizontal { k.props.width } else { k.props.height };
+        let cross_of = |k: &ZorkNode| if horizontal { k.props.height } else { k.props.width };
+        let main: i32 = kids.iter().filter_map(|k| main_of(k)).sum::<i32>()
+            + spacing * (kids.len() as i32 - 1).max(0);
+        let cross: i32 = kids.iter().filter_map(|k| cross_of(k)).max().unwrap_or(0);
+        Some(if horizontal { (main, cross) } else { (cross, main) })
+    }
+
+    /// Position a box's visible children along the packing axis, starting at
+    /// `(x, y)` and honouring `spacing`, and record the box's own size request.
+    ///
+    /// A child advances the cursor by its own extent on the packing axis, so
+    /// a child with no size request advances by nothing. Each child keeps its
+    /// own size request — this is a positioning pass, not a resize pass; use
+    /// [`Self::set_size_request`] to size children first.
+>>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
     pub fn layout_box(&mut self, id: usize, x: i32, y: i32, w: i32, h: i32) {
         let (horizontal, spacing) = match self.node(id) {
             Some(n) => match n.kind {
@@ -1054,6 +1082,7 @@ impl ZorkState {
             .into_iter()
             .filter(|c| self.node(*c).is_some_and(|n| n.props.visible))
             .collect();
+<<<<<<< HEAD
         if kids.is_empty() {
             return;
         }
@@ -1084,6 +1113,21 @@ impl ZorkState {
                     self.set_size_request(*kid, cross_total, self.node(*kid).and_then(|n| n.props.height).unwrap_or(0));
                 }
             }
+=======
+        let mut main = if horizontal { x } else { y };
+        for kid in kids {
+            let extent = self
+                .node(kid)
+                .and_then(|n| if horizontal { n.props.width } else { n.props.height })
+                .unwrap_or(0)
+                .max(0);
+            if horizontal {
+                self.set_offset(kid, main, y);
+            } else {
+                self.set_offset(kid, x, main);
+            }
+            main += extent + spacing;
+>>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
         }
     }
 
@@ -1942,11 +1986,34 @@ mod tests {
         s.append_child(bx, b);
         s.set_size_request(a, 30, 10);
         s.set_size_request(b, 30, 20);
+<<<<<<< HEAD
         // Vertical: main axis is height (10+20+2), cross is max width (30).
+=======
+        // A vertical box packs along y: height = 10 + 20 + 2*spacing,
+        // width = the widest child (30).
+>>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
         assert_eq!(s.measure_box(bx), Some((30, 32)));
     }
 
     #[test]
+<<<<<<< HEAD
+=======
+    fn measure_box_horizontal_sums_widths() {
+        let mut s = ZorkState::new();
+        s.create_window();
+        let bx = s.create_box(true, 4);
+        let a = s.create_button("a");
+        let b = s.create_button("b");
+        s.append_child(bx, a);
+        s.append_child(bx, b);
+        s.set_size_request(a, 10, 6);
+        s.set_size_request(b, 20, 9);
+        // Horizontal packs along x: width = 10 + 20 + spacing, height = tallest.
+        assert_eq!(s.measure_box(bx), Some((34, 9)));
+    }
+
+    #[test]
+>>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
     fn grid_attach_grows_grid() {
         let mut s = ZorkState::new();
         s.create_window();
@@ -2144,7 +2211,11 @@ mod tests {
         let fired = Rc::new(Cell::new(0));
         {
             let f = fired.clone();
+<<<<<<< HEAD
             s.add_callback(d, Box::new(move || f.set(f.get() + 1)));
+=======
+            s.add_response_callback(d, Box::new(move |_| f.set(f.get() + 1)));
+>>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
         }
         s.dialog_respond(d, 1);
         assert_eq!(fired.get(), 0, "unregistered response must not fire");

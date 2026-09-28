@@ -89,6 +89,12 @@ fn short_desc(_state: &ZorkState, node: &ZorkNode) -> String {
             format!("DropDown [{}]", current)
         }
         ZorkKind::TextView { .. } => "TextView".into(),
+        ZorkKind::Canvas { .. } => "Canvas".into(),
+        ZorkKind::Overlay => "Overlay".into(),
+        ZorkKind::ScrolledWindow => "ScrolledWindow".into(),
+        ZorkKind::Fixed => "Fixed".into(),
+        ZorkKind::Application => "Application".into(),
+        ZorkKind::Spreadsheet { .. } => "Spreadsheet".into(),
         ZorkKind::Menu => "Menu".into(),
         ZorkKind::MenuBar => "MenuBar".into(),
         ZorkKind::SimpleAction => "SimpleAction".into(),

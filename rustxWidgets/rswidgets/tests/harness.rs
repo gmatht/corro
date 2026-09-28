@@ -69,11 +69,14 @@ fn checkbutton_toggle_updates_state() {
 fn dropdown_selection_and_getters() {
     let h = Harness::new();
     let dd = h.create_dropdown(&["a", "b", "c"]);
-    dd.set_active(1);
+    dd.set_active(Some(1));
     assert_eq!(h.dropdown_selected(&dd), 1);
     dd.set_items(&["x", "y"]);
-    dd.set_active(1);
+    dd.set_active(Some(1));
     assert_eq!(h.dropdown_selected(&dd), 1);
+    // `None` clears the selection, matching the GTK/NWG signature.
+    dd.set_active(None);
+    assert_eq!(h.dropdown_selected(&dd), -1);
 }
 
 #[test]
