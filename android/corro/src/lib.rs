@@ -458,3 +458,9 @@ pub extern "system" fn Java_com_corro_SheetView_nativeCellContextMenu(
 ) {
     corro::gui::android_backend::open_cell_context_menu(x as f64, y as f64);
 }
+
+// The system clipboard needs no JNI export: `CorroClipboard.java` makes the
+// `ClipboardManager` call itself and Rust reaches it through
+// `backends::android::clipboard_set_text` / `clipboard_get_text`. A JNI hop
+// here would only add a second way to do something Java already does in one
+// line, and the two could then disagree.

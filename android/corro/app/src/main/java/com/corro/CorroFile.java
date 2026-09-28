@@ -74,6 +74,18 @@ public final class CorroFile {
     }
 
     /**
+     * The bound Activity, or null before {@link #attach}.
+     *
+     * <p>Also the app's <em>only</em> {@code Context}, which is why the
+     * clipboard bridge asks here rather than carrying its own handle: there
+     * is one Activity, it is registered once, and a second path to it would
+     * be a second thing that can be null.
+     */
+    public static android.content.Context activityContext() {
+        return activity;
+    }
+
+    /**
      * Show the platform's "open document" picker.
      *
      * @param mimes MIME types to accept; {@code *&#47;*} is the any-file case

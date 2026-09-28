@@ -215,6 +215,45 @@ pub fn menu_action_needs_terminal_suspend(name: &str) -> bool {
     matches!(name, "edit_external" | "edit_workbook_external")
 }
 
+/// Put a copied value on the *system* clipboard, where the platform has one.
+///
+/// A no-op on the desktop GUI backends, and deliberately so: neither the GTK
+/// nor the NWG GUI touches a platform clipboard — no file in
+/// `rustxWidgets/rswidgets/src/` mentions `gtk_clipboard`,
+/// `OpenClipboard` or `SetClipboardData`, and the gtk_dynamic_loader binds no
+/// clipboard symbol. Their copy/cut/paste is in-process Rust state, which is
+/// what `clipboard` above already is.
+///
+/// Android is different in kind, not just in degree: it has a system
+/// clipboard (`ClipboardManager`) and no `xclip`, no `pbcopy` and no terminal
+/// to reach one through. A copy there that stayed in-process would be
+/// invisible outside the app, so this is the one GUI backend that benefits
+/// from one.
+///
+/// Every backend that lacks a system clipboard is a silent no-op rather than
+/// an error: a Copy that succeeds in-app must not report failure.
+#[cfg(target_os = "android")]
+fn system_clipboard_set(text: &str) {
+    rswidgets::backends::android::clipboard_set_text(text);
+}
+
+#[cfg(not(target_os = "android"))]
+fn system_clipboard_set(_text: &str) {}
+
+/// Read the *system* clipboard, where the platform has one.
+///
+/// Consulted only when the in-process clipboard is empty — see the `paste`
+/// arm above for why that ordering is the correct one.
+#[cfg(target_os = "android")]
+fn system_clipboard_get() -> Option<String> {
+    rswidgets::backends::android::clipboard_get_text()
+}
+
+#[cfg(not(target_os = "android"))]
+fn system_clipboard_get() -> Option<String> {
+    None
+}
+
 /// Result of [`dispatch_menu_action`]. The backend performs the backend-
 /// specific part (text prompt, OSC 52 clipboard, dialog rendering, formula-bar
 /// update); the corro operation itself is already applied to `app`.
@@ -727,6 +766,12 @@ pub fn dispatch_menu_action(
         "copy" => {
             let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
             *clipboard = val.clone();
+            // Also put it on the system clipboard where there is one, so a
+            // copy can be pasted into another app. The in-process
+            // `clipboard` above is what makes the *reverse* direction work
+            // even when the system clipboard is unavailable, which is why it
+            // stays authoritative for paste.
+            system_clipboard_set(&val);
             // ratatui's Copy sets no status (keeps the current one).
             MenuDispatch::Status(String::new())
         },
@@ -736,12 +781,34 @@ pub fn dispatch_menu_action(
                 MenuDispatch::Status("Nothing to cut".into())
             } else {
                 *clipboard = val.clone();
+                system_clipboard_set(&val);
                 commit_cell(app, addr.clone(), String::new());
                 MenuDispatch::Status("Selection cut".into())
             }
         },
         "paste" => {
-            let val = clipboard.clone();
+            // The system clipboard first, then the in-process one.
+            //
+            // Order matters and is the reverse of what it looks like. The
+            // in-process value is what a Copy *in this app* put there, and it
+            // is authoritative for that case because it is the exact cell
+            // value at copy time. The system clipboard is only consulted when
+            // the in-process one is empty, which is precisely the case where
+            // nothing was copied in corro and the value must have come from
+            // somewhere else. Were it the other way round, a stray system
+            // clipboard would shadow this app's own last copy.
+            let from_system = if clipboard.is_empty() {
+                system_clipboard_get()
+            } else {
+                None
+            };
+            let val = match from_system {
+                Some(text) => {
+                    *clipboard = text.clone();
+                    text
+                }
+                None => clipboard.clone(),
+            };
             if val.is_empty() {
                 MenuDispatch::Status("Clipboard empty (use Copy/Cut first)".into())
             } else {

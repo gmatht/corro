@@ -175,18 +175,38 @@ and can `openInputStream` / `openOutputStream` it.
 
 ## 3. Clipboard
 
-corro's own session clipboard (`GuiState.clipboard`, `src/gui/clipboard.rs`)
-holds `text` + `cells`, and **works on Android** — the menu strip dispatches
-`app.copy` / `app.cut` / `app.paste`. What is missing is the *system*
-clipboard: GTK and NWG both put the copied text on the platform clipboard, so
-copy in corro → paste in another app, and vice versa. On Android a copy is
-invisible outside corro, and pasting from another app's copy is impossible.
+Corrected after checking the source rather than assuming. The GTK and NWG
+*GUI* backends do **not** touch a platform clipboard: no file in
+`rustxWidgets/rswidgets/src/` mentions `gtk_clipboard`, `OpenClipboard` or
+`SetClipboardData`, and the gtk_dynamic_loader binds no clipboard symbol. The
+GUI's copy/cut/paste is in-process Rust state — `GuiState::clipboard` for
+GTK and NWG alike (`src/gui/actions.rs` `"copy"` / `"cut"` / `"paste"`), and
+that already works on Android through the menu strip.
 
-| Feature | GTK | NWG | Android | Status |
-|---|---|---|---|---|
-| System clipboard read/write | yes | yes | **absent** | **done** (`ClipboardManager`) |
-| Cross-app copy/paste of a cell | yes | yes | **absent** | **done** |
-| Cell range copy (multi-cell) | no | no | no | not applicable — same on every backend |
+The *system* clipboard does exist, but in the two places that reach a
+platform one:
+
+* the **TUI** (`src/ui/mod.rs`), which shells out to `xclip` / `pbcopy` /
+  `clip` / `Get-Clipboard`; and
+* the **pancurses** backend (`set_clipboard_text`, via an OSC 52 escape).
+
+Android is in neither category, and it cannot be: there is no `xclip`, and a
+phone has no terminal. The equivalent is `ClipboardManager`, and a keyboard
+bridge (step #4 of §4) is what makes `Ctrl+C` reach it. So the gap is real
+for Android, but the framing is "Android has no way to reach a clipboard
+where TUI and terminal do", not "GTK and NWG do this and Android does not".
+
+| Feature | GTK | NWG | TUI | pancurses | Android | Status |
+|---|---|---|---|---|---|---|
+| In-app copy/cut/paste | yes | yes | yes | yes | yes (already worked) | ok |
+| System clipboard write | no | no | yes | yes (OSC 52) | **absent** | **done** |
+| System clipboard read (paste from another app) | no | no | yes | no | **absent** | **done** |
+| Cell range copy (multi-cell) | no | no | no | no | no | not applicable — same on every backend |
+
+Reading the system clipboard on paste is what makes an Android copy usable
+outside corro at all, so it is not a "nice extra": without the write side the
+copy is invisible, and without the read side a value copied in another app can
+never reach a cell.
 
 ## 4. Keyboard input — the second largest gap
 

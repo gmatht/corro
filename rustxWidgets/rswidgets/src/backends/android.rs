@@ -1933,6 +1933,48 @@ mod android_backend {
     static ENTRY_KEY_LISTENERS: Lazy<Mutex<Vec<GlobalRef>>> =
         Lazy::new(|| Mutex::new(Vec::new()));
 
+    // ---- System clipboard ----
+
+    /// Put text on the Android system clipboard (`ClipboardManager`).
+    ///
+    /// Returns whether it worked, so a caller can report the copy as
+    /// in-app-only rather than silently claiming it went to the system. That
+    /// distinction matters: a copy that appears to succeed and cannot be
+    /// pasted anywhere is worse than one that says so.
+    pub fn clipboard_set_text(text: &str) -> bool {
+        with_env_and_activity(|env, _activity| {
+            let cls = load_app_class(env, "com.corro.CorroClipboard")?;
+            let j_text = env.new_string(text)?;
+            let ok = env
+                .call_static_method(&cls, "setText", "(Ljava/lang/String;)Z", &[(&j_text).into()])?
+                .z()?;
+            Ok::<bool, Box<dyn StdError + Send + Sync>>(ok)
+        })
+        .unwrap_or(false)
+    }
+
+    /// The system clipboard's plain text, or `None` when it holds nothing.
+    ///
+    /// `None` rather than `Some("")` for an empty clipboard, because those
+    /// are different operations for a caller: pasting nothing is a no-op,
+    /// while pasting an empty string into a cell is a real (destructive) edit.
+    pub fn clipboard_get_text() -> Option<String> {
+        with_env_and_activity(|env, _activity| {
+            let cls = load_app_class(env, "com.corro.CorroClipboard")?;
+            let value = env
+                .call_static_method(&cls, "getText", "()Ljava/lang/String;", &[])?
+                .l()?;
+            if value.is_null() {
+                return Ok(None);
+            }
+            let s = unsafe { jni::objects::JObject::from_raw(value.as_raw()) };
+            let out: String = env.get_string(&JString::from(s))?.into();
+            Ok::<Option<String>, Box<dyn StdError + Send + Sync>>(Some(out))
+        })
+        .ok()
+        .flatten()
+    }
+
     // ---- Storage Access Framework ----
 
     /// Bind the SAF picker to the Activity. The host calls this from

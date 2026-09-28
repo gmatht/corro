@@ -9264,8 +9264,40 @@ mod mobile_gesture_tests {
     fn touch_long_press_arms_selection() {
         setup();
         assert_eq!(0, mobile_gesture_down(SHEET, 10.0, 10.0, true));
-        assert_eq!(4, mobile_gesture_long_press(SHEET, 10.0, 10.0));
+        // `menu_mode = false`: the long press arms the range selection, so the
+        // drag that follows reports SELECT. `true` would instead open the
+        // context menu and consume the press — see the two tests below.
+        assert_eq!(4, mobile_gesture_long_press(SHEET, 10.0, 10.0, false));
         assert_eq!(1, mobile_gesture_move(SHEET, 60.0, 60.0));
+        setup();
+    }
+
+    /// A long press in menu mode opens the cell context menu instead of
+    /// arming a selection — a phone's substitute for a desktop right-click.
+    ///
+    /// The press is *consumed*, not merely routed differently: a following
+    /// release must not also fire a tap, or the cursor would move to the
+    /// pressed cell after the menu had already acted on the old one.
+    #[test]
+    fn long_press_in_menu_mode_opens_the_menu_and_consumes_the_press() {
+        setup();
+        assert_eq!(0, mobile_gesture_down(SHEET, 10.0, 10.0, true));
+        assert_eq!(5, mobile_gesture_long_press(SHEET, 10.0, 10.0, true));
+        // Consumed: the release is recognised as ending a real gesture (so it
+        // is not a tap), and the drag that follows does not pan the sheet.
+        assert_eq!(0, mobile_gesture_up(SHEET, 10.0, 10.0));
+        setup();
+    }
+
+    /// Menu mode must not arm the drag, or a finger drag after the menu
+    /// dismissed would both pan the sheet and extend a selection.
+    #[test]
+    fn a_drag_after_a_menu_long_press_does_not_select() {
+        setup();
+        assert_eq!(0, mobile_gesture_down(SHEET, 10.0, 10.0, true));
+        assert_eq!(5, mobile_gesture_long_press(SHEET, 10.0, 10.0, true));
+        // Not SELECT (1): the press was consumed by the menu.
+        assert_eq!(2, mobile_gesture_move(SHEET, 60.0, 60.0));
         setup();
     }
 
@@ -9276,7 +9308,7 @@ mod mobile_gesture_tests {
         setup();
         mobile_gesture_down(SHEET, 10.0, 10.0, true);
         assert_eq!(2, mobile_gesture_move(SHEET, 60.0, 10.0));
-        assert_eq!(0, mobile_gesture_long_press(SHEET, 60.0, 10.0));
+        assert_eq!(0, mobile_gesture_long_press(SHEET, 60.0, 10.0, false));
         setup();
     }
 
@@ -9310,7 +9342,7 @@ mod mobile_gesture_tests {
         assert_eq!(0, mobile_gesture_down(OTHER, 10.0, 10.0, false));
         assert_eq!(0, mobile_gesture_move(OTHER, 50.0, 10.0));
         assert_eq!(0, mobile_gesture_up(OTHER, 50.0, 10.0));
-        assert_eq!(0, mobile_gesture_long_press(OTHER, 10.0, 10.0));
+        assert_eq!(0, mobile_gesture_long_press(OTHER, 10.0, 10.0, false));
         assert_eq!((0, 0), drag_viewport_by_pixels(OTHER, 0.0, -100.0));
         setup();
     }
