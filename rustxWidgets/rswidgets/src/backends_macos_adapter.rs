@@ -214,6 +214,30 @@ mod macos_adapter {
 
         pub fn set_default_size(&self, _w: i32, _h: i32) {}
 
+        /// Force the window to a size, in points.
+        ///
+        /// The handle is the host's root *view* (see `create_window`), not an
+        /// `NSWindow`, so this sets the view's frame. The origin is left
+        /// alone: the view is positioned by its superview, and a root view has
+        /// none to be in conflict with, so a zero origin is the neutral
+        /// choice.
+        ///
+        /// The argument order is the one that matters — `msg4cv` sends
+        /// `(CGFloat, CGFloat, CGFloat, CGFloat)`, which is `CGRect`'s field
+        /// order, so origin first and size second. Getting that backwards
+        /// produces a silently wrong frame rather than a compile error.
+        pub fn resize(&self, w: i32, h: i32) {
+            if self.0.is_null() {
+                return;
+            }
+            unsafe { msg4cv(self.0, "setFrame:", 0.0, 0.0, w as f64, h as f64) };
+            // AppKit needs both: a frame change is a layout change, and the
+            // canvas will keep painting the old size until something asks for
+            // a redraw.
+            unsafe { msg0v(self.0, "setNeedsLayout") };
+            unsafe { msg0v(self.0, "setNeedsDisplay") };
+        }
+
         /// # Safety
         /// Kept for API compatibility with the GTK backend; no-op on macOS.
         pub unsafe fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
@@ -470,6 +494,18 @@ mod macos_adapter {
             // `headIndent` is NSTextField's left inset (points), and unlike a
             // constraint it needs no superview to take effect.
             unsafe { msg1cv(self.0, "setHeadIndent:", px as f64) };
+        }
+
+        /// Top inset of the label's contents, in points.
+        ///
+        /// The vertical counterpart to [`Label::set_margin_start`]. Recorded
+        /// in `WidgetMeta` and not sent: `NSTextField` has no
+        /// `setTopIndent:` to send, and inventing a selector the object does
+        /// not have would raise `unrecognized selector` — a foreign throw
+        /// that `catch_unwind` cannot intercept, which is how the iOS adapter's
+        /// copy of `setHeadIndent:` used to kill the app.
+        pub fn set_margin_top(&self, px: i32) {
+            core_apple::with_meta_mut(self.0, |m| m.margin_top = px);
         }
 
         /// Set the x alignment of the label's text (0.0 left .. 1.0 right).

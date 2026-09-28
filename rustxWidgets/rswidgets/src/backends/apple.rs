@@ -711,6 +711,10 @@ pub struct WidgetMeta {
     /// label sits flush against its slot's edge, and this restores the inset
     /// the shrink-to-fit label used to have.
     pub margin_start: i32,
+    /// `Label::set_margin_top`: the vertical counterpart of
+    /// [`Self::margin_start`]. Recorded on both Apple backends; the iOS
+    /// `UILabel` has no inset selector at all, so it is recorded and not sent.
+    pub margin_top: i32,
     /// `Label::set_xalign`: horizontal text alignment, `0.0` left ..
     /// `1.0` right. `NSTextField`/`UILabel` centre their text by default, so
     /// a pinned slot would otherwise make the text *float* mid-slot and
@@ -732,6 +736,7 @@ impl Default for WidgetMeta {
             laid_out: (0, 0),
             fixed_width: None,
             margin_start: 0,
+            margin_top: 0,
             xalign: 0.5,
         }
     }

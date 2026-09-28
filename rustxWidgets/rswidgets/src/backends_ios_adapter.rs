@@ -336,6 +336,29 @@ mod ios_adapter {
 
         pub fn set_default_size(&self, _w: i32, _h: i32) {}
 
+        /// Force the window to a size, points.
+        ///
+        /// The `Window` handle here is the host's root *view*: iOS has no
+        /// toplevel window the toolkit owns, the scene does (see the type's
+        /// comment). A view's frame is set with `setFrame:`, and the argument
+        /// order is the one that matters — `msg4cv` sends
+        /// `(CGFloat, CGFloat, CGFloat, CGFloat)` after `(self, SEL)`, which
+        /// is `CGRect`'s field order, so origin first and size second.
+        pub fn resize(&self, w: i32, h: i32) {
+            if self.0.is_null() {
+                return;
+            }
+            // The origin is left alone: the view is positioned by its
+            // superview, and moving it here would fight the stack view that
+            // owns it. A zero origin is the right neutral value for a root.
+            unsafe { msg4cv(self.0, "setFrame:", 0.0, 0.0, w as f64, h as f64) };
+            // A frame change is not a redraw: without this the resize lands
+            // and the canvas keeps painting the old size until something else
+            // asks for a frame.
+            unsafe { msg0v(self.0, "setNeedsLayout") };
+            unsafe { msg0v(self.0, "setNeedsDisplay") };
+        }
+
         /// # Safety
         /// Kept for API compatibility with the GTK backend; no-op on iOS.
         pub unsafe fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
@@ -602,6 +625,18 @@ mod ios_adapter {
         /// sending a selector the object does not have costs the whole app.
         pub fn set_margin_start(&self, px: i32) {
             core_ios::with_meta_mut(self.0, |m| m.margin_start = px);
+        }
+
+        /// Top inset of the label's contents, in points.
+        ///
+        /// The counterpart to [`Label::set_margin_start`]. There is no
+        /// `UILabel` selector for a vertical inset — not even the AppKit one
+        /// `set_margin_start` cannot use — so this is recorded and not sent,
+        /// for the same reason and with the same justification: see that
+        /// method's comment. The value is in `WidgetMeta`, so a backend that
+        /// can honour it has it.
+        pub fn set_margin_top(&self, px: i32) {
+            core_ios::with_meta_mut(self.0, |m| m.margin_top = px);
         }
 
         /// Set the x alignment of the label's text (0.0 left .. 1.0 right).
