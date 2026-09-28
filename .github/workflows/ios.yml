@@ -273,12 +273,27 @@ jobs:
           # boot, draw, arm the edit script and tick four times (~250ms) and
           # then exited - reporting nothing wrong at any point, which is why it
           # took a `launchctl` liveness probe to find.
+          # `--stdout=<file>`, not `--console-pty`.
+          #
+          # `--console-pty` gives the app a PTY, which has a small fixed
+          # buffer. Nothing at the far end necessarily keeps draining it, and
+          # once it is full the app's own `write(2)` blocks - on the main
+          # thread, so the whole app freezes mid-frame with no crash report,
+          # no exception, and a screenshot that looks perfectly healthy.
+          #
+          # That is what the last runs showed: the app committed A1, drew
+          # twice, and then went completely silent while still alive. A1 is
+          # the first edit, and its repaint is the first frame big enough to
+          # matter - the chrome-only frames before it are small, which is why
+          # the app survived them. A regular file cannot fill up, and it is
+          # what `simctl launch` offers for exactly this reason.
+          rm -f /tmp/corro-live.log
           if command -v setsid >/dev/null 2>&1; then
-            setsid xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
-              > /tmp/corro-live.log 2>&1 &
+            setsid xcrun simctl launch --stdout=/tmp/corro-live.log \
+              "$SIM_UDID" com.corro.corro >/dev/null 2>&1 &
           else
-            nohup xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
-              > /tmp/corro-live.log 2>&1 &
+            nohup xcrun simctl launch --stdout=/tmp/corro-live.log \
+              "$SIM_UDID" com.corro.corro >/dev/null 2>&1 &
           fi
           echo "launch pid $!"
           disown 2>/dev/null || true
