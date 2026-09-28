@@ -242,9 +242,28 @@ jobs:
           # be affected by whatever the launch does to the environment.
           EDIT_SCRIPT="400:A1=1,900:A2=22,1400:A3==A1+A2,1900:B1=-3.5,2400:B2=123456789,2900:C1=long text that will not fit the cell,3400:C2==SUM(A1:A3),3900:A5=5.25"
           export SIMCTL_CHILD_CORRO_EDIT_SCRIPT="$EDIT_SCRIPT"
-          xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
+          # Launch the app, keeping it alive across steps.
+          #
+          # Two things are going on and both were found the hard way.
+          #
+          # `nohup ... &` rather than a bare `&`: the launch is backgrounded
+          # inside a step, and when that step's shell exits the process group
+          # takes the app's session with it. The app then lived long enough to
+          # boot, draw two frames, arm the edit script and tick four times
+          # (~250ms), and then exited - while every log line said it was fine.
+          # The symptom the checks saw was a screenshot of the springboard,
+          # which is what this whole workflow exists to prevent, so it is worth
+          # being explicit that the app was not "showing the wrong screen": it
+          # was gone.
+          #
+          # `--console-pty` is kept because it is how the app's stderr reaches
+          # a file, and every diagnostic here (the phase markers, the
+          # selector tracing, the per-tick log) depends on it. `nohup` plus
+          # the redirect is what makes the pty outlive the step.
+          nohup xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
             > /tmp/corro-live.log 2>&1 &
           echo "launch pid $!"
+          disown 2>/dev/null || true
 
           # Wait for the app's own readiness marker. `ios backend initialised`
           # is printed by Rust once the host has handed over the root view, so
