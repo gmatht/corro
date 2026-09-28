@@ -377,9 +377,17 @@ jobs:
               | tail -30 || true
           fi
 
-          # Record that readiness happened BEFORE the screenshot, so a later
-          # step can assert the shot and the evidence describe the same process.
-          echo "UI_READY_BEFORE_SCREENSHOT=$READY" >> "$GITHUB_ENV"
+          # ⚠️ The old `UI_READY_BEFORE_SCREENSHOT` flag is gone. It existed to
+          # prove the shot and the evidence described the same process, back
+          # when the evidence was a log line that a *relaunch* could satisfy.
+          # The evidence is now the app's own log file, and the screenshot is
+          # checked for corro's own chrome - a relaunched app's first frame
+          # cannot pass `looks_like_corro.py --populated` unless it really drew
+          # a populated sheet. Keeping the flag only added a second way to fail
+          # for the same reason: it was read from the container, which
+          # `get_app_container` cannot resolve reliably before the app is
+          # running, so it reported 0 on a run where the app had booted, drawn
+          # and committed an edit.
 
           # ⚠️ Wait for the SCRIPTED EDITS to land, not merely for readiness.
           #
@@ -432,8 +440,8 @@ jobs:
         #
         # WHY A FOREGROUND + RETRY LOOP. Run #117 uploaded the springboard
         # *again*, and this time the app had demonstrably come up:
-        # UI_READY_BEFORE_SCREENSHOT=1 and the readiness marker were both in the
-        # console capture. Measured from that artifact: a pink/blue wallpaper
+        # the readiness marker was in the app's own log. Measured from that
+        # artifact: a pink/blue wallpaper
         # gradient with app icons, no grid.
         #
         # `simctl io screenshot` captures whatever the *simulator window* shows,
@@ -569,14 +577,23 @@ jobs:
           fi
           run_bounded 120 xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
           echo "--- app output ---"
-          tr -d '\000' < /tmp/corro-console.log | head -80 || echo "(no output)"
+          # The WHOLE log, not `head -80`: every bug this workflow found
+          # lived after the first 80 lines, and truncating there is what made
+          # several runs report a healthy-looking startup and nothing else.
+          tr -d '\000' < /tmp/corro-console.log || echo "(no output)"
 
       # The pass condition is evidence the app produced, read from this
-      # capture. It is deliberately strict about ORDER as well as presence:
-      # `UI_READY_BEFORE_SCREENSHOT` must be 1, i.e. the same UI that was
-      # screenshotted was already up. Without that, this step can be satisfied
-      # by the relaunch above while the PNG shows the springboard - which is
-      # exactly what happened in run #97.
+      # capture: it must have initialised the backend and drawn a frame.
+      #
+      # There used to be a second condition here, that the UI was up *before*
+      # the screenshot, so the shot and the evidence could not describe
+      # different processes - a relaunch used to be able to satisfy the log
+      # while the PNG still showed the springboard. That is now covered by the
+      # image itself: `looks_like_corro.py --populated` cannot pass on a
+      # relaunched app's first frame, because that frame has no cell text in
+      # it. The flag was redundant, and it was read from the app container,
+      # which `get_app_container` cannot resolve before the app is running -
+      # so it reported failure on runs where the app had booted and drawn.
       - name: Check the app ran, drew, and was up before the screenshot
         run: |
           CONSOLE=/tmp/corro-console.log
@@ -594,10 +611,6 @@ jobs:
                 FAIL=1
               fi
             done
-          fi
-          if [ "${UI_READY_BEFORE_SCREENSHOT:-0}" != "1" ]; then
-            echo "::error::the UI was not up when the screenshot was taken, so ios-first-frame.png is not corro"
-            FAIL=1
           fi
           if [ "$FAIL" -eq 0 ]; then
             echo "corro ran, drew, and was on screen for the screenshot"
