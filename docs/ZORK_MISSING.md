@@ -216,6 +216,23 @@ matters as much as the adapter's.
 
 ---
 
+## 6. Night mode and the Grue (added after the enumeration)
+
+Not a parity gap — a zork-only feature the model needed to grow.
+
+| # | Item | State |
+|---|------|-------|
+| N1 | `ZorkState::night_mode` + `grue_warned`, `is_night`, `set_night_mode` | `[x]` |
+| N2 | `ZorkState::grue_warning` — latched per dark period, so repeated `look` does not nag | `[x]` |
+| N3 | `ZorkState::dark_room_description` — replaces the room tour while dark | `[x]` |
+| N4 | `Snapshot::night_mode` so a test can assert it | `[x]` |
+| N5 | REPL `light`/`lantern`, `dark`/`douse`, `grue` verbs | `[x]` |
+| N6 | REPL warns on `look` and on every move; `examine` reports darkness | `[x]` |
+
+The dungeon starts dark. Lighting and dousing the lantern re-arms the warning,
+because a room that was lit and then went dark is a new hazard rather than the
+same one.
+
 ## Implementation order
 
 1. **Unblock the build** — B1..B6. Nothing else can be verified until

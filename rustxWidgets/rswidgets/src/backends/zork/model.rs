@@ -342,6 +342,8 @@ pub struct Snapshot {
     pub overlay_pass_through: HashMap<usize, bool>,
     /// Spreadsheet cells keyed by `(row, col)`, flattened for easy lookup.
     pub cells: HashMap<(u32, u32), SheetCell>,
+    /// Whether the dungeon is dark.
+    pub night_mode: bool,
 }
 
 pub struct ZorkState {
@@ -357,6 +359,14 @@ pub struct ZorkState {
     /// Named actions, so `MenuBar` dispatch can resolve an action name to the
     /// `SimpleAction` node that registered it.
     pub action_names: HashMap<String, usize>,
+    /// Whether the dungeon is dark. Starts `true` — a Zork dungeon with no
+    /// light source is dark by definition, and the REPL warns about the Grue
+    /// while it is. See [`ZorkState::set_night_mode`].
+    pub night_mode: bool,
+    /// Whether the player has already been warned about the Grue since the
+    /// light last changed, so a repeated `look` does not print the same line
+    /// forever.
+    pub grue_warned: bool,
 }
 
 impl Default for ZorkState {
@@ -376,6 +386,9 @@ impl ZorkState {
             menu_items: HashMap::new(),
             focused: None,
             action_names: HashMap::new(),
+            // A dungeon is dark until lit.
+            night_mode: true,
+            grue_warned: false,
         }
     }
 
@@ -1027,18 +1040,12 @@ impl ZorkState {
         }
     }
 
-<<<<<<< HEAD
-    /// Compute the size of a `BoxWidget` from its children: the sum of the
-    /// children along the packing axis (plus `spacing` between them) and the
-    /// max on the cross axis. Returns `None` for a non-box node.
-=======
     /// Compute the size a `BoxWidget` needs for its visible children: the sum
     /// of the children's extent along the *packing* axis (plus `spacing`
     /// between them) and the largest extent on the cross axis.
     ///
     /// A horizontal box packs along x, so its width is the sum of the child
     /// widths and its height the tallest child. Returns `None` for a non-box.
->>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
     pub fn measure_box(&self, id: usize) -> Option<(i32, i32)> {
         let n = self.node(id)?;
         let (horizontal, spacing) = match n.kind {
@@ -1054,24 +1061,6 @@ impl ZorkState {
         if kids.is_empty() {
             return Some((0, 0));
         }
-<<<<<<< HEAD
-        let main: i32 = kids.iter().filter_map(|c| c.props.width).sum::<i32>()
-            + spacing * (kids.len() as i32 - 1).max(0);
-        let cross: i32 = kids
-            .iter()
-            .filter_map(|c| c.props.height)
-            .max()
-            .unwrap_or(0);
-        Some(if horizontal { (main, cross) } else { (cross, main) })
-    }
-
-    /// Assign sequential positions to a box's visible children along the
-    /// packing axis, honouring `spacing`, and record each child's size from
-    /// its own size request (falling back to the measured box size).
-    ///
-    /// This is what makes `BoxWidget::layout(x, y, w, h)` a real operation
-    /// rather than a discarded argument list.
-=======
         // `pick` selects a child's extent on the requested axis.
         let main_of = |k: &ZorkNode| if horizontal { k.props.width } else { k.props.height };
         let cross_of = |k: &ZorkNode| if horizontal { k.props.height } else { k.props.width };
@@ -1088,7 +1077,6 @@ impl ZorkState {
     /// a child with no size request advances by nothing. Each child keeps its
     /// own size request — this is a positioning pass, not a resize pass; use
     /// [`Self::set_size_request`] to size children first.
->>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
     pub fn layout_box(&mut self, id: usize, x: i32, y: i32, w: i32, h: i32) {
         let (horizontal, spacing) = match self.node(id) {
             Some(n) => match n.kind {
@@ -1105,38 +1093,6 @@ impl ZorkState {
             .into_iter()
             .filter(|c| self.node(*c).is_some_and(|n| n.props.visible))
             .collect();
-<<<<<<< HEAD
-        if kids.is_empty() {
-            return;
-        }
-        // Cross-axis extent available to each child.
-        let cross_total = if horizontal { h } else { w };
-        let mut main = x;
-        let mut cross = y;
-        for (i, kid) in kids.iter().enumerate() {
-            let (kx, ky) = self
-                .node(*kid)
-                .map(|n| (n.props.offset_x.unwrap_or(0), n.props.offset_y.unwrap_or(0)))
-                .unwrap_or((0, 0));
-            if horizontal {
-                self.set_offset(*kid, main + kx, y + ky);
-                let ch = self.node(*kid).and_then(|n| n.props.height).unwrap_or(cross_total);
-                main += ch.max(0) + spacing;
-            } else {
-                self.set_offset(*kid, x + kx, main + ky);
-                let cw = self.node(*kid).and_then(|n| n.props.width).unwrap_or(cross_total);
-                main += cw.max(0) + spacing;
-            }
-            if i == 0 && self.node(*kid).and_then(|n| n.props.width).is_none() {
-                // Give the first child the whole cross extent so a single-child
-                // box fills it.
-                if horizontal {
-                    self.set_size_request(*kid, self.node(*kid).and_then(|n| n.props.width).unwrap_or(0), cross_total);
-                } else {
-                    self.set_size_request(*kid, cross_total, self.node(*kid).and_then(|n| n.props.height).unwrap_or(0));
-                }
-            }
-=======
         let mut main = if horizontal { x } else { y };
         for kid in kids {
             let extent = self
@@ -1150,7 +1106,6 @@ impl ZorkState {
                 self.set_offset(kid, x, main);
             }
             main += extent + spacing;
->>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
         }
     }
 
@@ -1777,6 +1732,49 @@ impl ZorkState {
         }
     }
 
+    // -- Light --
+
+    /// Turn the light on or off.
+    ///
+    /// Going from dark to light clears [`Self::grue_warned`], so the next
+    /// `look` in the dark warns again — a dungeon that was lit and then went
+    /// dark is a new hazard, not the same one.
+    pub fn set_night_mode(&mut self, night: bool) {
+        self.night_mode = night;
+        if !night {
+            self.grue_warned = false;
+        }
+    }
+
+    /// Whether the dungeon is dark.
+    pub fn is_night(&self) -> bool {
+        self.night_mode
+    }
+
+    /// The Grue warning, or `None` when there is nothing to say: it is light,
+    /// or the player has already been warned since the light last changed.
+    ///
+    /// The warning is latched rather than repeated so a player poking around
+    /// with `look` is not nagged on every command, but a light-then-dark cycle
+    /// arms it again.
+    pub fn grue_warning(&mut self) -> Option<&'static str> {
+        if !self.night_mode || self.grue_warned {
+            return None;
+        }
+        self.grue_warned = true;
+        Some(
+            "It is pitch dark, and you feel a presence. A grue lurks in the \
+             darkness here, and it is very likely to eat you.",
+        )
+    }
+
+    /// The dark-room description, used when the player cannot see. A lit room
+    /// is described normally, so this is only reached under night mode.
+    pub fn dark_room_description(&self) -> &'static str {
+        "You are in a dark room you cannot see. If a grue is here, it will \
+         surely eat you. Light the lantern with 'light' before you go further."
+    }
+
     pub fn quit(&mut self) {
         self.running = false;
     }
@@ -1886,6 +1884,7 @@ impl ZorkState {
             focused: self.focused,
             overlay_pass_through,
             cells,
+            night_mode: self.night_mode,
         }
     }
 }
@@ -2021,18 +2020,12 @@ mod tests {
         s.append_child(bx, b);
         s.set_size_request(a, 30, 10);
         s.set_size_request(b, 30, 20);
-<<<<<<< HEAD
-        // Vertical: main axis is height (10+20+2), cross is max width (30).
-=======
         // A vertical box packs along y: height = 10 + 20 + 2*spacing,
         // width = the widest child (30).
->>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
         assert_eq!(s.measure_box(bx), Some((30, 32)));
     }
 
     #[test]
-<<<<<<< HEAD
-=======
     fn measure_box_horizontal_sums_widths() {
         let mut s = ZorkState::new();
         s.create_window();
@@ -2048,7 +2041,6 @@ mod tests {
     }
 
     #[test]
->>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
     fn grid_attach_grows_grid() {
         let mut s = ZorkState::new();
         s.create_window();
@@ -2246,11 +2238,7 @@ mod tests {
         let fired = Rc::new(Cell::new(0));
         {
             let f = fired.clone();
-<<<<<<< HEAD
-            s.add_callback(d, Box::new(move || f.set(f.get() + 1)));
-=======
             s.add_response_callback(d, Box::new(move |_| f.set(f.get() + 1)));
->>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
         }
         s.dialog_respond(d, 1);
         assert_eq!(fired.get(), 0, "unregistered response must not fire");
@@ -2368,6 +2356,64 @@ mod tests {
         let l = s.create_label("x");
         s.set_fixed_width(l, Some(120));
         assert_eq!(s.get_size_request(l), Some((Some(120), None)));
+    }
+
+    // -- Night mode / the Grue --
+
+    #[test]
+    fn dungeon_starts_dark() {
+        let s = ZorkState::new();
+        assert!(s.is_night(), "a dungeon with no lantern is dark");
+    }
+
+    #[test]
+    fn grue_warning_appears_once_per_dark_period() {
+        let mut s = ZorkState::new();
+        assert!(s.grue_warning().is_some(), "the first look warns");
+        assert!(s.grue_warning().is_none(), "and does not nag afterwards");
+        assert!(s.grue_warning().is_none());
+    }
+
+    #[test]
+    fn lighting_up_silences_the_grue() {
+        let mut s = ZorkState::new();
+        assert!(s.grue_warning().is_some());
+        s.set_night_mode(false);
+        assert!(s.grue_warning().is_none(), "no grue in a lit room");
+    }
+
+    #[test]
+    fn going_dark_again_rewarns() {
+        let mut s = ZorkState::new();
+        assert!(s.grue_warning().is_some());
+        s.set_night_mode(false);
+        assert!(s.grue_warning().is_none());
+        s.set_night_mode(true);
+        assert!(s.grue_warning().is_some(), "a fresh darkness is a new hazard");
+    }
+
+    #[test]
+    fn night_mode_is_in_the_snapshot() {
+        let mut s = ZorkState::new();
+        assert!(s.snapshot().night_mode);
+        s.set_night_mode(false);
+        assert!(!s.snapshot().night_mode);
+    }
+
+    #[test]
+    fn dark_room_text_names_the_grue_and_the_way_out() {
+        let s = ZorkState::new();
+        let text = s.dark_room_description().to_lowercase();
+        assert!(text.contains("grue"), "warns about the grue: {text}");
+        assert!(text.contains("light"), "says what to do about it: {text}");
+    }
+
+    #[test]
+    fn grue_warning_mentions_being_eaten() {
+        let mut s = ZorkState::new();
+        let w = s.grue_warning().unwrap().to_lowercase();
+        assert!(w.contains("grue"), "{w}");
+        assert!(w.contains("eat"), "the threat is spelled out: {w}");
     }
 
     #[test]

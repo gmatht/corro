@@ -164,6 +164,20 @@ fn dir_name(dirs: &[(&str, &ZorkNode)], id: usize) -> String {
 
 fn describe_room(state: &ZorkState, node: &ZorkNode) {
     println!();
+    // In the dark you cannot see the room, but you absolutely can be eaten.
+    // This is checked before the room itself, because a player who is about to
+    // be killed by a grue should be told so before they get a detailed tour of
+    // the furniture.
+    if state.is_night() {
+        println!("{}", state.dark_room_description());
+    } else {
+        describe_room_lit(state, node);
+    }
+}
+
+/// The normal, sighted description. Split out so the night-mode check in
+/// [`describe_room`] reads as a gate rather than as another match arm.
+fn describe_room_lit(state: &ZorkState, node: &ZorkNode) {
     match &node.kind {
         ZorkKind::Window { title } => {
             println!("You are in a Window{}", if title.is_empty() { ".".to_string() } else { format!(" titled \"{}\".", title) });
@@ -328,6 +342,34 @@ fn execute_command(state: &mut ZorkState, line: &str) {
         "look" | "l" => {
             if let Some(node) = state.node(state.current_id) {
                 describe_room(state, node);
+                warn_grue(state);
+            }
+        }
+        "light" | "lantern" => {
+            if state.is_night() {
+                state.set_night_mode(false);
+                println!("You light the lantern. The room comes into view, and you feel a great deal safer.");
+            } else {
+                println!("The lantern is already lit.");
+            }
+        }
+        "dark" | "douse" => {
+            if state.is_night() {
+                println!("It is already pitch dark.");
+            } else {
+                state.set_night_mode(true);
+                println!("You douse the lantern. The room vanishes.");
+            }
+            // Going dark is exactly when a warning is due.
+            warn_grue(state);
+        }
+        "grue" => {
+            // The player is checking for one. Answer honestly, and do not
+            // latch the warning here: asking should always be answerable.
+            if state.is_night() {
+                println!("You feel it. The grue is here, lurking in the dark, and it is very likely to eat you.");
+            } else {
+                println!("No grue here. The light keeps it at bay.");
             }
         }
         "go" | "g" => {
@@ -734,6 +776,9 @@ fn execute_command(state: &mut ZorkState, line: &str) {
             println!("  select / choose <n>   - select a menu item from a MenuBar/Menu");
             println!("  examine / x [n]       - examine something in detail");
             println!("  type / write          - enter text into an Entry (sub-prompt)");
+            println!("  light / lantern       - light the lantern (the grue fears it)");
+            println!("  dark / douse          - douse the lantern, and meet the grue");
+            println!("  grue                  - ask whether a grue is here");
             println!("  read                  - read text at current location");
             println!("  toggle                - toggle a CheckButton/RadioButton");
             println!("  props                 - show this widget's recorded properties");
@@ -779,6 +824,19 @@ fn parse_pair_f64(value: &str) -> Option<(f64, f64)> {
     let a = it.next()?.parse().ok()?;
     let b = it.next()?.parse().ok()?;
     Some((a, b))
+}
+
+/// Print the Grue warning, if one is due.
+///
+/// The model latches it per dark period, so a player who runs `look` in a loop
+/// is warned once rather than every command — but lighting and dousing the
+/// lantern re-arms it, because a room that was lit and then went dark is a new
+/// hazard rather than the same one.
+fn warn_grue(state: &mut ZorkState) {
+    if let Some(text) = state.grue_warning() {
+        println!();
+        println!("{}", text);
+    }
 }
 
 fn resolve_arg_to_id(state: &ZorkState, arg: &str) -> Option<usize> {    if let Ok(num) = arg.parse::<usize>() {
@@ -865,12 +923,14 @@ fn navigate_to(state: &mut ZorkState, dir: &str) {
         state.prev_location = Some(state.current_id);
         state.current_id = target_id;
         println!("You go {}.", dir);
+        warn_grue(state);
     } else if let Ok(num) = dir.parse::<usize>() {
         if let Some(id) = resolve_number_target(state, num) {
             let desc = state.node(id).map(|n| short_desc(state, n)).unwrap_or_default();
             state.prev_location = Some(state.current_id);
             state.current_id = id;
             println!("You move to {}.", desc);
+            warn_grue(state);
         } else {
             println!("You can't go that way.");
         }
@@ -879,8 +939,17 @@ fn navigate_to(state: &mut ZorkState, dir: &str) {
     }
 }
 
-fn examine(state: &ZorkState, id: usize) {
+fn examine(state: &mut ZorkState, id: usize) {
     if let Some(node) = state.node(id) {
+        if state.is_night() {
+            // You cannot make out the details, but you can feel the grue.
+            println!("You cannot see it in the dark.");
+            if let Some(text) = state.grue_warning() {
+                println!();
+                println!("{}", text);
+            }
+            return;
+        }
         match &node.kind {
             ZorkKind::Label { text } => {
                 println!("The label reads:");

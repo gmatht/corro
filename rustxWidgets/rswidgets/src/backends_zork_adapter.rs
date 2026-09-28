@@ -12,11 +12,7 @@
 //! sense for a headless model is now wired through.
 
 use std::os::raw::c_void;
-<<<<<<< HEAD
-use crate::backends::zork::{MenuItemData, MenuItemKind};
-=======
 use crate::backends::zork::MenuItemData;
->>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
 use crate::core::{Error, Widget};
 
 /// Extract a model node id from a widget handle's raw pointer.
@@ -449,22 +445,6 @@ impl Label {
 pub enum Orientation {
     Horizontal,
     Vertical,
-<<<<<<< HEAD
-}
-
-#[derive(Clone)]
-pub struct BoxWidget {
-    pub(crate) id: usize,
-    pub(crate) orientation: Orientation,
-    pub(crate) spacing: i32,
-}
-
-impl Widget for BoxWidget {
-    fn raw_handle(&self) -> *mut c_void {
-        &self.id as *const usize as *mut c_void
-    }
-=======
->>>>>>> 184a0b72 (feat(zork): make the zork backend build and cover the GTK/NWG surface)
 }
 
 #[derive(Clone)]
