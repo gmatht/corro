@@ -118,8 +118,17 @@ pub extern "system" fn Java_com_corro_SheetView_nativeGestureDown(
     let _ = corro::gui::android_backend::gesture_down(canvas_id as u64, x as f64, y as f64, is_touch != 0);
 }
 
-/// Called from `SheetView` on `GestureDetector.onLongPress`: arms selection so
-/// the drag that follows extends the selection instead of scrolling.
+/// Called from `SheetView` on `GestureDetector.onLongPress`.
+///
+/// Returns one of the shared `DragOutcome`-shaped codes: `4` (the long press
+/// armed a range selection, and the drag that follows extends it) or `5`
+/// (open the cell context menu — a phone's substitute for a right-click).
+///
+/// The host does not decide which; it asks, and acts on the answer, because
+/// the decision needs the gesture state only Rust has (whether the finger
+/// moved past the drag slop, whether the press was on the sheet at all).
+/// Before this existed the long press could only arm a selection, so the
+/// sheet had no route to `open_sheet_context_menu` from touch.
 #[no_mangle]
 pub extern "system" fn Java_com_corro_SheetView_nativeGestureLongPress(
     _env: JNIEnv,
@@ -127,8 +136,14 @@ pub extern "system" fn Java_com_corro_SheetView_nativeGestureLongPress(
     canvas_id: i64,
     x: f32,
     y: f32,
-) {
-    let _ = corro::gui::android_backend::gesture_long_press(canvas_id as u64, x as f64, y as f64);
+    menu_mode: jni::sys::jboolean,
+) -> jni::sys::jint {
+    corro::gui::android_backend::gesture_long_press(
+        canvas_id as u64,
+        x as f64,
+        y as f64,
+        menu_mode != 0,
+    )
 }
 
 /// Called from `SheetView.onTouchEvent(ACTION_MOVE)` during an active gesture.
@@ -342,4 +357,99 @@ pub extern "system" fn Java_com_corro_CorroLayout_nativeLayout(
     view_ptr: i64,
 ) {
     rswidgets::backends_android_adapter::dispatch_layout(view_ptr as *mut _);
+}
+
+/// Called from `SheetView.onKeyDown` (or `CorroKeyView`), `MainActivity` and
+/// `CorroKeyListener`: hand a key to corro's shared `handle_key`.
+///
+/// This is the bridge that makes the whole of the shared key handler
+/// reachable on a phone. Before it existed, `dispatch_canvas_key` had a live
+/// registry that nothing ever called, so every desktop binding in
+/// `gui_backend::handle_key` — cursor arrows, Shift+arrows to extend a
+/// selection, Home/End, PageUp/PageDown, Tab, Escape, Delete/Backspace,
+/// F1/F2/F3, and the Ctrl accelerators — was dead on Android. The only key
+/// that ever arrived was Enter, through the IME editor-action listener.
+///
+/// `keyCode` and `metaMask` are Android's own values; the translation to the
+/// GDK keysym and the GdkModifierType bitmask happens in Rust, so
+/// `handle_key` needs no Android arm. `canvasId` is the canvas that should
+/// see the key (0 when none is focused); `viewPtr` is a focused entry, if
+/// any, which is routed to the entry's own handler instead.
+///
+/// Returns true when a handler consumed the key, so the Java side knows
+/// whether to swallow it (`onKeyDown` returning true) or let the platform
+/// have it.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_CorroKeyBridge_nativeKey(
+    _env: JNIEnv,
+    _class: JClass,
+    key_code: jni::sys::jint,
+    meta_mask: jni::sys::jint,
+    canvas_id: jni::sys::jlong,
+    view_ptr: jni::sys::jlong,
+) -> jni::sys::jboolean {
+    // A focused entry takes the key first, exactly as on a desktop where the
+    // EditText's controller runs before the window's. Returning early matters
+    // because the entry handler is where an in-cell caret key is applied; a
+    // key that fell through to the grid handler would move the cursor while
+    // the user was editing.
+    if view_ptr != 0 && corro::gui::android_backend::dispatch_entry_key(
+        view_ptr as u64,
+        key_code,
+        meta_mask,
+    ) {
+        return 1;
+    }
+    let canvas = if canvas_id == 0 {
+        None
+    } else {
+        Some(canvas_id as u64)
+    };
+    let handled = corro::gui::android_backend::dispatch_key(key_code, meta_mask, canvas);
+    jni::sys::jboolean::from(handled)
+}
+
+/// Called from `SheetView.onGenericMotionEvent`: a mouse right-click, which on
+/// Android is a `BUTTON_SECONDARY` press rather than a touch.
+///
+/// This is the platform half of `gui_backend::open_sheet_context_menu`, whose
+/// `on_click_button` registration previously had no Android source at all. The
+/// long-press on a finger reaches the same place through `SheetView`'s gesture
+/// detector; this is the mouse equivalent, so the emulator's pointer behaves
+/// like a desktop's.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeClickButton(
+    _env: JNIEnv,
+    _class: JClass,
+    canvas_id: i64,
+    x: f32,
+    y: f32,
+    button: i32,
+    mods: i32,
+) {
+    rswidgets::backends_android_adapter::dispatch_canvas_click_button(
+        canvas_id as u64,
+        x as f64,
+        y as f64,
+        button as u32,
+        mods as u32,
+    );
+}
+
+/// Called from `SheetView` after a long press reported that it wants a menu:
+/// open the cell context menu for the pressed cell.
+///
+/// This is the Android half of a desktop right-click. Before the pointer
+/// bridge existed, `open_sheet_context_menu` always reported
+/// `SHEET_MENU_UNAVAILABLE` — `Canvas::on_click_button` had no Android
+/// source and the long press was already spoken for by range selection — so a
+/// phone had no way to reach the cell actions at all.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeCellContextMenu(
+    _env: JNIEnv,
+    _class: JClass,
+    x: f32,
+    y: f32,
+) {
+    corro::gui::android_backend::open_cell_context_menu(x as f64, y as f64);
 }

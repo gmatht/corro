@@ -3652,6 +3652,69 @@ impl Dialog {
         }
     }
 
+    /// Show the dialog's children and let GTK measure it, without mapping
+    /// it.
+    ///
+    /// `present` does both at once, which is the wrong order for a caller
+    /// that attaches a custom view: the window opens at the height of
+    /// nothing and the content appears a frame later. `show_all` forces a
+    /// synchronous layout pass, so sizing the dialog *after* it is built
+    /// already knows the content's natural size.
+    ///
+    /// This is the `layout_dialog` the cross-backend wrapper forwards to, and
+    /// it is what the Android adapter answers with `AlertDialog.create` (a
+    /// measure pass) followed by a separate `show`.
+    pub fn layout_dialog(&self) {
+        guard_widget!(self, "Dialog", "layout_dialog");
+        if let Some(show_all) = self.loader.symbols.gtk_widget_show_all {
+            unsafe { show_all(self.inner); }
+        }
+    }
+
+    /// Hide the dialog without destroying it, so `set_visible(true)` can show
+    /// it again.
+    ///
+    /// `close` would not do: it emits `gtk_window_close`, which for a
+    /// `GtkDialog` triggers the delete-event handler and destroys the window.
+    /// `gtk_widget_hide` only unmaps it, which is the difference between
+    /// "hide this dialog" and "throw it away".
+    pub fn set_visible(&self, visible: bool) {
+        guard_widget!(self, "Dialog", "set_visible");
+        if let Some(hide) = self.loader.symbols.gtk_widget_hide {
+            if !visible {
+                unsafe { hide(self.inner); }
+                return;
+            }
+        }
+        if visible {
+            if let Some(show) = self.loader.symbols.gtk_widget_show {
+                unsafe { show(self.inner); }
+            }
+            if let Some(present) = self.loader.symbols.gtk_window_present {
+                unsafe { present(self.inner); }
+            }
+        }
+    }
+
+    /// Run the dialog's nested main loop and return the response id.
+    ///
+    /// `gtk_dialog_run` spins a nested `gtk_main`, which is what makes a
+    /// `Dialog::run` synchronous on a desktop. It is optional in the loader:
+    /// without the symbol the dialog is presented and `0`
+    /// (`GTK_RESPONSE_NONE`) is returned, which is the same answer the mobile
+    /// and terminal backends give, so a caller written once keeps working.
+    pub fn run(&self) -> i32 {
+        if !guard_widget_ptr(self.inner, "Dialog", "run") {
+            return 0;
+        }
+        if let Some(dialog_run) = self.loader.symbols.gtk_dialog_run {
+            return unsafe { dialog_run(self.inner) };
+        }
+        self.layout_dialog();
+        self.present();
+        0
+    }
+
     pub fn response(&self, _response_id: i32) {
         guard_widget!(self, "Dialog", "response");
         if let Some(emit) = self.loader.symbols.g_signal_emit_by_name {

@@ -42,6 +42,7 @@ pub type GtkWindowSetChild = unsafe extern "C" fn(window: *mut c_void, child: *m
 /// `void gtk_widget_show(GtkWidget*)` (GTK3; in GTK4 this is deprecated but
 /// still present as a no-op, so calling it is safe on both).
 pub type GtkWidgetShow = unsafe extern "C" fn(widget: *mut c_void);
+pub type GtkWidgetHide = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetShowAll = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWindowPresent = unsafe extern "C" fn(window: *mut c_void);
 pub type GtkInit = unsafe extern "C" fn(argc: *mut libc::c_int, argv: *mut *mut *mut libc::c_char);
@@ -403,6 +404,7 @@ pub struct Symbols {
     pub gtk_window_set_child: Option<GtkWindowSetChild>,
     pub gtk_widget_show_all: Option<GtkWidgetShowAll>,
     pub gtk_widget_show: Option<GtkWidgetShow>,
+    pub gtk_widget_hide: Option<GtkWidgetHide>,
     pub gtk_window_present: Option<GtkWindowPresent>,
     pub gtk_window_set_application: Option<GtkWindowSetApplication>,
     pub gtk_widget_insert_action_group: Option<GtkWidgetInsertActionGroup>,
@@ -760,6 +762,7 @@ impl Symbols {
         let gtk_window_set_child = unsafe { sym::<GtkWindowSetChild>(gtk, "gtk_window_set_child") };
         let gtk_widget_show_all = unsafe { sym::<GtkWidgetShowAll>(gtk, "gtk_widget_show_all") };
         let gtk_widget_show = unsafe { sym::<GtkWidgetShow>(gtk, "gtk_widget_show") };
+        let gtk_widget_hide = unsafe { sym::<GtkWidgetHide>(gtk, "gtk_widget_hide") };
         let gtk_window_present = unsafe { sym::<GtkWindowPresent>(gtk, "gtk_window_present") };
         let _gtk_window_set_application = unsafe { sym::<GtkWindowSetApplication>(gtk, "gtk_window_set_application") };
         let gtk_file_chooser_native_new = open_sym_try!(libs, "libgio", GtkFileChooserNativeNew, "gtk_file_chooser_native_new").or_else(|| unsafe { sym::<GtkFileChooserNativeNew>(gtk, "gtk_file_chooser_native_new") });
@@ -1050,7 +1053,7 @@ impl Symbols {
             g_object_ref, g_object_unref, g_object_ref_sink, g_signal_connect_data, g_signal_connect,
             gtk_window_new, gtk_window_set_title, gtk_button_new_with_label, gtk_label_new, gtk_label_set_text,
             gtk_box_new, gtk_box_append, gtk_box_pack_start, gtk_container_add, gtk_container_remove, gtk_window_set_child,
-            gtk_widget_show_all, gtk_widget_show, gtk_window_present,
+            gtk_widget_show_all, gtk_widget_show, gtk_widget_hide, gtk_window_present,
             gtk_grid_new, gtk_grid_attach, gtk_entry_new, gtk_entry_set_text, gtk_entry_get_text,
             gtk_entry_set_width_chars, gtk_widget_set_size_request, gtk_entry_set_has_frame,
             gtk_label_set_markup, gtk_widget_set_visible, gtk_widget_grab_focus, gtk_widget_has_focus,

@@ -205,7 +205,20 @@ mod android_adapter {
         }
         pub fn queue_redraw(&self) {}
         pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
-        pub fn on_event_key(&self, _cb: Box<dyn FnMut(u32, u32) -> i32>) {}
+        /// Window-level key fallback, the counterpart of GTK's
+        /// `EventControllerKey` on the toplevel.
+        ///
+        /// This was an empty body, which is the second reason no key reached
+        /// corro on Android (the first was that nothing in the Java host
+        /// called `dispatch_canvas_key` at all). The Activity's `onKeyDown`
+        /// now routes into this registry, so a key that no view claims still
+        /// arrives — which is where Ctrl+Q, Ctrl+S and the other window-level
+        /// accelerators live, because the formula entry deliberately lets
+        /// those through.
+        pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) {
+            let mut map = WINDOW_KEY_CALLBACKS.lock().unwrap();
+            map.insert(0u64, SendWindowKey(Box::into_raw(cb)));
+        }
         pub fn on_close(&self, _cb: Box<dyn FnMut()>) {}
     }
 
@@ -815,6 +828,10 @@ mod android_adapter {
             let mut map = ENTRY_KEYS.lock().unwrap();
             map.insert(self.0 as usize, SendEntryKey(Box::into_raw(cb)));
             crate::backends::android::attach_key_listener(self.0);
+            // The key bridge recovers this handle from the view's tag; a
+            // `View` with no tag is not a corro entry, so the key never
+            // reaches an entry handler that does not exist.
+            crate::backends::android::tag_view_pointer(self.0);
         }
 
         /// Convenience form of [`Entry::on_key_raw`] with no modifiers, the
@@ -1312,6 +1329,33 @@ mod android_adapter {
         }
     }
 
+    /// Window-level key callbacks. There is exactly one window, so the
+    /// registry is keyed by a constant 0 rather than a handle: an Activity is
+    /// a singleton, and a second `on_event_key` replaces the first — the
+    /// same contract GTK's single window controller has.
+    static WINDOW_KEY_CALLBACKS: Lazy<Mutex<HashMap<u64, SendWindowKey>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    struct SendWindowKey(*mut dyn FnMut(u32, u32) -> i32);
+    // SAFETY: guarded by the registry mutex; same pattern as the canvas maps.
+    unsafe impl Send for SendWindowKey {}
+
+    /// Dispatch a key to the window-level handler. Returns the handler's
+    /// value, or 0 when no handler is registered.
+    pub fn dispatch_window_key(keyval: u32, mods: u32) -> i32 {
+        let raw = {
+            let map = WINDOW_KEY_CALLBACKS.lock().unwrap();
+            map.get(&0).map(|s| s.0)
+        };
+        match raw {
+            Some(ptr) => {
+                let cb: &mut dyn FnMut(u32, u32) -> i32 = unsafe { &mut *ptr };
+                cb(keyval, mods)
+            }
+            None => 0,
+        }
+    }
+
     /// Dispatch a key from Java to the registered key closure. Returns
     /// whether a handler consumed it.
     ///
@@ -1757,35 +1801,153 @@ mod android_adapter {
     }
 
     impl MenuBar {
-        pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool {
-            false
+        /// The mnemonic character of the submenu whose label contains
+        /// `keyval`'s letter after an underscore, if any.
+        fn find_submenu_mnemonic(&self, keyval: u32) -> Option<usize> {
+            let ch = char::from_u32(keyval)?.to_ascii_lowercase();
+            self.items.iter().position(|item| match item {
+                MenuItem::Submenu { label, .. } => mnemonic_of(label) == Some(ch),
+                MenuItem::Item { .. } => false,
+            })
+        }
+
+        /// Activate the submenu whose mnemonic is `keyval`, at its natural
+        /// position (the overflow button, which is where the whole menu tree
+        /// lives on a phone).
+        pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
+            let Some(index) = self.find_submenu_mnemonic(keyval) else {
+                return false;
+            };
+            // The tree is one level deeper than the label the caller matched,
+            // so the overflow entry index and the model index differ. The
+            // Java side matches by *label*, which is what the strip was built
+            // with, so the label is what goes over the wire.
+            let MenuItem::Submenu { label, .. } = &self.items[index] else {
+                return false;
+            };
+            crate::backends::android::menu_strip_open_overflow(label)
         }
 
         /// Open the submenu whose mnemonic is `keyval` at a screen position.
         ///
-        /// Only the GTK backend can do this (its `GtkMenu` takes a position
-        /// callback); elsewhere the menu system has no programmatic
-        /// popup-at-position call, so this reports `false` instead of
-        /// pretending. The caller surfaces that as an "unavailable" status.
-        pub fn popup_submenu_by_mnemonic_at(&self, _keyval: u32, _x: i32, _y: i32) -> bool {
-            false
+        /// `x`/`y` are ignored: the overflow popup is anchored to the strip
+        /// itself, not to a caller-chosen point, because a `PopupMenu` on
+        /// Android is positioned by an anchor view and would have to be told
+        /// to fall outside its bounds otherwise. The long-press context menu
+        /// goes through a different path (an `AlertDialog` of the cell
+        /// actions) precisely because it *does* need a point.
+        pub fn popup_submenu_by_mnemonic_at(&self, keyval: u32, _x: i32, _y: i32) -> bool {
+            self.activate_submenu_by_mnemonic(keyval)
         }
-        pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool {
-            false
+
+        pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
+            let Some(ch) = char::from_u32(keyval).map(|c| c.to_ascii_lowercase()) else {
+                return false;
+            };
+            let mut found: Option<String> = None;
+            for item in &self.items {
+                match item {
+                    MenuItem::Item { label, action } => {
+                        if mnemonic_of(label) == Some(ch) {
+                            found = Some(action.clone());
+                            break;
+                        }
+                    }
+                    MenuItem::Submenu { items, .. } => {
+                        for sub in items {
+                            if let MenuItem::Item { label, action } = sub {
+                                if mnemonic_of(label) == Some(ch) {
+                                    found = Some(action.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            match found {
+                // The action registry is keyed by the name the desktop menu
+                // registers, so the *same* action runs here. One dispatch
+                // table, two ways of reaching it — which is why the menu
+                // strip does not need its own copy of any logic.
+                Some(action) => {
+                    invoke_action(&action, std::ptr::null_mut());
+                    true
+                }
+                None => false,
+            }
         }
+
         /// # Safety
         /// Kept for API compatibility; no-op on Android.
         pub unsafe fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
-        pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool {
+
+        /// `Alt` + the mnemonic letter, opening that submenu.
+        pub fn handle_mnemonic_key(&self, keyval: u32) -> bool {
+            self.activate_submenu_by_mnemonic(keyval)
+        }
+
+        /// A key with modifiers, when a menu is open: a letter selects an
+        /// item, Escape closes it. Mirrors the desktop contract, where
+        /// `handle_menu_key` is the "a menu is active, interpret this key"
+        /// entry point.
+        pub fn handle_menu_key(&self, keyval: u32, _modifiers: u32) -> bool {
+            if keyval == ESCAPE_KEY {
+                if self.menu_active() {
+                    self.menu_close();
+                }
+                return true;
+            }
+            if MENU_ACTIVE.with(|a| a.get()) {
+                return self.activate_submenu_item_by_mnemonic(keyval);
+            }
             false
         }
-        pub fn handle_menu_key(&self, _keyval: u32, _modifiers: u32) -> bool {
-            false
-        }
+
         pub fn menu_active(&self) -> bool {
-            false
+            MENU_ACTIVE.with(|a| a.get())
         }
-        pub fn menu_close(&self) {}
+
+        pub fn menu_close(&self) {
+            crate::backends::android::menu_strip_close_overflow();
+            MENU_ACTIVE.with(|a| a.set(false));
+        }
+    }
+
+    /// `ESCAPE`'s keysym, for `handle_menu_key`. The unix set, which is what
+    /// `core::key` defines for every non-Windows target.
+    const ESCAPE_KEY: u32 = 0xFF1B;
+
+    /// Whether a menu popup is open, and the submenu it holds.
+    ///
+    /// This is what makes `menu_active` a real answer rather than `false`:
+    /// the desktop uses it to decide whether a plain letter key should be
+    /// routed to menu selection instead of starting a cell edit, and a
+    /// constant `false` meant that on Android an open menu and a typed
+    /// character collided.
+    thread_local! {
+        static MENU_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Called from the menu strip when its overflow opens or closes, so
+    /// `menu_active` tracks reality.
+    pub fn set_menu_active(active: bool) {
+        MENU_ACTIVE.with(|a| a.set(active));
+    }
+
+    /// The character a menu label declares as its mnemonic, i.e. the one
+    /// after an underscore (`"_Save"` -> `'s'`), upper- or lower-cased.
+    ///
+    /// The menu model's labels are the *shared* ones, so they carry GTK
+    /// mnemonics; the Android strip strips the underscore for display, but
+    /// the model keeps it, which is what makes a mnemonic key work here
+    /// without a second definition of the menu.
+    fn mnemonic_of(label: &str) -> Option<char> {
+        let (_, rest) = label.split_once('_')?;
+        rest.chars().next().map(|c| c.to_ascii_lowercase())
     }
 
     #[derive(Clone)]

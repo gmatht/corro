@@ -196,7 +196,10 @@ pub fn gesture_down(canvas_id: u64, x: f64, y: f64, is_touch: bool) -> i32 {
 /// The long-press recogniser fired: arm selection for the drag that follows.
 #[cfg(target_os = "ios")]
 pub fn gesture_long_press(canvas_id: u64, x: f64, y: f64) -> i32 {
-    super::gui_backend::mobile_gesture_long_press(canvas_id, x, y)
+    // iOS keeps the long press as a range-selection arm: the iPhone
+    // host reserves the long press for selection and opens context menus
+    // from its own two-finger tap. `false` is `menu_mode = false`.
+    super::gui_backend::mobile_gesture_long_press(canvas_id, x, y, false)
 }
 
 /// A pointer move during a gesture. Returns the shared outcome code

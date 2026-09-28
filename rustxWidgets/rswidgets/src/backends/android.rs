@@ -330,7 +330,9 @@ mod android_backend {
                 "(Landroid/content/Context;Ljava/lang/String;)V",
                 &[(&ctx).into(), (&j_title).into()],
             )?;
-            make_global_ref(env, &strip)
+            let raw = make_global_ref(env, &strip)?;
+            *MENU_STRIP.lock().unwrap() = env.new_global_ref(&strip).ok();
+            Ok(raw)
         })
     }
 
@@ -367,6 +369,48 @@ mod android_backend {
             Ok::<_, Box<dyn StdError + Send + Sync>>(())
         });
     }
+
+    /// Open the menu strip's overflow popup with `label` expanded.
+    ///
+    /// The Java side ignores an unknown label, so a mnemonic for a menu the
+    /// strip does not have does nothing rather than opening an unrelated
+    /// menu.
+    pub fn menu_strip_open_overflow(label: &str) -> bool {
+        let opened = with_env_and_activity(|env, _activity| {
+            let strip = MENU_STRIP
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or("no menu strip")?;
+            let j_label = env.new_string(label)?;
+            env.call_method(
+                strip.as_obj(),
+                "showOverflowFor",
+                "(Ljava/lang/String;)V",
+                &[(&j_label).into()],
+            )?;
+            Ok::<bool, Box<dyn StdError + Send + Sync>>(true)
+        });
+        // A missing strip (a host without one) is `false`, which the caller
+        // surfaces as an unavailable status rather than pretending a menu
+        // opened.
+        opened.unwrap_or(false)
+    }
+
+    /// Close the strip's overflow popup, if open.
+    pub fn menu_strip_close_overflow() {
+        let strip = MENU_STRIP.lock().unwrap().clone();
+        let Some(strip) = strip else { return };
+        let _ = with_env_and_activity(|env, _activity| {
+            env.call_method(strip.as_obj(), "closeOverflow", "()V", &[])?;
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    /// The most recently built menu strip. There is one, because an Activity
+    /// has one menu bar; a second `create_menu_strip` replaces the handle
+    /// (an Activity recreated after rotation builds a new one).
+    static MENU_STRIP: Lazy<Mutex<Option<GlobalRef>>> = Lazy::new(|| Mutex::new(None));
 
     pub fn create_label(text: &str) -> Result<jni::sys::jobject, Box<dyn StdError + Send + Sync>> {
         with_env_and_activity(|env, activity| {
@@ -1507,6 +1551,119 @@ mod android_backend {
         });
     }
 
+    // ---- Key translation ----
+
+    /// Android `KeyEvent` constants, named. These are stable ints from API 1,
+    /// so naming them here (rather than resolving each through a JNI static
+    /// lookup) keeps the translation table readable and cheap. The values
+    /// are the AOSP `KeyEvent.KEYCODE_*` assignments.
+    mod keycode {
+        pub const DPAD_UP: i32 = 19;
+        pub const DPAD_DOWN: i32 = 20;
+        pub const DPAD_LEFT: i32 = 21;
+        pub const DPAD_RIGHT: i32 = 22;
+        pub const TAB: i32 = 61;
+        pub const SPACE: i32 = 62;
+        pub const ENTER: i32 = 66;
+        pub const DEL: i32 = 67;
+        pub const FORWARD_DEL: i32 = 112;
+        pub const ESCAPE: i32 = 111;
+        pub const MOVE_HOME: i32 = 122;
+        pub const MOVE_END: i32 = 123;
+        pub const PAGE_UP: i32 = 92;
+        pub const PAGE_DOWN: i32 = 93;
+        pub const F1: i32 = 131;
+        pub const F12: i32 = 142;
+    }
+
+    /// Translate an Android keycode to the GDK/X11 keysym
+    /// `rswidgets::core::key` uses.
+    ///
+    /// Returns `None` for a key with no counterpart, which the caller reports
+    /// as "not ours" so the platform handles it. That distinction matters:
+    /// answering `0` for an unknown key would make `handle_key` treat it as
+    /// a printable NUL and start an edit.
+    ///
+    /// The named keysyms are the *unix* set, which is what `core::key` defines
+    /// for every non-Windows target. They are spelled as literals because
+    /// this module is `#[cfg(target_os = "android")]` inside a file whose
+    /// `core::key` re-export is already resolved by the adapter, and because
+    /// a unit test below asserts each literal against the real constant so
+    /// the two cannot drift.
+    pub fn android_keycode_to_gdk(keycode: i32) -> Option<u32> {
+        use keycode::*;
+        Some(match keycode {
+            DPAD_LEFT => 0xFF51,  // LEFT
+            DPAD_UP => 0xFF52,    // UP
+            DPAD_RIGHT => 0xFF53, // RIGHT
+            DPAD_DOWN => 0xFF54,  // DOWN
+            TAB => 0xFF09,        // TAB
+            ENTER => 0xFF0D,      // RETURN
+            DEL => 0xFF08,        // BACKSPACE
+            FORWARD_DEL => 0xFFFF,// DELETE
+            ESCAPE => 0xFF1B,     // ESCAPE
+            MOVE_HOME => 0xFF50,  // HOME
+            MOVE_END => 0xFF57,   // END
+            PAGE_UP => 0xFF55,    // PAGE_UP
+            PAGE_DOWN => 0xFF56,  // PAGE_DOWN
+            F1..=F12 => {
+                // F1..F12 are contiguous (131..142) and GDK's are
+                // (0xFFBE..0xFFC9), so one offset covers the range instead of
+                // twelve arms that would each have to be edited together.
+                0xFFBE + (keycode - F1) as u32
+            }
+            _ => return None,
+        })
+    }
+
+    /// Modifier bits as `core::key`'s callers spell them, which is the GTK
+    /// `GdkModifierType` layout: 0x1 Shift, 0x2 Lock, 0x4 Control, 0x8 Mod1.
+    ///
+    /// The Android mapping: `KEYCODE_SHIFT_LEFT/RIGHT` set Shift, and
+    /// `KEYCODE_ALT_LEFT/RIGHT` set **Mod1** (not "Alt"), because the bit
+    /// 0x8 position is what `gui_backend`'s `alt_held` test reads. A
+    /// `MetaEvent.getModifierState` mask is the authoritative source for
+    /// software modifiers, because a hardware key's own modifier state is
+    /// often empty at `onKeyDown` time; the two are OR-ed so a real key press
+    /// is never lost when the meta state lags.
+    pub fn android_key_mods(key_code: i32, meta_mask: i32) -> u32 {
+        // KeyEvent.META_SHIFT_ON = 0x1, META_CTRL_ON = 0x1000,
+        // META_ALT_ON = 0x2000, META_META_ON = 0x10000.
+        const META_SHIFT_ON: i32 = 0x0000_0001;
+        const META_CTRL_ON: i32 = 0x0000_1000;
+        const META_ALT_ON: i32 = 0x0000_2000;
+        const META_META_ON: i32 = 0x0001_0000;
+
+        let mut mods = 0u32;
+        if meta_mask & META_SHIFT_ON != 0 {
+            mods |= 0x1;
+        }
+        if meta_mask & META_CTRL_ON != 0 {
+            mods |= 0x4;
+        }
+        // Alt and Meta both map onto Mod1 (bit 0x8): a desktop spreadsheet
+        // treats Alt and the Windows key identically for menu mnemonics, and
+        // the emulator reports a "Meta" key where a desktop build would have
+        // Alt. Merging is what makes Ctrl+Alt+... and the emulator's Meta
+        // shortcuts reach the same code.
+        if meta_mask & (META_ALT_ON | META_META_ON) != 0 {
+            mods |= 0x8;
+        }
+        // The physical modifier key itself. A modifier's own press arrives
+        // with an empty meta state on some IMEs, so the key code is OR-ed in
+        // rather than preferred: losing Shift there would silently turn
+        // Shift+arrows into plain moves, which is the difference between
+        // moving the cursor and extending the selection.
+        match key_code {
+            59 | 60 => mods |= 0x1,          // SHIFT_LEFT / SHIFT_RIGHT
+            57 | 58 => mods |= 0x4,          // CTRL_LEFT / CTRL_RIGHT
+            62 | 63 => mods |= 0x8,          // ALT_LEFT / ALT_RIGHT
+            91 | 92 | 93 => mods |= 0x8,     // META_LEFT / _RIGHT / META_STAR
+            _ => {}
+        }
+        mods
+    }
+
     // ---- Platform listener attachment ----
     //
     // JNI cannot create a proxy for a Java interface, so each Android
@@ -1718,6 +1875,30 @@ mod android_backend {
 
     static DIALOG_CONTENT: Lazy<Mutex<HashMap<usize, RawJob>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
+
+    /// Tag a view with the Rust handle its listeners were built from, so
+    /// `CorroKeyBridge` can recover it from Java.
+    ///
+    /// JNI cannot read a Rust field off a Java object, and the key bridge is
+    /// handed a `View` (not a handle) because that is what `onKeyDown`
+    /// receives. The pointer therefore has to live somewhere both sides can
+    /// see it, and a view tag is the platform's own mechanism for exactly
+    /// this. `0` for a view that is not a corro widget, which the Rust side
+    /// reads as "no entry".
+    pub fn tag_view_pointer(view_ptr: *mut std::os::raw::c_void) {
+        if view_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            // `View.setTag(Object)` is the generic form; the id-keyed
+            // setTag(int, Object) would collide with a host's own use of a
+            // resource id, so the plain slot is used and documented as ours.
+            let tag = env.new_object("java/lang/Long", "(J)V", &[(view_ptr as i64).into()])?;
+            env.call_method(&view, "setTag", "(Ljava/lang/Object;)V", &[(&tag).into()])?;
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
+        });
+    }
 
     /// Install the `OnKeyListener` on an entry so raw keys reach corro's edit
     /// model. The Java shim is `com.corro.CorroKeyListener`, already wired by

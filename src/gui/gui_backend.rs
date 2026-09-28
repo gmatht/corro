@@ -4826,7 +4826,7 @@ mod mobile_gesture {
     /// The sheet canvas's id, or `u64::MAX` (which no real canvas has) before
     /// `run_gui` publishes it — so an early gesture is ignored rather than
     /// driving a sheet that does not exist yet.
-    fn sheet_canvas_id() -> u64 {
+    pub(crate) fn sheet_canvas_id() -> u64 {
         SHEET_CANVAS_ID.with(|c| c.get())
     }
 
@@ -4844,6 +4844,20 @@ mod mobile_gesture {
         pub const SELECT: i32 = 1;
         pub const SCROLL: i32 = 2;
         pub const TAP: i32 = 3;
+        /// A long press that should open a *context menu* rather than arm a
+        /// range selection.
+        ///
+        /// The long press means two different things and the caller picks
+        /// which, because only the host knows what it asked for:
+        /// `gui_backend::install_mobile_menu` registers the sheet as
+        /// "long press opens the cell menu" (a phone's substitute for a
+        /// right-click), while a host that wants the long-press-then-drag
+        /// range selection reads [`LONG_PRESS`] and arms the drag instead.
+        ///
+        /// A mouse right-click never reaches here at all — it arrives as
+        /// `BUTTON_SECONDARY` and goes through `Canvas::on_click_button`, the
+        /// same path a desktop takes.
+        pub const LONG_PRESS_MENU: i32 = 5;
         pub const LONG_PRESS: i32 = 4;
     }
 
@@ -4885,7 +4899,16 @@ mod mobile_gesture {
 
     /// The host's long-press timer fired. Arm selection if the finger has not
     /// moved since the press; the long press itself does not move the cursor.
-    pub(crate) fn mobile_gesture_long_press(canvas_id: u64, _x: f64, _y: f64) -> i32 {
+    ///
+    /// `menu_mode` selects which of the two long-press meanings applies: a
+    /// context menu (a phone's right-click) or a range selection to be
+    /// extended by the drag that follows. See [`drag_code::LONG_PRESS_MENU`].
+    pub(crate) fn mobile_gesture_long_press(
+        canvas_id: u64,
+        x: f64,
+        y: f64,
+        menu_mode: bool,
+    ) -> i32 {
         if canvas_id != sheet_canvas_id() {
             return drag_code::IGNORED;
         }
@@ -4899,10 +4922,32 @@ mod mobile_gesture {
                 return false;
             }
             g.long_press_pending = false;
-            g.select_armed = true;
+            // In menu mode the press is *consumed*: arming the drag as well
+            // would make the finger drag that follows both pan the sheet and
+            // extend a selection, and a menu cannot be used while a drag is
+            // in flight.
+            if !menu_mode {
+                g.select_armed = true;
+            }
             true
         });
-        if armed { drag_code::LONG_PRESS } else { drag_code::IGNORED }
+        if !armed {
+            return drag_code::IGNORED;
+        }
+        if menu_mode {
+            // Move the cursor to the pressed cell first, so the menu's items
+            // act on what the user pressed rather than on wherever the cursor
+            // happened to be. `select_armed` stays false and `active` stays
+            // true, so a following release is still recognised as a gesture
+            // end and does not also fire a tap.
+            MOBILE_GESTURE.with(|g| {
+                let mut g = g.borrow_mut();
+                g.dragging = true;
+            });
+            begin_selection_at_pixel(x, y);
+            return drag_code::LONG_PRESS_MENU;
+        }
+        drag_code::LONG_PRESS
     }
 
     /// A pointer move: extends the selection when armed, else reports a scroll
@@ -5053,6 +5098,116 @@ mod mobile_gesture {
         state.canvas.queue_redraw();
     }
 
+    /// Open the cell context menu for the pointer at `(x, y)`.
+    ///
+    /// The touch and mouse equivalent of a desktop right-click, and the
+    /// counterpart of [`open_sheet_context_menu`] (which is the *tab strip*
+    /// menu). A phone cannot pop a menu at an arbitrary point the way
+    /// `gtk_menu_popup` does, so this is an `AlertDialog` listing the same
+    /// `app.*` actions the desktop's Edit menu registers — a list rather than
+    /// a floating menu, but the same items and the same dispatch
+    /// ([`dispatch_mobile_menu_action`]), so there is no second copy of any
+    /// action's logic.
+    ///
+    /// The cursor is moved to the pressed cell first, so the items act on what
+    /// the user pressed rather than on wherever the cursor happened to be.
+    /// The pixel→cell mapping is [`begin_selection_at_pixel`]'s, because that
+    /// is the mapping the gesture machine already agreed with: a second copy
+    /// here would drift from it the first time the display order or the
+    /// pinned-row set changed.
+    pub(crate) fn open_cell_context_menu(x: f64, y: f64) {
+        let state = MOBILE_MENU_STATE.with(|s| s.borrow().clone());
+        let Some(state) = state else { return };
+        let state: &GuiState = &state;
+
+        // Move the cursor (and so the cell the menu acts on) to the pressed
+        // cell. A press on chrome (the header band, the row labels) leaves the
+        // cursor alone and the menu applies to it, exactly as a desktop
+        // right-click on the header does.
+        begin_selection_at_pixel(x, y);
+
+        let cell = {
+            let app = state.app_ref();
+            // The same label the formula bar shows, so the menu title and the
+            // address box cannot disagree about which cell is selected — and
+            // it handles a header/margin cursor, which a plain A1 formatter
+            // would get wrong.
+            let grid = &app.core.workbook.active_sheet().grid;
+            formula_addr_label(app.core.cursor.row, app.core.cursor.col, grid)
+        };
+
+        // The items, taken from the shared menu model rather than spelled out
+        // again, so this list cannot drift from the Edit menu's. The label's
+        // mnemonic underscore is dropped: a dialog list has no mnemonics, and
+        // a literal underscore on a touch target looks like a bug.
+        let items: Vec<(String, String)> = crate::gui::menu::menu_bar()
+            .into_iter()
+            .find(|root| root.label == "Edit")
+            .map(|edit| {
+                edit.submenu
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter(|item| item.submenu.is_none())
+                    .map(|item| {
+                        (
+                            item.label.replace('_', ""),
+                            format!(
+                                "app.{}",
+                                crate::gui::menu::action_kind_to_name(item.action)
+                            ),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if items.is_empty() {
+            state.app_mut().core.status = crate::core::state::SHEET_MENU_UNAVAILABLE.to_string();
+            sync_chrome_labels(state);
+            return;
+        }
+
+        // `App::init` is the toolkit handle the other dialogs in this file
+        // use (see `dialogs.rs`); it is a cheap handle to the already-running
+        // backend, not a second event loop.
+        let Ok(rxapp) = rswidgets::App::init() else {
+            return;
+        };
+        let Ok(dialog) = rxapp.new_dialog() else {
+            return;
+        };
+        dialog.set_title(&cell);
+        for (i, (label, _)) in items.iter().enumerate() {
+            // Response ids start at 1: 0 is GTK's "no response", and a dialog
+            // that reports 0 for its first item would be indistinguishable
+            // from a dismissal.
+            dialog.add_button(label, i as i32 + 1);
+        }
+        // Items are moved into the closure; `connect_response` is
+        // 'static, and the dialog outlives this function.
+        let items = std::rc::Rc::new(items);
+        let items_cb = items.clone();
+        dialog.connect_response(move |response| {
+            // Guard the underflow: a dismissal reports a response that is not
+            // an index into the list.
+            if response < 1 {
+                return;
+            }
+            if let Some((_, action)) = items_cb.get(response as usize - 1) {
+                dispatch_mobile_menu_action(action);
+            }
+        });
+        dialog.layout_dialog();
+        dialog.present();
+        // The dialog and its buttons are native objects the closure above
+        // refers to; dropping the wrappers would destroy them and leave a
+        // visible but dead dialog. Same reason every other corro dialog
+        // leaks (see `wire_prompt_confirm`).
+        let _ = Box::into_raw(Box::new(dialog));
+        let _ = std::rc::Rc::into_raw(items);
+    }
+
     /// Pan the sheet by a pixel delta from a touch drag, converting to whole cells
     /// with the current (zoom-aware) metrics. Positive `dy` (content moves down)
     /// reveals earlier rows, matching the existing `SheetView.scrollByDrag`.
@@ -5090,6 +5245,23 @@ pub(crate) use mobile_gesture::{
     mobile_gesture_long_press, mobile_gesture_move, mobile_gesture_up,
     set_sheet_canvas_id,
 };
+
+/// Open the cell context menu for a long press or a mouse right-click on the
+/// sheet. Re-exported from [`mobile_gesture`] for the same reason as the
+/// gesture entry points above: `android_backend` is a sibling module and
+/// `mobile_gesture` is private to this file.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) use mobile_gesture::open_cell_context_menu;
+
+/// The sheet canvas's backend id, for a host that needs to route a key event
+/// to the canvas that has focus (`android_backend::dispatch_key`). Separate
+/// from the re-export above because it is a *query*, not a gesture entry
+/// point, and re-exporting it under the `mobile_gesture` name would suggest
+/// it belongs to the gesture machine.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) fn mobile_sheet_canvas_id() -> u64 {
+    mobile_gesture::sheet_canvas_id()
+}
 
 /// Where the drawn pointer should sit for a menu tour stop, in **canvas**
 /// coordinates (see `paint_movie_pointer` for why that is not the same as

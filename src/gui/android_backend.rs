@@ -168,11 +168,34 @@ pub fn gesture_down(canvas_id: u64, x: f64, y: f64, is_touch: bool) -> i32 {
 }
 
 /// A finger that has been still since `gesture_down` and has now held long
-/// enough: arm selection so the following drag extends it instead of
-/// scrolling. Wire this to `GestureDetector.onLongPress`.
+/// enough. Wire this to `GestureDetector.onLongPress`.
+///
+/// A long press means one of two things on a touch device, and the host
+/// chooses: `menu_mode` true opens the cell's context menu — a phone's
+/// substitute for a right-click, and what corro's sheet uses — while false
+/// arms the following drag to extend a selection instead of scrolling.
+/// Returns [`LONG_PRESS_MENU`](5) or [`LONG_PRESS`](4) so the caller can
+/// tell which happened, or `0` when the gesture did not qualify (the finger
+/// had already moved, or the press was not a finger).
 #[cfg(target_os = "android")]
-pub fn gesture_long_press(canvas_id: u64, x: f64, y: f64) -> i32 {
-    super::gui_backend::mobile_gesture_long_press(canvas_id, x, y)
+pub fn gesture_long_press(canvas_id: u64, x: f64, y: f64, menu_mode: bool) -> i32 {
+    super::gui_backend::mobile_gesture_long_press(canvas_id, x, y, menu_mode)
+}
+
+/// Open the cell context menu for the pointer at `(x, y)`.
+///
+/// This is what a long press on the sheet, and a mouse right-click, end up
+/// at. Before the key/pointer bridge existed, `open_sheet_context_menu`
+/// always reported `SHEET_MENU_UNAVAILABLE` because
+/// `Canvas::on_click_button` had no Android source and
+/// `MenuBar::popup_submenu_by_mnemonic_at` returned `false`.
+///
+/// The menu is an `AlertDialog` of the same `app.*` actions the desktop menu
+/// registers, so choosing an item runs the identical dispatch — a phone gets
+/// a list instead of a right-click menu, not a second copy of the logic.
+#[cfg(target_os = "android")]
+pub fn open_cell_context_menu(x: f64, y: f64) {
+    super::gui_backend::open_cell_context_menu(x, y);
 }
 
 /// A pointer move while a gesture is active. Returns the
@@ -209,6 +232,89 @@ pub fn gesture_cancel(canvas_id: u64) {
 #[cfg(target_os = "android")]
 pub fn drag_viewport(canvas_id: u64, dx: f64, dy: f64) -> (i32, i32) {
     super::gui_backend::drag_viewport_by_pixels(canvas_id, dx, dy)
+}
+
+/// Route a key event to corro.
+///
+/// This is the bridge that makes the whole of `gui_backend::handle_key` —
+/// cursor arrows, Shift+arrows, Home/End, PageUp/PageDown, Tab, Escape,
+/// Delete/Backspace, F1/F2/F3, and the Ctrl accelerators — reachable on
+/// Android. Without it the only key that ever reached corro was Enter (via
+/// the IME editor-action listener), so a spreadsheet on a phone could be
+/// driven only by tapping cells and using the menu strip.
+///
+/// The Android keycode is translated to the GDK keysym the shared handler
+/// matches on, and the modifier state is the GdkModifierType bitmask, so
+/// `handle_key` needs no Android arm of its own. `key_code` of 0 (Enter) is
+/// accepted: the entry's IME path calls the native `activate` export
+/// directly, and a hardware Enter reaches here instead, so both converge on
+/// the same commit.
+///
+/// `sheet_canvas_id` is the canvas that has focus, so the key reaches the
+/// canvas handler first — the same order as the desktop (entry, then window,
+/// then canvas), with the entry's own listener taking precedence because the
+/// focused view is the one Android delivers to.
+///
+/// Returns true when a handler consumed the key, so `SheetView.onKeyDown`
+/// knows whether to swallow it or let the platform have it.
+#[cfg(target_os = "android")]
+pub fn dispatch_key(key_code: i32, meta_mask: i32, sheet_canvas_id: Option<u64>) -> bool {
+    use rswidgets::backends::android;
+
+    // Enter has no distinct GDK keysym here beyond RETURN, which the table
+    // covers; an unknown code is "not ours" and the platform keeps it.
+    let Some(keyval) = android::android_keycode_to_gdk(key_code) else {
+        return false;
+    };
+    let mods = android::android_key_mods(key_code, meta_mask);
+
+    // Canvas first. `dispatch_canvas_key` returns whether the canvas handler
+    // consumed the key, and `gui_backend` installs one that deliberately
+    // declines Alt (so Alt+letter opens a menu rather than typing 'f' into a
+    // cell), so a declined key falls through to the window handler below.
+    let sheet_canvas_id = match sheet_canvas_id {
+        Some(id) => id,
+        // Before `run_gui` publishes it the cell is `u64::MAX`, which is not a
+        // real canvas id; the window handler still runs, so a key that arrives
+        // before the sheet exists is not simply dropped.
+        None => super::gui_backend::mobile_sheet_canvas_id(),
+    };
+    if sheet_canvas_id != 0
+        && sheet_canvas_id != u64::MAX
+        && rswidgets::backends_android_adapter::dispatch_canvas_key(
+        sheet_canvas_id,
+        keyval,
+        mods,
+    ) {
+        return true;
+    }
+    // Window level, where Ctrl+Q and the other accelerators live. The GTK
+    // window handler is a BUBBLE-phase controller that also sees keys the
+    // entry declined, and it expects to be able to propagate, so `0` means
+    // "not handled" rather than "consumed".
+    rswidgets::backends_android_adapter::dispatch_window_key(keyval, mods) != 0
+}
+
+/// Route a key event to a *focused entry* (the formula bar).
+///
+/// Separate from [`dispatch_key`] because the two have different contracts:
+/// the canvas path runs `handle_key` (which moves the cursor) while the entry
+/// path must not, since the entry is showing a cell's text. It goes to the
+/// entry's own registry, which is the one `Entry::on_key_raw` filled, and
+/// `gui_backend` decides there whether the key is an edit action or should
+/// be left to the platform.
+///
+/// `view_ptr` is the `EditText`'s handle — the same value the Java
+/// `CorroKeyListener` was constructed with.
+#[cfg(target_os = "android")]
+pub fn dispatch_entry_key(view_ptr: u64, key_code: i32, meta_mask: i32) -> bool {
+    use rswidgets::backends::android;
+
+    let Some(keyval) = android::android_keycode_to_gdk(key_code) else {
+        return false;
+    };
+    let mods = android::android_key_mods(key_code, meta_mask);
+    rswidgets::backends_android_adapter::dispatch_entry_key(view_ptr as *mut _, keyval, mods)
 }
 
 /// Write a line to logcat (`log -t corro` shows these). Best-effort: the

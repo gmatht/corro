@@ -337,8 +337,25 @@ macro_rules! common_types_mod {
             pub fn append_content_area(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.append_content_area(child); }
             pub fn add_button(&self, text: &str, response_id: i32) { self.inner.add_button(text, response_id); }
             pub fn present(&self) { self.inner.present(); }
+            /// Build the dialog's view hierarchy before showing it.
+            ///
+            /// A caller that attaches a custom view needs the dialog measured
+            /// before it opens, or it opens at the height of nothing and the
+            /// content appears a frame later. GTK and NWG both have a real
+            /// `layout_dialog`; without this forward, a caller written for
+            /// them could not compile against a backend that had one.
+            pub fn layout_dialog(&self) { self.inner.layout_dialog(); }
             pub fn connect_response<F: FnMut(i32) + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_response(f) }
             pub fn close(&self) { self.inner.close(); }
+            /// Show or hide without destroying the dialog.
+            pub fn set_visible(&self, visible: bool) { self.inner.set_visible(visible); }
+            /// The container a dialog's children are added to, for a caller
+            /// that needs to lay them out itself.
+            pub fn get_content_area(&self) -> *mut std::os::raw::c_void { self.inner.get_content_area() }
+            /// Run the dialog's nested loop and return the response id.
+            /// See the Android adapter's note: there is no nested loop
+            /// there, so this presents and returns the last response.
+            pub fn run(&self) -> i32 { self.inner.run() }
         }
         impl AsRef<*mut std::os::raw::c_void> for Dialog {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
