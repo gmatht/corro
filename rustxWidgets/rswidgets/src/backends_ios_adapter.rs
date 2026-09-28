@@ -2738,18 +2738,29 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
     let ms_for_cb = ms;
     let mut f = f;
     let registered = crate::backends::apple::register_callback(Box::new(move || {
-        if !f() {
-            crate::backends::apple::unregister_callback(id_for_cb.get());
-            return;
-        }
-        // Fire again one interval from now. A failure here is logged rather
-        // than propagated: the tick is already gone (it returned true but
-        // nothing is scheduled to call it again), and the honest report is a
-        // log line, not a silent stop.
+        // Re-arm FIRST, then run the body.
+        //
+        // Order matters because the body is application code that repaints:
+        // the first real edit commits a cell and calls `queue_redraw`, which
+        // re-enters the draw path. If anything in that path stalls the main
+        // thread, a re-arm placed after it never happens, and the tick stops
+        // for good having done exactly one edit - which is the symptom, since
+        // the sheet showed A1 and nothing else and the app was otherwise
+        // healthy and still drawing.
+        //
+        // Re-arming first costs nothing: the next fire is `ms` away either way,
+        // and if the body stops the tick the series ends on this iteration
+        // rather than the next.
         if let Err(e) = arm_one_shot(ms_for_cb, id_for_cb.get()) {
             crate::backends::apple::log_apple(&format!(
                 "ios: could not re-arm the {ms_for_cb}ms tick: {e}"
             ));
+        }
+        if !f() {
+            // The body asked to stop, so undo the fire we just scheduled:
+            // `unregister_callback` makes the next dispatch a no-op, and the
+            // timer is a one-shot that has not been reached yet.
+            crate::backends::apple::unregister_callback(id_for_cb.get());
         }
     }));
     id_cell.set(registered);
