@@ -157,21 +157,39 @@ Android's answer is the Storage Access Framework
 (`ACTION_OPEN_DOCUMENT` / `ACTION_CREATE_DOCUMENT`), which is *asynchronous*:
 `startActivityForResult` returns immediately and the URI arrives later in
 `onActivityResult`, on the UI thread. That is the whole reason this is not a
-three-line port. The implementation is a `FilePicker.java` shim that starts the
-intent, plus a Rust side that pumps the looper until a result lands (so the
-existing synchronous `Ok(Option<String>)` signature is preserved), plus a
-`File` guard that holds persistable read/write permission for the returned URI
-and can `openInputStream` / `openOutputStream` it.
+three-line port. corro's file dialogs are synchronous — they are called from
+a menu action inside a native call, on the UI thread, with no opportunity to
+return and be called back — so the thread has to wait, and the wait is
+signalled by the platform's own `onActivityResult` delivery.
+
+Two further things the naive port gets wrong, and which decide whether the
+feature works at all:
+
+* **A `content://` URI is not a path.** `std::fs` cannot open one and
+  `Path::exists` is false for it, so handing the result on unchanged loads
+  nothing. The *import* direction therefore copies the document once into
+  private storage and returns a real path, which every existing loader works
+  with unchanged. The *save* direction keeps the URI and routes it through
+  the content resolver, because there is no other handle to write to — hence
+  `SaveTarget` (path or document) rather than a `PathBuf`.
+* **The permission lapses.** The picker's grant is per-document and does not
+  survive a reboot unless `FLAG_GRANT_PERSISTABLE_URI_PERMISSION` was
+  requested and taken; without it the next save fails with a
+  `SecurityException` that is very hard to attribute later.
+
+The honest cost, documented at the call site: a path save is atomic (temp
+sibling + rename) and a document save is not, because a document provider
+exposes a single stream with no sibling to rename over.
 
 | Feature | GTK | NWG | Android | Status |
 |---|---|---|---|---|
-| Open file | yes | yes | **absent** | **done** (SAF `ACTION_OPEN_DOCUMENT`) |
-| Open file with extension filters | yes | yes | **absent** | **done** (`EXTRA_MIME_TYPES`) |
-| Save file | yes | yes | **absent** | **done** (SAF `ACTION_CREATE_DOCUMENT`) |
-| Save file with filters + default name | yes | yes | **absent** | **done** |
-| Read a `content://` URI in corro's `io` layer | n/a | n/a | **absent** | **done** (`UriStream`) |
-| Write a `content://` URI in corro's `io` layer | n/a | n/a | **absent** | **done** |
-| Open document handed to the app from outside (a VIEW intent) | no | no | **absent** | **done** |
+| Open file | yes | yes | **absent** | **done** (`CorroFile.open`, `ACTION_OPEN_DOCUMENT`) |
+| Open file with extension filters | yes | yes | **absent** | **done** (`mimes_from_filters` → `EXTRA_MIME_TYPES`) |
+| Save file | yes | yes | **absent** | **done** (`CorroFile.create`, `ACTION_CREATE_DOCUMENT`) |
+| Save file with filters + default name | yes | yes | **absent** | **done** (`Intent.EXTRA_TITLE`) |
+| Read a picked document | n/a | n/a | **absent** | **done** (`materialize_document` → a real `PathBuf`) |
+| Write to a picked document | n/a | n/a | **absent** | **done** (`SaveTarget::Document` → `write_document`) |
+| Open document handed to the app from outside | no | no | **absent** | **done** (VIEW/SEND intent filters + `onNewIntent`) |
 
 ## 3. Clipboard
 
