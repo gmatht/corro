@@ -1137,6 +1137,41 @@ mod ios_adapter {
                     msg0v(self.0, "setNeedsDisplay");
                 }
             }
+            // Re-entrancy guard.
+            //
+            // The draw closure is APPLICATION code: `render_grid` repaints
+            // chrome, and any of it may ask for another redraw (a pinned
+            // scrollbar value, a changed label, the tab bar's own state). That
+            // re-entry arrives here while `DRAW_CALLBACKS` is still locked -
+            // the lock is a plain `std::sync::Mutex`, which is not reentrant -
+            // so the second call waits for a lock its own caller holds and the
+            // main thread stops forever. No crash, no exception, and a
+            // screenshot that still looks healthy, which is exactly the iOS CI
+            // signature.
+            //
+            // A nested redraw is redundant by construction: the outer call is
+            // already replaying the same closure against the same state, and
+            // the `setNeedsDisplay` above has asked UIKit for a frame anyway.
+            // So the inner call is simply not run.
+            //
+            // A thread-local rather than a field: dispatch is single-threaded
+            // (UIKit callbacks and the tick all run on the main thread), and a
+            // field would be shared state that has to be reset on an unwind.
+            IN_DRAW.with(|d| {
+                if d.get() {
+                    return;
+                }
+                d.set(true);
+            });
+            // `guard` restores the flag on every exit path, including a panic
+            // out of the closure, so one failed draw cannot wedge the canvas.
+            struct Guard;
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    IN_DRAW.with(|d| d.set(false));
+                }
+            }
+            let _guard = Guard;
             let mut map = DRAW_CALLBACKS.lock().unwrap();
             if let Some(SendDrawCallback(ptr)) = map.get_mut(&self.canvas_id()) {
                 // SAFETY: registry-owned closure, single-threaded dispatch.
@@ -1261,6 +1296,13 @@ mod ios_adapter {
                 cb(&mut dc, w, h);
             }
         }
+    }
+
+    thread_local! {
+        /// True while a draw closure is running, per thread. See
+        /// [`Canvas::queue_redraw`], which uses it to refuse a re-entrant
+        /// redraw rather than deadlock on `DRAW_CALLBACKS`.
+        static IN_DRAW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     static DRAW_CALLBACKS: Lazy<Mutex<HashMap<u64, SendDrawCallback>>> =
