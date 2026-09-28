@@ -287,15 +287,26 @@ jobs:
           # matter - the chrome-only frames before it are small, which is why
           # the app survived them. A regular file cannot fill up, and it is
           # what `simctl launch` offers for exactly this reason.
+          # No pty: `--console-pty` gives the app a fixed-size buffer, and a
+          # full one blocks the app's own `write(2)` on the main thread. The
+          # app froze mid-frame with no crash report and a healthy-looking
+          # screenshot, which is why this matters.
+          #
+          # The log comes from the simulator's own log instead, filtered on the
+          # prefixes every Rust message carries. `--stdout=<file>` was tried
+          # first and captured nothing, so the system log is the reliable
+          # source here.
           rm -f /tmp/corro-live.log
-          if command -v setsid >/dev/null 2>&1; then
-            setsid xcrun simctl launch --stdout=/tmp/corro-live.log \
-              "$SIM_UDID" com.corro.corro >/dev/null 2>&1 &
-          else
-            nohup xcrun simctl launch --stdout=/tmp/corro-live.log \
-              "$SIM_UDID" com.corro.corro >/dev/null 2>&1 &
-          fi
+          : > /tmp/corro-live.log
+          nohup xcrun simctl launch "$SIM_UDID" com.corro.corro \
+            >/dev/null 2>&1 &
           echo "launch pid $!"
+          disown 2>/dev/null || true
+          nohup xcrun simctl spawn "$SIM_UDID" log stream --level debug \
+            --style compact \
+            --predicate 'eventMessage CONTAINS "[corro]" OR eventMessage CONTAINS "[rswidgets]"' \
+            >> /tmp/corro-live.log 2>&1 &
+          echo "log stream pid $!"
           disown 2>/dev/null || true
           disown 2>/dev/null || true
 
