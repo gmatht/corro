@@ -691,7 +691,18 @@ fn install_raw_panic_hook95() {
         }
         let n = w.p;
         unsafe {
-            let h = CreateFileA(b"c:\\panic95.log\0".as_ptr(), 0x4000_0000, 1,
+            // Same overridable path as mark95, suffixed with the panic marker,
+            // so a panic shows up next to the breadcrumbs instead of in a file
+            // on a read-only volume the harness cannot read.
+            let base = corro::debug_log::win95_diag_log_path();
+            let mut path = [0u8; 260];
+            let n_copy = (base.len() - 1).min(240);
+            path[..n_copy].copy_from_slice(&base[..n_copy]);
+            let suffix = b".panic";
+            let end = n_copy + suffix.len();
+            path[n_copy..end].copy_from_slice(suffix);
+            path[end] = 0;
+            let h = CreateFileA(path.as_ptr(), 0x4000_0000, 1,
                 std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
             if !h.is_null() && h as isize != -1 {
                 SetFilePointer(h, 0, std::ptr::null_mut(), 2);
@@ -703,8 +714,10 @@ fn install_raw_panic_hook95() {
     }));
 }
 
-/// TEMPORARY Win95 diagnosis: append bytes to c:\gcorro.log via raw
+/// TEMPORARY Win95 diagnosis: append bytes to the diagnostic log via raw
 /// CreateFileA (std::fs is broken on 9x: CreateFileW stub, error 120).
+/// The path comes from `corro::debug_log::win95_diag_log_path`, so a harness
+/// can redirect it to a writable volume.
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
 unsafe fn mark95(s: &[u8]) {
     use std::os::raw::c_void;
@@ -715,7 +728,8 @@ unsafe fn mark95(s: &[u8]) {
         fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, w: *mut u32, ov: *mut c_void) -> i32;
         fn CloseHandle(h: *mut c_void) -> i32;
     }
-    let h = CreateFileA(b"c:\\gcorro.log\0".as_ptr(), 0x4000_0000, 1,
+    let h = CreateFileA(
+        corro::debug_log::win95_diag_log_path().as_ptr(), 0x4000_0000, 1,
         std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
     if h.is_null() || h as isize == -1 {
         return;
@@ -778,8 +792,25 @@ fn win9x_redirect_console_output() {
         {
             return; // NT line: keep the real console handles
         }
+        // Send stdout/stderr to the same *directory* as the diagnostic log, so
+        // the eprintln!/println! traces that the raw shims cannot capture land
+        // next to the breadcrumbs on a writable volume (a harness sets
+        // CORRO_WIN95_LOG to a path it can read back).
+        let base = corro::debug_log::win95_diag_log_path();
+        let stem: &[u8] = match base.iter().rposition(|&b| b == b'\\' || b == b'/') {
+            Some(i) => &base[i + 1..base.len() - 1],
+            None => b"gcorro.log",
+        };
+        let mut path = [0u8; 260];
+        let dir_len = base.len().saturating_sub(stem.len() + 1);
+        let n = dir_len.min(path.len() - 16);
+        path[..n].copy_from_slice(&base[..n]);
+        let suffix: &[u8] = b"stdout.log";
+        let end = n + suffix.len();
+        path[n..end].copy_from_slice(suffix);
+        path[end] = 0;
         let h = CreateFileA(
-            b"c:\\corro-win95.log\0".as_ptr(),
+            path.as_ptr(),
             GENERIC_WRITE,
             FILE_SHARE_READ,
             std::ptr::null_mut(),

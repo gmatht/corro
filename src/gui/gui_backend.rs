@@ -5558,8 +5558,10 @@ fn on_formula_entry_changed(state: &GuiState) {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// TEMPORARY Win95 diagnosis: append bytes to c:\gcorro.log via raw
+/// TEMPORARY Win95 diagnosis: append bytes to the diagnostic log via raw
 /// CreateFileA (std::fs is broken on 9x: CreateFileW stub, error 120).
+/// The path comes from `corro::debug_log::win95_diag_log_path`, so a harness
+/// can redirect it to a writable volume.
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
 unsafe fn mark95(s: &[u8]) {
     use std::os::raw::c_void;
@@ -5570,7 +5572,8 @@ unsafe fn mark95(s: &[u8]) {
         fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, w: *mut u32, ov: *mut c_void) -> i32;
         fn CloseHandle(h: *mut c_void) -> i32;
     }
-    let h = CreateFileA(b"c:\\gcorro.log\0".as_ptr(), 0x4000_0000, 1,
+    let h = CreateFileA(
+        crate::debug_log::win95_diag_log_path().as_ptr(), 0x4000_0000, 1,
         std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
     if h.is_null() || h as isize == -1 {
         return;

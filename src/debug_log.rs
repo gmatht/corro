@@ -38,6 +38,36 @@ pub fn log(msg: &str) {
     }
 }
 
+/// Path for the rust9x (Windows 95/9x) *diagnostic* log, as a NUL-terminated
+/// ANSI byte string for a raw `CreateFileA`.
+///
+/// The GUI has no console and `std::fs` is broken on 9x (`CreateFileW` is a
+/// stub, error 120), so every `mark95` breadcrumb and the panic hook append
+/// through this one path via raw Win32. It is overridable with
+/// `CORRO_WIN95_LOG` so a bring-up harness can point the log at a *writable*
+/// volume (a ReactOS LiveCD's C: is read-only); the default is the historical
+/// `c:\gcorro.log`.
+///
+/// A fixed-size buffer, not a `String`: every caller hands the pointer
+/// straight to `CreateFileA` and needs the storage to outlive the call.
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+pub fn win95_diag_log_path() -> &'static [u8] {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Vec<u8>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let src = std::env::var("CORRO_WIN95_LOG")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "c:\\gcorro.log".to_string());
+        let mut v = src.into_bytes();
+        v.truncate(259);
+        v.push(0);
+        v
+    })
+    .as_slice()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
