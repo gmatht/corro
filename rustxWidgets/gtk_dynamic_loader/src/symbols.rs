@@ -301,6 +301,8 @@ pub type GtkWindowSetTransientFor = unsafe extern "C" fn(window: *mut c_void, pa
 /// `void gtk_window_set_position(GtkWindow*, GtkWindowPosition)`.
 pub type GtkWindowSetPosition = unsafe extern "C" fn(window: *mut c_void, position: i32);
 pub type GtkWindowSetDefaultSize = unsafe extern "C" fn(window: *mut c_void, width: i32, height: i32);
+pub type GtkWindowResize = unsafe extern "C" fn(window: *mut c_void, width: i32, height: i32);
+pub type GtkWindowMove = unsafe extern "C" fn(window: *mut c_void, x: i32, y: i32);
 
 // Grid/Entry related
 pub type GtkGridNew = unsafe extern "C" fn() -> *mut c_void;
@@ -677,6 +679,8 @@ pub struct Symbols {
     pub gtk_menu_button_set_active: Option<GtkMenuButtonSetActive>,
 
     // GtkWindow default size
+    pub gtk_window_resize: Option<GtkWindowResize>,
+    pub gtk_window_move: Option<GtkWindowMove>,
     pub gtk_window_set_default_size: Option<GtkWindowSetDefaultSize>,
     pub gtk_window_set_transient_for: Option<GtkWindowSetTransientFor>,
     pub gtk_window_set_position: Option<GtkWindowSetPosition>,
@@ -1041,6 +1045,8 @@ impl Symbols {
         let gtk_menu_button_set_active = unsafe { sym::<GtkMenuButtonSetActive>(gtk, "gtk_menu_button_set_active") };
 
         // GtkWindow default size
+        let gtk_window_resize = unsafe { sym::<GtkWindowResize>(gtk, "gtk_window_resize") };
+        let gtk_window_move = unsafe { sym::<GtkWindowMove>(gtk, "gtk_window_move") };
         let gtk_window_set_default_size = unsafe { sym::<GtkWindowSetDefaultSize>(gtk, "gtk_window_set_default_size") };
         let gtk_window_set_transient_for = unsafe { sym::<GtkWindowSetTransientFor>(gtk, "gtk_window_set_transient_for") };
         let gtk_window_set_position = unsafe { sym::<GtkWindowSetPosition>(gtk, "gtk_window_set_position") };
@@ -1119,7 +1125,7 @@ impl Symbols {
             gtk_button_set_has_frame, gtk_widget_add_css_class,
             gtk_menu_button_get_popover, gtk_widget_set_can_target,
             gtk_popover_menu_new_from_model,
-            gtk_window_set_default_size,
+            gtk_window_resize, gtk_window_move, gtk_window_set_default_size,
             gtk_window_set_transient_for, gtk_window_set_position,
             gtk_drawing_area_set_draw_func, gtk_drawing_area_set_content_width, gtk_drawing_area_set_content_height,
             gtk_native_get_surface, gdk_surface_create_cairo_context, gdk_surface_get_width, gdk_surface_get_height,

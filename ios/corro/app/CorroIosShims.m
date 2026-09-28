@@ -92,9 +92,43 @@
             self.corroFillingSuperview = NO;
         }
     }
-    fprintf(stderr, "[corro] SheetView.layoutSubviews canvas=%llu %dx%d\n",
-            self.corroCanvasId, (int)CGRectGetWidth(b), (int)CGRectGetHeight(b));
-    fflush(stderr);
+    // ⚠️ Loop guard. `corro_ios_canvas_size` hands the size to Rust, and the
+    // host-side `SheetView` is a plain `UIView` - so anything Rust does in
+    // response that touches this view re-enters `layoutSubviews` immediately.
+    // One canvas (the sheet-tab strip) ran five million passes in a single CI
+    // run: the app froze, drew nothing further, and the screenshot showed a
+    // sheet that had gained its first edit and no more, with nothing in the
+    // log to say why.
+    //
+    // The count is per view, reset whenever a genuinely new layout starts
+    // (a different pass, identified by the bounds changing OR by the counter
+    // being at its cap - see below). What it must guarantee is that a single
+    // cascade cannot spin forever: past the cap the size report is dropped
+    // and the pass is allowed to finish, so a misbehaving layout degrades to
+    // "the size is not reported" rather than to a hung app.
+    static NSUInteger sPasses = 0;
+    static unsigned long long sLastW = 0, sLastH = 0;
+    unsigned long long w = (unsigned long long)CGRectGetWidth(b);
+    unsigned long long h = (unsigned long long)CGRectGetHeight(b);
+    if (w != sLastW || h != sLastH) {
+        sPasses = 0;
+        sLastW = w;
+        sLastH = h;
+    }
+    sPasses += 1;
+    if (sPasses > 64) {
+        fprintf(stderr,
+                "[corro] SheetView.layoutSubviews canvas=%llu: %d passes at "
+                "%llux%llu - dropping the size report to break the cascade\n",
+                self.corroCanvasId, (int)sPasses, w, h);
+        fflush(stderr);
+        return;
+    }
+    if (sPasses > 4) {
+        fprintf(stderr, "[corro] SheetView.layoutSubviews canvas=%llu pass %d\n",
+                self.corroCanvasId, (int)sPasses);
+        fflush(stderr);
+    }
     if (CGRectGetWidth(b) > 0 && CGRectGetHeight(b) > 0) {
         corro_ios_canvas_size(self.corroCanvasId,
                               (int32_t)CGRectGetWidth(b),

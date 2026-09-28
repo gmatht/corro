@@ -1698,6 +1698,13 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_macos_adapter::create_window()?;
             return Ok(crate::common::Window { inner });
         }
+        // Zork: the headless model backend. Returns the same wrapper shape as
+        // every other backend, so shared GUI code runs unchanged.
+        #[cfg(feature = "zork")]
+        {
+            let inner = crate::backends_zork_adapter::create_window()?;
+            return Ok(crate::common::Window { inner });
+        }
     }
 
     /// Create a new layout Box.

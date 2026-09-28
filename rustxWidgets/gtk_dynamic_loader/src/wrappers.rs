@@ -347,6 +347,19 @@ impl Window {
         }
     }
 
+    /// Resize the window immediately, rather than only recording a default.
+    ///
+    /// `set_default_size` is what GTK wants in normal use, but it is advisory:
+    /// with no window manager (a bare Xvfb, an offscreen CI runner) nothing
+    /// applies it and the window stays at its 1x1 initial size, clipping the
+    /// whole UI to a dot. This is the escape hatch for that case.
+    pub fn resize(&self, width: i32, height: i32) {
+        guard_widget!(self, "Window", "resize");
+        if let Some(r) = self.loader.symbols.gtk_window_resize {
+            unsafe { r(self.inner, width, height); }
+        }
+    }
+
     /// # Safety
     /// `group_ptr` must be a valid GActionGroup pointer or null.
     pub unsafe fn insert_action_group(&self, name: &str, group_ptr: *mut c_void) {
@@ -607,6 +620,11 @@ impl Label {
         if let Some(set_margin) = self.loader.symbols.gtk_widget_set_margin_start {
             unsafe { set_margin(self.inner, margin); }
         }
+    }
+    /// Vertical outer spacing. Pairs with `set_margin_start`; without it a
+    /// caller could only inset a label horizontally.
+    pub fn set_margin_top(&self, px: i32) {
+        if let Some(f) = self.loader.symbols.gtk_widget_set_margin_top { unsafe { f(self.inner, px); } }
     }
 }
 
@@ -1078,6 +1096,24 @@ impl DrawingArea {
         if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
             unsafe { f(self.inner, if visible { 1 } else { 0 }); }
         }
+    }
+    /// Whether the drawing area may take extra space from its container.
+    ///
+    /// A DrawingArea has no natural minimum size, so without this it stays at
+    /// whatever `set_size_request` said and does not follow the window being
+    /// resized -- which is the normal case for an image viewer.
+    pub fn set_hexpand(&self, expand: bool) {
+        if let Some(f) = self.loader.symbols.gtk_widget_set_hexpand { unsafe { f(self.inner, if expand { 1 } else { 0 }); } }
+    }
+    pub fn set_vexpand(&self, expand: bool) {
+        if let Some(f) = self.loader.symbols.gtk_widget_set_vexpand { unsafe { f(self.inner, if expand { 1 } else { 0 }); } }
+    }
+    /// Outer spacing in pixels.
+    pub fn set_margin_top(&self, px: i32) {
+        if let Some(f) = self.loader.symbols.gtk_widget_set_margin_top { unsafe { f(self.inner, px); } }
+    }
+    pub fn set_margin_start(&self, px: i32) {
+        if let Some(f) = self.loader.symbols.gtk_widget_set_margin_start { unsafe { f(self.inner, px); } }
     }
     pub fn grab_focus(&self) {
         guard_widget!(self, "DrawingArea", "grab_focus");

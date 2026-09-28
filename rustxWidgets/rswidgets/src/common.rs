@@ -112,6 +112,11 @@ macro_rules! common_types_mod {
         impl Window {
             pub fn set_title(&self, title: &str) { self.inner.set_title(title); }
             pub fn set_default_size(&self, w: i32, h: i32) { self.inner.set_default_size(w, h); }
+            /// Immediate resize. `set_default_size` is advisory under GTK and
+            /// is not applied at all when no window manager is running (bare
+            /// Xvfb, an offscreen CI runner), leaving the window 1x1 and the UI
+            /// clipped to nothing. This forces the size.
+            pub fn resize(&self, w: i32, h: i32) { self.inner.resize(w, h); }
             pub fn present(&self) { self.inner.present(); }
             pub fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) { #[allow(unused_unsafe)] unsafe { self.inner.insert_action_group(name, group_ptr); } }
             pub fn hwnd(&self) -> *mut std::os::raw::c_void { self.inner.hwnd() }
@@ -138,6 +143,11 @@ macro_rules! common_types_mod {
             /// `set_fixed_width`: a pinned, left-aligned label sits flush
             /// against its slot's edge, and this restores the inset.
             pub fn set_margin_start(&self, px: i32) { self.inner.set_margin_start(px); }
+            /// Vertical outer spacing. Pairs with `set_margin_start`: without
+            /// it a caller could inset a label left and right but not top and
+            /// bottom, which is not enough to space a toolbar from the content
+            /// below it.
+            pub fn set_margin_top(&self, px: i32) { self.inner.set_margin_top(px); }
             /// Set the x alignment of the label's text (0.0 left .. 1.0 right).
             pub fn set_xalign(&self, x: f32) { self.inner.set_xalign(x); }
             pub fn raw_handle(&self) -> *mut std::os::raw::c_void { self.inner.raw_handle() }

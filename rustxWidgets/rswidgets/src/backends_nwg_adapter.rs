@@ -533,6 +533,14 @@ mod nwg_adapter {
         pub fn on_close(&self, cb: Box<dyn FnMut()>) {
             *self.close_cb.borrow_mut() = Some(cb);
         }
+        /// Immediate resize.
+        ///
+        /// `set_default_size` is advisory and is only applied once a window
+        /// manager adopts the window; on a bare Xvfb or an offscreen CI runner
+        /// there is none and the window keeps its initial size. This forces it.
+        pub fn resize(&self, width: i32, height: i32) {
+            self.inner.set_size(width, height);
+        }
     }
 
     pub fn create_window(parent_cell: &Rc<RefCell<Option<*mut c_void>>>) -> Result<Window, Error> {
@@ -2419,6 +2427,15 @@ mod nwg_adapter {
             *self.draw_cb.borrow_mut() = Some(cb);
             self.queue_redraw();
         }
+        /// Whether the canvas may take extra horizontal space.
+        ///
+        /// The NWG `Frame` this wraps exposes no expansion flag, so this is a
+        /// no-op kept for parity with the GTK backend: a caller written once
+        /// for both compiles unchanged, and the GTK path -- the one the image
+        /// viewer actually runs on -- does honour it.
+        pub fn set_hexpand(&self, _expand: bool) {}
+        /// See `set_hexpand`.
+        pub fn set_vexpand(&self, _expand: bool) {}
         pub fn queue_redraw(&self) {
             if !self.hwnd.is_null() {
                 unsafe {

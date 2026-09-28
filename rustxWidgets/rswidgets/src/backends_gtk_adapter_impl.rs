@@ -51,6 +51,9 @@ mod gtk_adapter {
         pub fn set_default_size(&self, w: i32, h: i32) {
             self.0.set_default_size(w, h);
         }
+        /// Immediate resize; see the loader's `Window::resize`. Needed where
+        /// `set_default_size` is advisory (no window manager).
+        pub fn resize(&self, w: i32, h: i32) { self.0.resize(w, h); }
 
         pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
             self.0.set_child(child);
@@ -310,6 +313,9 @@ mod gtk_adapter {
                 None => self.0.set_size_request(-1, -1),
             }
         }
+        /// Vertical outer spacing; pairs with `set_margin_start` so a label
+        /// can be inset on all four sides from one code path.
+        pub fn set_margin_top(&self, m: i32) { self.0.set_margin_top(m); }
         /// Set the x alignment of the label's text (0.0 left .. 1.0 right)
         pub fn set_xalign(&self, x: f32) { self.0.set_xalign(x); }
         pub fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() }
@@ -1391,6 +1397,18 @@ mod gtk_adapter {
         pub fn set_visible(&self, visible: bool) {
             self.drawing_area.set_visible(visible);
         }
+        /// Whether the canvas may take extra horizontal space.
+        ///
+        /// Missing until now, so a `Canvas` inside a `ScrolledWindow` could not
+        /// be told to fill it: the viewer had to fall back to a fixed
+        /// `set_size_request`, which does not follow the window being resized.
+        /// The loader already binds `gtk_widget_set_hexpand`.
+        pub fn set_hexpand(&self, expand: bool) { self.drawing_area.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.drawing_area.set_vexpand(expand); }
+        /// Outer spacing in pixels; `start`/`end` are the logical-direction
+        /// (left/right) names, so they follow the locale's text direction.
+        pub fn set_margin_top(&self, px: i32) { self.drawing_area.set_margin_top(px); }
+        pub fn set_margin_start(&self, px: i32) { self.drawing_area.set_margin_start(px); }
     }
 
     pub fn create_canvas() -> Result<Canvas, Error> {
