@@ -1245,9 +1245,35 @@ mod nwg_adapter {
                 }
             }
         }
-        pub fn set_vexpand(&self, _expand: bool) {}
+        /// Minimum size of the box itself.
+        ///
+        /// A box with no explicit height lays its children out at their natural
+        /// height, which for a Button inside a horizontal row can exceed the
+        /// strip the caller allocated -- the rows then overlap and the text
+        /// renders on top of itself. Setting the size on the row is the
+        /// portable way to say "this strip is N tall".
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if !self.hwnd.is_null() {
+                let hwnd = self.hwnd;
+                unsafe {
+                    winapi::um::winuser::SetWindowPos(
+                        hwnd as _,
+                        std::ptr::null_mut(), 0, 0, w, h,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
+                    );
+                }
+            }
+        }
+        /// Whether the box may take extra space from its parent.
         pub fn set_hexpand(&self, _expand: bool) {}
-    }
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn set_visible(&self, visible: bool) {
+            if !self.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::ShowWindow(self.hwnd as _, if visible { 1 } else { 0 });
+                }
+            }
+        }}
 
     /// Measure a STATIC (label) control's text width in pixels, for
     /// shrink-to-fit layout (parity with GTK label auto-sizing).

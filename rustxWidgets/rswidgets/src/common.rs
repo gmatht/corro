@@ -124,6 +124,12 @@ macro_rules! common_types_mod {
         }
         impl WidgetBox {
             pub fn append(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.append(child); }
+            /// Minimum size of the box itself.
+            ///
+            /// Needed for a horizontal row: without an explicit height a Button
+            /// child can be laid out taller than the strip, and consecutive rows
+            /// overlap and render as garbled text.
+            pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
             pub fn set_child_hexpand(&self, child: &impl AsRef<*mut std::os::raw::c_void>, expand: bool) { self.inner.set_child_hexpand(child, expand); }
             pub fn set_child_vexpand(&self, child: &impl AsRef<*mut std::os::raw::c_void>, expand: bool) { self.inner.set_child_vexpand(child, expand); }
             pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }
