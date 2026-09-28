@@ -368,14 +368,18 @@ that is not a gap.
 | `AsElement` trait (86) + its impls | The DOM's typing mechanism; GTK/NWG use `AsRef<*mut c_void>`. |
 | `Orientation::as_flex_direction` (127) | Maps to CSS `flex-direction`. |
 | `RadioButton` group via `input.name` (1213-1215) | Mutual exclusion falls out of the HTML radio-group semantics — a genuinely *better* answer than GTK's `set_group`, and worth copying into any backend that has to do it manually. |
+| `Canvas::on_gesture` | `core::Gesture` landed on main *after* this enumeration, and the WASM adapter was the one backend left accepting-but-missing it. A browser is the best of the three fits for it, which is worth recording because the other two found it hard: NWG reaches for raw `WM_*` messages (a `Frame` exposes no mouse API) and decodes `GET_KEYSTATE` bits for modifiers; GTK splits one `GtkEventMask` across three signals. The DOM *is* the unified pointer abstraction — one `PointerEvent` carries button, buttons-held and all four modifiers, for mouse/pen/touch alike. Two things it does that GTK cannot: `meta` is its own field, so a ⌘-click is distinguishable from a Ctrl-click where GDK folds both into one bit; and `buttons` is a bitmask, so hover-vs-drag needs no per-backend bookkeeping. Where it is *not* better: scroll deltas are not always pixels, so `deltaMode` lines are scaled by 16 and pages by the canvas height, the same normalisation NWG does with `WHEEL_DELTA`. |
+| `open_file_content` / `save_file_content` | Not a DOM-native facility, but a capability GTK and NWG get from the OS and a browser cannot: a real file picker (hidden `<input type=file>` + `FileReader`, clicked inside the user gesture) and a real download (`Blob` + synthetic `<a download>`). Both deliver *content*, because that is all a browser has. See F7/F8. |
 
 ---
 
 ## What was done
 
-Ten commits on `wasm/impl`, in the order below. Each is independently
+Eleven commits on `wasm/impl`, in the order below. Each is independently
 compilable; the build fix had to come first because nothing else could be
-verified until the target built.
+verified until the target built. The last is not part of the original
+enumeration — `core::Gesture` landed on main afterwards and WASM was the one
+backend left without it.
 
 1. **`55456605` — unblock the build.** B1–B15: the 18 `common_types_mod!`
    methods, the empty `impl MenuBar` filled, the duplicate `impl Clone` and
@@ -400,6 +404,11 @@ verified until the target built.
 5. **`0aaa45ff` — file dialogs.** See F7/F8: the path form cannot exist in a
    browser, so Open and Save were reimplemented over content, with
    `load_workbook_text` in `src/io` so the shared parser still does the work.
+6. **`06d5aee5`, `df0daae1` — silence the ten dead-code warnings, and add the
+   CI job.** See the note above the legend for why the second one matters
+   more than the first.
+7. **`4127105c` — `on_gesture`.** Added to main after the enumeration; see §7
+   for why a browser is the *best* fit for it.
 
 ### One gap deliberately left
 
