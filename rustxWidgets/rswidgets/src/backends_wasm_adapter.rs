@@ -79,6 +79,46 @@ mod wasm_adapter {
         }
     }
 
+    /// The GDK modifier mask for a mouse or key event: 1 = Shift, 4 =
+    /// Control, 8 = Alt/Meta.
+    ///
+    /// Every callback in this adapter promises a GDK-style mask, because that
+    /// is what the shared GUI already branches on. Translating once here is
+    /// what keeps `on_motion`, `on_click_button`, `on_release` and
+    /// `Window::on_event_key` agreeing -- previously `on_event_key` reported
+    /// only Alt and hard-coded 0, so a caller checking Ctrl or Shift saw
+    /// "no modifier" for half its cases.
+    fn gdk_modifier_mask(evt: &KeyboardEvent) -> u32 {
+        let mut state = 0u32;
+        if evt.shift_key() {
+            state |= 1;
+        }
+        if evt.ctrl_key() {
+            state |= 4;
+        }
+        if evt.alt_key() {
+            state |= 8;
+        }
+        state
+    }
+
+    /// `gdk_modifier_mask` for a mouse event. Separate because
+    /// `KeyboardEvent` and `MouseEvent` are distinct wasm-bindgen types with
+    /// the same three accessors.
+    fn gdk_modifier_mask_mouse(evt: &MouseEvent) -> u32 {
+        let mut state = 0u32;
+        if evt.shift_key() {
+            state |= 1;
+        }
+        if evt.ctrl_key() {
+            state |= 4;
+        }
+        if evt.alt_key() {
+            state |= 8;
+        }
+        state
+    }
+
     /// Own a `Closure` for the life of the program.
     ///
     /// A `Closure` that is dropped releases the JS function it points at, so
@@ -343,10 +383,10 @@ impl Window {
             let cb2 = self.event_key_cb.clone();
             let closure = Closure::<dyn FnMut(KeyboardEvent)>::new(move |evt: KeyboardEvent| {
                 let keyval = evt.key_code() as u32;
-                let mut state = 0u32;
-                if evt.alt_key() {
-                    state |= 0x8; // GDK_MOD1_MASK / ALT
-                }
+                // The full GDK mask, not just Alt: a caller branching on Ctrl
+                // (the standard accelerator modifier) saw "no modifier" for
+                // every Ctrl keypress, because only alt_key was read.
+                let state = gdk_modifier_mask(&evt);
                 if let Some(cb) = cb2.borrow_mut().as_mut() {
                     if cb(keyval, state) != 0 {
                         evt.prevent_default();
@@ -431,6 +471,66 @@ impl Window {
         pub fn emit_clicked(&self) -> Result<u64, Error> {
             self.elem.click();
             Ok(0)
+        }
+
+        pub fn set_visible(&self, v: bool) {
+            set_css(self.elem.as_ref(), "display", if v { "" } else { "none" });
+        }
+
+        /// `flex-grow` + `align-self: stretch`. A `<button>` sizes to its
+        /// label, so without these it stays that width inside a flex row
+        /// instead of taking the leftover space.
+        pub fn set_hexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-grow", "1");
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            } else {
+                set_css(self.elem.as_ref(), "flex-grow", "0");
+            }
+        }
+
+        /// See [`Button::set_hexpand`].
+        pub fn set_vexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-shrink", "1");
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            } else {
+                set_css(self.elem.as_ref(), "flex-shrink", "0");
+            }
+        }
+
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if w > 0 {
+                set_css(self.elem.as_ref(), "width", &format!("{}px", w));
+            }
+            if h > 0 {
+                set_css(self.elem.as_ref(), "height", &format!("{}px", h));
+            }
+        }
+
+        /// `font-weight` / `font-style`, GTK `set_font_style`'s
+        /// `(weight, italic)` pair.
+        pub fn set_font_style(&self, weight: i32, italic: bool) {
+            set_css(
+                self.elem.as_ref(),
+                "font-weight",
+                if weight != 0 { "bold" } else { "normal" },
+            );
+            set_css(
+                self.elem.as_ref(),
+                "font-style",
+                if italic { "italic" } else { "normal" },
+            );
+        }
+
+        /// `classList`, the same mechanism [`Label::add_class`] uses.
+        pub fn add_class(&self, class_name: &str) {
+            self.elem.class_list().add_1(class_name).ok();
+        }
+
+        /// See [`Button::add_class`].
+        pub fn remove_class(&self, class_name: &str) {
+            self.elem.class_list().remove_1(class_name).ok();
         }
     }
 
@@ -568,6 +668,58 @@ impl Window {
             set_css(&self.elem, "margin-top", &format!("{}px", px));
         }
 
+        /// See [`Entry::set_hexpand`].
+        pub fn set_hexpand(&self, expand: bool) {
+            if expand {
+                set_css(&self.elem, "flex-grow", "1");
+                set_css(&self.elem, "align-self", "stretch");
+            } else {
+                set_css(&self.elem, "flex-grow", "0");
+            }
+        }
+
+        /// See [`Entry::set_vexpand`].
+        pub fn set_vexpand(&self, expand: bool) {
+            if expand {
+                set_css(&self.elem, "flex-shrink", "1");
+                set_css(&self.elem, "align-self", "stretch");
+            } else {
+                set_css(&self.elem, "flex-shrink", "0");
+            }
+        }
+
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if w > 0 {
+                set_css(&self.elem, "width", &format!("{}px", w));
+            }
+            if h > 0 {
+                set_css(&self.elem, "height", &format!("{}px", h));
+            }
+        }
+
+        /// Horizontal alignment, GTK `GtkAlign` ordinals (0 = start,
+        /// 1 = centre, 2 = end). Distinct from `set_xalign`, which aligns the
+        /// *text* inside the label; this moves the label itself inside its
+        /// slot.
+        pub fn set_halign(&self, align: i32) {
+            let v = match align {
+                1 => "center",
+                2 => "flex-end",
+                _ => "flex-start",
+            };
+            set_css(&self.elem, "justify-self", v);
+        }
+
+        /// Vertical alignment, same ordinals as [`Label::set_halign`].
+        pub fn set_valign(&self, align: i32) {
+            let v = match align {
+                1 => "center",
+                2 => "flex-end",
+                _ => "flex-start",
+            };
+            set_css(&self.elem, "align-self", v);
+        }
+
         /// `AsRef` in the *other* direction: a raw handle to the DOM element,
         /// the escape hatch `common::Label::raw_handle` forwards. The DOM
         /// handle is the pointer, so this is the same value `crate::core::
@@ -647,7 +799,38 @@ impl AsElement for BoxWidget {
             }
         }
 
-        pub fn set_hexpand(&self, _expand: bool) {
+        /// See [`Entry::set_hexpand`]: `flex-grow` is how a box takes the
+        /// leftover space, and `align-self: stretch` is the cross-axis half.
+        pub fn set_hexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-grow", "1");
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            } else {
+                set_css(self.elem.as_ref(), "flex-grow", "0");
+            }
+        }
+
+        /// See [`BoxWidget::set_hexpand`].
+        pub fn set_vexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-grow", "1");
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            } else {
+                set_css(self.elem.as_ref(), "flex-grow", "0");
+            }
+        }
+
+        pub fn set_visible(&self, v: bool) {
+            set_css(self.elem.as_ref(), "display", if v { "" } else { "none" });
+        }
+
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if w > 0 {
+                set_css(self.elem.as_ref(), "width", &format!("{}px", w));
+            }
+            if h > 0 {
+                set_css(self.elem.as_ref(), "height", &format!("{}px", h));
+            }
         }
     }
 
@@ -701,6 +884,34 @@ impl AsElement for BoxWidget {
                 .ok();
             }
             self.elem.append_child(child).ok();
+        }
+
+        pub fn set_visible(&self, v: bool) {
+            set_css(self.elem.as_ref(), "display", if v { "" } else { "none" });
+        }
+        pub fn set_hexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-grow", "1");
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            } else {
+                set_css(self.elem.as_ref(), "flex-grow", "0");
+            }
+        }
+        pub fn set_vexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-grow", "1");
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            } else {
+                set_css(self.elem.as_ref(), "flex-grow", "0");
+            }
+        }
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if w > 0 {
+                set_css(self.elem.as_ref(), "width", &format!("{}px", w));
+            }
+            if h > 0 {
+                set_css(self.elem.as_ref(), "height", &format!("{}px", h));
+            }
         }
     }
 
@@ -1666,12 +1877,86 @@ impl SimpleAction {
     }
 
     impl DropDown {
-        pub fn set_active(&self, index: u32) {
-            self.elem.set_selected_index(index as i32);
+        /// Select `index`, or clear the selection with `None`.
+        ///
+        /// The `Option` is GTK's contract (a caller can clear the selection),
+        /// and the DOM has a matching state: `selectedIndex = -1` is "nothing
+        /// selected", which is exactly what a `None` asks for. Passing a bare
+        /// `u32` -- the old signature -- could not express it, so a caller that
+        /// wanted "no selection" had no way to say so.
+        pub fn set_active(&self, index: Option<u32>) {
+            match index {
+                Some(i) => self.elem.set_selected_index(i as i32),
+                None => self.elem.set_selected_index(-1),
+            }
         }
 
+        /// The selected index, or `None` when nothing is selected. `None` is
+        /// what `selectedIndex == -1` means, and it is the inverse of
+        /// `set_active(None)`.
         pub fn get_active(&self) -> i32 {
             self.elem.selected_index()
+        }
+
+        /// The selected index as an `Option`, for callers that would rather
+        /// not interpret the `-1` sentinel themselves.
+        pub fn active(&self) -> Option<u32> {
+            match self.elem.selected_index() {
+                i if i < 0 => None,
+                i => Some(i as u32),
+            }
+        }
+
+        pub fn grab_focus(&self) {
+            let _ = self.elem.focus();
+        }
+
+        pub fn set_visible(&self, v: bool) {
+            set_css(self.elem.as_ref(), "display", if v { "" } else { "none" });
+        }
+
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if w > 0 {
+                set_css(self.elem.as_ref(), "width", &format!("{}px", w));
+            }
+            if h > 0 {
+                set_css(self.elem.as_ref(), "height", &format!("{}px", h));
+            }
+        }
+
+        pub fn set_hexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-grow", "1");
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            } else {
+                set_css(self.elem.as_ref(), "flex-grow", "0");
+            }
+        }
+
+        pub fn set_vexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-shrink", "1");
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            } else {
+                set_css(self.elem.as_ref(), "flex-shrink", "0");
+            }
+        }
+
+        /// Move the dropdown within its parent, in px.
+        ///
+        /// The DOM answer to GTK's `set_offset`, and what makes a dropdown
+        /// hosted in an `Overlay` land where the caller asked instead of at
+        /// the overlay's top-left corner: `add_overlay` sets
+        /// `position: absolute` with no offset, so without this a positioned
+        /// popup has nowhere to go. `transform: translate` is used rather than
+        /// `left`/`top` because it composes with any layout position the
+        /// overlay already established.
+        pub fn set_offset(&self, x: i32, y: i32) {
+            set_css(
+                self.elem.as_ref(),
+                "transform",
+                &format!("translate({}px, {}px)", x, y),
+            );
         }
 
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
@@ -1762,6 +2047,51 @@ impl SimpleAction {
             self.closures.borrow_mut().push(Box::new(closure));
             Ok(id)
         }
+
+        pub fn set_visible(&self, v: bool) {
+            set_css(&self.elem, "display", if v { "" } else { "none" });
+        }
+        pub fn set_hexpand(&self, expand: bool) {
+            if expand {
+                set_css(&self.elem, "flex-grow", "1");
+                set_css(&self.elem, "align-self", "stretch");
+            } else {
+                set_css(&self.elem, "flex-grow", "0");
+            }
+        }
+        pub fn set_vexpand(&self, expand: bool) {
+            if expand {
+                set_css(&self.elem, "flex-shrink", "1");
+                set_css(&self.elem, "align-self", "stretch");
+            } else {
+                set_css(&self.elem, "flex-shrink", "0");
+            }
+        }
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if w > 0 {
+                set_css(&self.elem, "width", &format!("{}px", w));
+            }
+            if h > 0 {
+                set_css(&self.elem, "height", &format!("{}px", h));
+            }
+        }
+
+        /// Replace the label text.
+        ///
+        /// The wrapper is a `<label>` holding the input plus a text node, so
+        /// the text is the wrapper's *last* child; only that one is rewritten
+        /// and the input is left alone.
+        pub fn set_label(&self, label: &str) {
+            if let Some(node) = self.elem.last_child() {
+                let _ = node.set_text_content(Some(label));
+            }
+        }
+
+        /// The current label text, read back from the same text node
+        /// [`CheckButton::set_label`] writes.
+        pub fn get_label(&self) -> Option<String> {
+            self.elem.last_child().and_then(|n| n.text_content())
+        }
     }
 
     pub fn create_checkbutton(label: &str) -> Result<CheckButton, Error> {
@@ -1837,6 +2167,47 @@ impl SimpleAction {
             *self.next_id.borrow_mut() += 1;
             self.closures.borrow_mut().push(Box::new(closure));
             Ok(id)
+        }
+
+        pub fn set_visible(&self, v: bool) {
+            set_css(&self.elem, "display", if v { "" } else { "none" });
+        }
+        pub fn set_hexpand(&self, expand: bool) {
+            if expand {
+                set_css(&self.elem, "flex-grow", "1");
+                set_css(&self.elem, "align-self", "stretch");
+            } else {
+                set_css(&self.elem, "flex-grow", "0");
+            }
+        }
+        pub fn set_vexpand(&self, expand: bool) {
+            if expand {
+                set_css(&self.elem, "flex-shrink", "1");
+                set_css(&self.elem, "align-self", "stretch");
+            } else {
+                set_css(&self.elem, "flex-shrink", "0");
+            }
+        }
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if w > 0 {
+                set_css(&self.elem, "width", &format!("{}px", w));
+            }
+            if h > 0 {
+                set_css(&self.elem, "height", &format!("{}px", h));
+            }
+        }
+        pub fn grab_focus(&self) {
+            let _ = self.input.focus();
+        }
+        /// See [`CheckButton::set_label`].
+        pub fn set_label(&self, label: &str) {
+            if let Some(node) = self.elem.last_child() {
+                let _ = node.set_text_content(Some(label));
+            }
+        }
+        /// See [`CheckButton::get_label`].
+        pub fn get_label(&self) -> Option<String> {
+            self.elem.last_child().and_then(|n| n.text_content())
         }
     }
 
@@ -1940,6 +2311,19 @@ impl SimpleAction {
             } else {
                 set_css(self.elem.as_ref(), "flex-shrink", "0");
             }
+        }
+
+        pub fn set_visible(&self, v: bool) {
+            set_css(self.elem.as_ref(), "display", if v { "" } else { "none" });
+        }
+
+        /// Read-only mode, via the `readOnly` attribute NWG's `set_editable`
+        /// sets. `readOnly` rather than `disabled` on purpose: a disabled
+        /// textarea drops out of the tab order and dims, whereas a read-only
+        /// one stays selectable and copyable, which is what "not editable"
+        /// means in a form.
+        pub fn set_editable(&self, editable: bool) {
+            self.elem.set_read_only(!editable);
         }
             /// Append a line to the buffer.
         ///
@@ -2046,6 +2430,14 @@ impl SimpleAction {
         draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>>>>,
         click_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>>,
         key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>>,
+        /// `(x, y, button, modifier mask)`, for a press.
+        click_button_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64, u32, u32)>>>>,
+        /// `(x, y, state)`, for motion.
+        motion_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64, u32)>>>>,
+        /// `(keyval, modifier mask) -> consumed`, for keys.
+        key_raw_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> bool>>>>,
+        /// `(x, y, button, modifier mask)`, for a release.
+        release_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64, u32, u32)>>>>,
         closures: Rc<RefCell<Vec<Box<dyn Any>>>>,
     }
 
@@ -2074,6 +2466,10 @@ impl SimpleAction {
                 draw_cb: self.draw_cb.clone(),
                 click_cb: self.click_cb.clone(),
                 key_cb: self.key_cb.clone(),
+                click_button_cb: self.click_button_cb.clone(),
+                motion_cb: self.motion_cb.clone(),
+                key_raw_cb: self.key_raw_cb.clone(),
+                release_cb: self.release_cb.clone(),
                 closures: self.closures.clone(),
             }
         }
@@ -2119,33 +2515,122 @@ impl SimpleAction {
             }
         }
 
-        /// Button/modifier-aware click. See the GTK backend's
-        /// `on_click_button`: added alongside `on_click` so the signature change
-        /// does not ripple through every backend, and so a backend that cannot
-        /// report a button (terminal, mobile) stays compilable.
-        pub fn on_click_button(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
-            // wasm: the DOM handler does not yet forward button/state; a follow-up can
-            // wire MouseEvent::button into a stored callback.
+        /// Button/modifier-aware press: `(x, y, button, modifier mask)`.
+        ///
+        /// All three of this file's pointer methods were comment-only stubs
+        /// ("the DOM handler does not yet forward button/state"), which is
+        /// what made canvas dragging, hover and right-click menus impossible
+        /// on a page. The DOM has all of it: `MouseEvent::button()` gives the
+        /// button number and the shift/ctrl/alt keys are on the event, so the
+        /// same `(x, y, button, state)` tuple GTK produces is available here.
+        pub fn on_click_button(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            *self.click_button_cb.borrow_mut() = Some(cb);
+            let cell = self.click_button_cb.clone();
+            let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
+                if let Some(f) = cell.borrow_mut().as_mut() {
+                    f(
+                        evt.offset_x() as f64,
+                        evt.offset_y() as f64,
+                        evt.button() as u32,
+                        gdk_modifier_mask_mouse(&evt),
+                    );
+                }
+            });
+            self.elem
+                .add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())
+                .ok();
+            self.closures.borrow_mut().push(Box::new(closure));
         }
 
-        /// Pointer motion over the canvas; see the GTK backend's `on_motion`.
-        pub fn on_motion(&self, _cb: Box<dyn FnMut(f64, f64, u32)>) {
-            // wasm: the DOM handler does not yet forward button/state; a follow-up can
-            // wire MouseEvent::button into a stored callback.
+        /// Pointer motion: `(x, y, state mask)`.
+        ///
+        /// The state is the same GDK-style mask as everywhere else (1 = Shift,
+        /// 4 = Control, 8 = Alt), so a caller can ask "is a button held"
+        /// without the backend translating a second time.
+        pub fn on_motion(&self, cb: Box<dyn FnMut(f64, f64, u32)>) {
+            *self.motion_cb.borrow_mut() = Some(cb);
+            let cell = self.motion_cb.clone();
+            let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
+                if let Some(f) = cell.borrow_mut().as_mut() {
+                    f(
+                        evt.offset_x() as f64,
+                        evt.offset_y() as f64,
+                        gdk_modifier_mask_mouse(&evt),
+                    );
+                }
+            });
+            self.elem
+                .add_event_listener_with_callback("mousemove", closure.as_ref().unchecked_ref())
+                .ok();
+            self.closures.borrow_mut().push(Box::new(closure));
         }
 
-        /// This canvas's top-left in screen coordinates, or `None` when the
-        /// backend cannot report one. Callers then open a context menu
-        /// unpositioned rather than guessing. See the GTK backend's
-        /// `screen_origin`.
+        /// This canvas's top-left in screen coordinates.
+        ///
+        /// `getBoundingClientRect` gives the viewport-relative box, and the
+        /// canvas's offset within the document is added so the answer is in the
+        /// same *page* coordinates the GTK backend reports. Returning `None`
+        /// here is what forced every context menu on a page to open
+        /// unpositioned, since a caller has no origin to place it against.
         pub fn screen_origin(&self) -> Option<(i32, i32)> {
-            None
+            let rect = self.elem.get_bounding_client_rect();
+            let scroll = document().document_element()?;
+            let x = rect.x() + scroll.scroll_left() as f64;
+            let y = rect.y() + scroll.scroll_top() as f64;
+            Some((x.round() as i32, y.round() as i32))
         }
 
-        /// Pointer release; see the GTK backend's `on_release`.
-        pub fn on_release(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
-            // wasm: the DOM handler does not yet forward button/state; a follow-up can
-            // wire MouseEvent::button into a stored callback.
+        /// Pointer release: `(x, y, button, modifier mask)`.
+        ///
+        /// Pairs with [`Canvas::on_click_button`]; a press and a release with
+        /// motion between them are what a drag is, and without the release a
+        /// drag can never end.
+        pub fn on_release(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            *self.release_cb.borrow_mut() = Some(cb);
+            let cell = self.release_cb.clone();
+            let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
+                if let Some(f) = cell.borrow_mut().as_mut() {
+                    f(
+                        evt.offset_x() as f64,
+                        evt.offset_y() as f64,
+                        evt.button() as u32,
+                        gdk_modifier_mask_mouse(&evt),
+                    );
+                }
+            });
+            self.elem
+                .add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())
+                .ok();
+            self.closures.borrow_mut().push(Box::new(closure));
+        }
+
+        pub fn set_hexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-grow", "1");
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            } else {
+                set_css(self.elem.as_ref(), "flex-grow", "0");
+            }
+        }
+
+        /// See [`Entry::set_vexpand`].
+        pub fn set_vexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-shrink", "1");
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            } else {
+                set_css(self.elem.as_ref(), "flex-shrink", "0");
+            }
+        }
+
+        /// Outer spacing in px, for a canvas inset inside its container.
+        pub fn set_margin_start(&self, px: i32) {
+            set_css(self.elem.as_ref(), "margin-left", &format!("{}px", px));
+        }
+
+        /// See [`Canvas::set_margin_start`].
+        pub fn set_margin_top(&self, px: i32) {
+            set_css(self.elem.as_ref(), "margin-top", &format!("{}px", px));
         }
 
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
@@ -2180,8 +2665,22 @@ impl SimpleAction {
             self.elem.set_tab_index(0);
         }
         pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
-            let mut cb = cb;
-            self.on_key(Box::new(move |k: u32| -> bool { cb(k, 0) }));
+            // Registered directly rather than through `on_key`, which discards
+            // the modifier state -- and a canvas key handler is exactly where
+            // an accelerator (Ctrl+S) has to be distinguishable from a bare S.
+            *self.key_raw_cb.borrow_mut() = Some(cb);
+            let cell = self.key_raw_cb.clone();
+            let closure = Closure::<dyn FnMut(KeyboardEvent)>::new(move |evt: KeyboardEvent| {
+                if let Some(f) = cell.borrow_mut().as_mut() {
+                    if f(evt.key_code() as u32, gdk_modifier_mask(&evt)) {
+                        evt.prevent_default();
+                    }
+                }
+            });
+            self.elem
+                .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
+                .ok();
+            self.closures.borrow_mut().push(Box::new(closure));
         }
         pub fn grab_focus(&self) {
             let _ = self.elem.focus();
@@ -2205,6 +2704,10 @@ impl SimpleAction {
             draw_cb: Rc::new(RefCell::new(None)),
             click_cb: Rc::new(RefCell::new(None)),
             key_cb: Rc::new(RefCell::new(None)),
+            click_button_cb: Rc::new(RefCell::new(None)),
+            motion_cb: Rc::new(RefCell::new(None)),
+            key_raw_cb: Rc::new(RefCell::new(None)),
+            release_cb: Rc::new(RefCell::new(None)),
             closures: Rc::new(RefCell::new(Vec::new())),
         })
     }
@@ -2293,6 +2796,18 @@ impl SimpleAction {
             if expand {
                 set_css(self.elem.as_ref(), "align-self", "stretch");
             }
+        }
+
+        /// Outer spacing of the overlay itself, in px. See
+        /// [`Label::set_margin_start`] for why this is a margin and not a
+        /// padding.
+        pub fn set_margin_start(&self, px: i32) {
+            set_css(self.elem.as_ref(), "margin-left", &format!("{}px", px));
+        }
+
+        /// See [`Overlay::set_margin_start`].
+        pub fn set_margin_top(&self, px: i32) {
+            set_css(self.elem.as_ref(), "margin-top", &format!("{}px", px));
         }
     }
 
