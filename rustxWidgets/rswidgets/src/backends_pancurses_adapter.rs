@@ -46,6 +46,14 @@ mod pancurses_adapter {
 
         pub fn set_default_size(&self, _width: i32, _height: i32) {}
 
+        /// No-op: a character terminal has no window to resize. The size
+        /// comes from the tty (and from `CORRO_TERM_COLS`/`CORRO_TERM_ROWS`
+        /// for a scripted run - see `core::terminal_size_with_override`), so
+        /// a `resize` here would have to be ignored anyway, and honouring it
+        /// would mean the widget tree and the terminal disagreed about the
+        /// surface being drawn on.
+        pub fn resize(&self, _w: i32, _h: i32) {}
+
         pub fn hwnd(&self) -> *mut c_void {
             std::ptr::null_mut()
         }
@@ -139,6 +147,10 @@ mod pancurses_adapter {
         /// slot, so there is no sub-cell margin to speak of. Present so the
         /// cross-backend `Label` surface matches the GUI backends.
         pub fn set_margin_start(&self, _px: i32) {}
+        /// No-op: a character cell has no inset. The terminal backends align
+        /// their own columns instead, and the shared renderer's margins are
+        /// expressed in whole characters.
+        pub fn set_margin_top(&self, _px: i32) {}
         pub fn raw_handle(&self) -> *mut c_void {
             &self.id as *const usize as *mut c_void
         }
