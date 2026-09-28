@@ -125,6 +125,22 @@ pub fn log_ios(msg: &str) {
     eprintln!("corro(ios): {msg}");
 }
 
+/// A diagnostic line for the mobile backends, on the same footing as
+/// [`log_ios`].
+///
+/// On iOS this goes through rswidgets' logger rather than `eprintln!`, and
+/// that is the point. The iOS CI app is launched with `--console-pty`, so its
+/// stderr is a PTY with a small fixed buffer; if nothing drains it, a blocking
+/// `write(2)` stalls the caller - and the callers here are the edit-script
+/// tick and the commit it performs, i.e. the main thread. rswidgets' logger
+/// puts the descriptor in non-blocking mode, so a log line can never take the
+/// app down. The per-edit commit line is the one diagnostic that says whether
+/// the scripted edits ran at all, so it is the last thing that should be able
+/// to stop them.
+pub fn log_mobile(msg: &str) {
+    log_ios(msg);
+}
+
 // ---------------------------------------------------------------------------
 // Touch gestures (pinch to zoom; drag pans unless a long press armed select)
 // ---------------------------------------------------------------------------

@@ -6597,6 +6597,12 @@ fn arm_edit_script(state: &Rc<GuiState>) {
     // costs nothing here: the animation is defined by elapsed time either way.
     const MIN_TICK_MS: u32 = 25;
     let tick_ms = ((char_ms / 4.0).round() as u32).max(MIN_TICK_MS);
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    super::ios_backend::log_mobile(&format!(
+        "[corro] edit-script typing {} cps ({char_ms}ms/char, {tick_ms}ms tick)",
+        options.typing_cps
+    ));
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     eprintln!("[corro] edit-script typing {} cps ({char_ms}ms/char, {tick_ms}ms tick)", options.typing_cps);
 
     let tick = move || -> bool {
@@ -6658,12 +6664,16 @@ fn arm_edit_script(state: &Rc<GuiState>) {
             // makes the commit itself observable.
             {
                 let g = &app.core.workbook.active_sheet().grid;
-                eprintln!(
+                let m = format!(
                     "[corro] scripted edit committed {} = {:?} (now {:?})",
                     crate::addr::cell_ref_text(&addr, g.main_cols()),
                     step.value,
                     g.get(&addr).unwrap_or_default()
                 );
+                #[cfg(any(target_os = "ios", target_os = "android"))]
+                super::ios_backend::log_mobile(&m);
+                #[cfg(not(any(target_os = "ios", target_os = "android")))]
+                eprintln!("{m}");
             }
             app.core.state = app.core.workbook.active_sheet().clone();
             state_for_tick.editing.set(false);
@@ -6677,8 +6687,20 @@ fn arm_edit_script(state: &Rc<GuiState>) {
         true
     };
     match rswidgets::add_periodic_tick(&state.window, tick_ms, Box::new(tick)) {
-        Ok(()) => eprintln!("[corro] edit script armed ({step_count} steps, {tick_ms}ms tick)"),
-        Err(e) => eprintln!("[corro] edit-script timer unavailable: {e}"),
+        Ok(()) => {
+            let m = format!("[corro] edit script armed ({step_count} steps, {tick_ms}ms tick)");
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            super::ios_backend::log_mobile(&m);
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            eprintln!("{m}");
+        }
+        Err(e) => {
+            let m = format!("[corro] edit-script timer unavailable: {e}");
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            super::ios_backend::log_mobile(&m);
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            eprintln!("{m}");
+        }
     }
 }
 

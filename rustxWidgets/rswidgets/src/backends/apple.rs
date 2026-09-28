@@ -541,7 +541,38 @@ pub fn log_apple(msg: &str) {
         unsafe extern "C" {
             fn write(fd: i32, buf: *const std::os::raw::c_void, count: usize) -> isize;
         }
-        write(2, line.as_ptr() as *const std::os::raw::c_void, line.len());
+        // The descriptor is put in non-blocking mode, once, and restored.
+        //
+        // Logging must never be able to stop the app. When the app is launched
+        // with `simctl launch --console-pty` its stderr is a PTY, which has a
+        // small fixed buffer; if nothing at the far end drains it, a plain
+        // `write(2)` blocks, and because the callers include the draw path and
+        // the tick body, a full buffer freezes the whole UI on the main thread
+        // - no crash report, no exception, and a screenshot that looks
+        // perfectly healthy. That is exactly the shape of the iOS CI failure
+        // where the app committed its first edit, drew twice, and then went
+        // silent while still running.
+        //
+        // A log line is not worth blocking for, so a full buffer means the
+        // line is dropped. `O_NONBLOCK` is set once and left: leaving it on
+        // affects only this descriptor, and a diagnostic stream that can stall
+        // its own process is worse than one that loses lines under pressure.
+        extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        const F_GETFL: i32 = 3;
+        const F_SETFL: i32 = 4;
+        const O_NONBLOCK: i32 = 0o4000;
+        const STDERR_FILENO: i32 = 2;
+        let flags = fcntl(STDERR_FILENO, F_GETFL);
+        if flags >= 0 && flags & O_NONBLOCK == 0 {
+            fcntl(STDERR_FILENO, F_SETFL, flags | O_NONBLOCK);
+        }
+        write(
+            STDERR_FILENO,
+            line.as_ptr() as *const std::os::raw::c_void,
+            line.len(),
+        );
     }
 }
 
