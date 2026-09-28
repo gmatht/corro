@@ -60,6 +60,12 @@ web-sys = { version = "0.3", features = [
   # (drawImage needs no extra feature: the overload taking a scaled
   # destination rect is on CanvasRenderingContext2d itself.)
   "ImageData",
+  # The file picker: a hidden <input type=file>, FileList/File to read the
+  # chosen file's name, and FileReader to turn it into a String.
+  "HtmlInputElement", "File", "FileList", "FileReader",
+  # The save path: a Blob plus the DOM plumbing to click a synthetic
+  # <a download> and hand the browser a real file.
+  "Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement",
 ] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

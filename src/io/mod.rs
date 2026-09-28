@@ -224,6 +224,111 @@ pub fn load_workbook_revisions_partial(
     ))
 }
 
+/// Load a workbook from the *text* of a log, with no filesystem involved.
+///
+/// This is the browser's entry point. A page cannot be handed a path -- the
+/// file picker returns a `File`, not a name a later `std::fs` call can open --
+/// so the content arrives here instead and the replay is done from the string
+/// directly. `load_workbook_file` is the path form of exactly this, and both
+/// share the same parser, so a file opened on a page and the same file opened
+/// on the desktop produce identical workbooks.
+///
+/// Accepts the same two dialects as [`load_workbook_file`]: the legacy
+/// `WORKBOOK` snapshot, and the canonical `CORRO_LOG` op log.
+pub fn load_workbook_text(data: &str) -> Result<WorkbookState, IoError> {
+    let first = data
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first.split_whitespace().next() == Some("WORKBOOK") {
+        let snap = load_workbook_snapshot_text(data)?;
+        return Ok(WorkbookState::from_snapshot(&snap));
+    }
+    let mut workbook = WorkbookState::new();
+    let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+    let (_offset, replay) = load_workbook_revisions_partial_text(
+        data,
+        usize::MAX,
+        &mut workbook,
+        &mut active_sheet,
+    )?;
+    if let Some(line) = replay.failed_line {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bad log line {line}: {}",
+                replay.error.unwrap_or_else(|| "parse error".into())
+            ),
+        )
+        .into());
+    }
+    if let Some(i) = workbook.sheets.iter().position(|s| s.id == active_sheet) {
+        workbook.active_sheet = i;
+    }
+    Ok(workbook)
+}
+
+/// The replay half of [`load_workbook_revisions_partial`], taking the log text
+/// rather than reading it. See that function for the meaning of `limit` and of
+/// the returned `PartialReplay`.
+pub fn load_workbook_revisions_partial_text(
+    data: &str,
+    limit: usize,
+    workbook: &mut WorkbookState,
+    active_sheet: &mut u32,
+) -> Result<(u64, PartialReplay), IoError> {
+    let logical_lines = match collect_workbook_log_lines(data) {
+        Ok(lines) => lines,
+        Err(err) => {
+            return Ok((
+                data.len() as u64,
+                PartialReplay {
+                    op_count: 0,
+                    failed_line: Some(1),
+                    error: Some(err.to_string()),
+                },
+            ));
+        }
+    };
+    if limit == 0 {
+        return Ok((
+            data.len() as u64,
+            PartialReplay {
+                op_count: 0,
+                failed_line: None,
+                error: None,
+            },
+        ));
+    }
+    let mut n = 0usize;
+    let mut _fit_guard = ReplayFitGuard::new(workbook);
+    for (line_no, line) in logical_lines {
+        if let Err(err) = apply_log_line_to_workbook(&line, _fit_guard.workbook(), active_sheet) {
+            return Ok((
+                data.len() as u64,
+                PartialReplay {
+                    op_count: n,
+                    failed_line: Some(line_no),
+                    error: Some(err.to_string()),
+                },
+            ));
+        }
+        n += 1;
+        if n >= limit {
+            break;
+        }
+    }
+    Ok((
+        data.len() as u64,
+        PartialReplay {
+            op_count: n,
+            failed_line: None,
+            error: None,
+        },
+    ))
+}
+
 /// Serialize a whole workbook as the canonical `CORRO_LOG` op log.
 ///
 /// This is the *single* `.corro` writer: the TUI saves through it and the GUI
@@ -587,6 +692,14 @@ pub fn load_workbook_template(path: &Path) -> Result<crate::ops::WorkbookState, 
 
 pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> {
     let data = fs::read_to_string(path)?;
+    load_workbook_snapshot_text(&data)
+}
+
+/// The parser half of [`load_workbook_snapshot`], taking the log text rather
+/// than reading it -- the same split as
+/// [`load_workbook_revisions_partial_text`], and for the same reason: a browser
+/// has the contents of a file, not a path to one.
+pub fn load_workbook_snapshot_text(data: &str) -> Result<WorkbookSnapshot, IoError> {
     let mut lines = data.lines();
     let header = lines.next().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "missing workbook header")

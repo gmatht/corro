@@ -8,10 +8,10 @@ mod wasm_adapter {
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::JsCast;
     use web_sys::{
-        Document, Element, Event, FocusEvent, HtmlCanvasElement, HtmlButtonElement,
-        HtmlDialogElement, HtmlDivElement, HtmlElement, HtmlInputElement,
-        HtmlOptionElement, HtmlSelectElement, HtmlTextAreaElement, KeyboardEvent,
-        MouseEvent,
+        Document, Element, Event, FocusEvent, HtmlAnchorElement, HtmlCanvasElement,
+        HtmlButtonElement, HtmlDialogElement, HtmlDivElement, HtmlElement,
+        HtmlInputElement, HtmlOptionElement, HtmlSelectElement, HtmlTextAreaElement,
+        KeyboardEvent, MouseEvent,
     };
     use crate::core::{Error, Widget};
 
@@ -28,6 +28,158 @@ mod wasm_adapter {
 
     fn create_element(tag: &str) -> Element {
         document().create_element(tag).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // File dialogs
+    //
+    // A browser has no filesystem paths, so the path-returning
+    // `App::open_file` / `save_file` cannot be implemented here and stay
+    // honest no-ops. What a page *can* do is hand the app the file's
+    // *contents*, and that is what these two do: `open_file_content` runs a
+    // real file picker and reads the choice as text, `save_file_content`
+    // builds a Blob and clicks a synthetic <a download> so the browser writes
+    // it wherever the user's download settings say. A caller that needs a
+    // path keeps needing one it cannot get; a caller that needs a document
+    // gets one.
+    // -----------------------------------------------------------------------
+
+    /// Ask the user to pick a file and read it, calling
+    /// `on_chosen(name, Some(text))` -- or `on_chosen(name, None)` if the user
+    /// cancels.
+    ///
+    /// The three constraints that shape this, all inherent to a browser:
+    ///
+    /// 1. *The picker is modal and async.* There is no `Result` to return
+    ///    from, so the answer arrives as a callback. The sync
+    ///    `open_file` signature cannot express this, which is why it stays a
+    ///    no-op rather than pretending.
+    /// 2. *A chooser must be triggered by a user gesture.* Browsers suppress
+    ///    the dialog otherwise, so the input is `.click()`ed synchronously
+    ///    from inside this call -- the caller has to be in an event handler.
+    /// 3. *The name is not a path.* `File::name` is a bare basename, so
+    ///    `on_chosen` is given the name and the text separately, and the
+    ///    caller decides what to do with the name (title the document, suggest
+    ///    it on the next save).
+    ///
+    /// `accept` is the `accept` attribute: a comma-separated list of
+    /// extensions and/or MIME types (".corro,.ods,text/csv"). It is a *hint*
+    /// that greys the rest of the list; the browser still allows All files,
+    /// which is the same contract the GTK filter has.
+    pub fn open_file_content(
+        accept: Option<&str>,
+        on_chosen: Box<dyn FnMut(Option<String>, Option<String>)>,
+    ) -> Result<(), Error> {
+        let input: HtmlInputElement = create_element("input").dyn_into().map_err(|e| {
+            Error::Backend(format!("open_file_content: {e:?}"))
+        })?;
+        input.set_type("file");
+        if let Some(acc) = accept {
+            input.set_accept(acc);
+        }
+        // Kept in the DOM (not just referenced) for the picker's lifetime:
+        // detaching it can cancel the dialog in some browsers.
+        set_css(&input, "display", "none");
+        body().append_child(&input).ok();
+
+        let cell = Rc::new(RefCell::new(Some(on_chosen)));
+        let on_change = cell.clone();
+        let input_for_handler = input.clone();
+        let closure = Closure::<dyn FnMut(Event)>::new(move |_evt: Event| {
+            // Run exactly once: the input fires `change` on pick *and* on
+            // cancel in some browsers, and a second call would re-enter the
+            // caller's handler with a stale value.
+            let handler = on_change.borrow_mut().take();
+            let Some(mut handler) = handler else {
+                return;
+            };
+            let files = input_for_handler.files();
+            let Some(file) = files.and_then(|f| f.item(0)) else {
+                // No file: the user dismissed the dialog.
+                handler(None, None);
+                return;
+            };
+            let name = file.name();
+            let reader = match web_sys::FileReader::new() {
+                Ok(r) => r,
+                Err(_) => {
+                    handler(Some(name), None);
+                    return;
+                }
+            };
+            let name_for_result = name.clone();
+            let on_done = cell.clone();
+            // The reader is moved into the onload closure so it cannot be
+            // dropped before the load completes -- `FileReader::result` after a
+            // drop would be a use-after-free across the FFI boundary, and
+            // browsers do not keep a JS object alive for a pending callback.
+            // `FileReader` is a JsCast handle: cloning it is a refcount bump
+            // on the same JS object, so the closure and the setup code below
+            // can each hold one safely.
+            let reader_for_cb = reader.clone();
+            let read_ok = Closure::<dyn FnMut(Event)>::new(move |_evt: Event| {
+                let text = reader_for_cb
+                    .result()
+                    .ok()
+                    .and_then(|v| v.as_string());
+                if let Some(mut h) = on_done.borrow_mut().take() {
+                    h(Some(name_for_result.clone()), text);
+                }
+            });
+            // `read_as_text` is what starts the load, so it has to come after
+            // `onload` is attached -- and both have to happen before `reader`
+            // is moved into the closure above. Ordering matters twice here:
+            // an `onload` set after `read_as_text` can miss a cached read.
+            let _ = reader.set_onload(Some(read_ok.as_ref().unchecked_ref()));
+            let _ = reader.read_as_text(&file);
+            // Leaked deliberately: `onload` fires long after this function has
+            // returned, and dropping the Closure would free the trampoline it
+            // points at. The load path runs once per pick, so this is bounded
+            // by the number of files the user opens.
+            std::mem::forget(read_ok);
+        });
+        input
+            .add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())
+            .ok();
+        std::mem::forget(closure);
+
+        // The gesture-triggered click, per constraint 2 above.
+        input.click();
+        Ok(())
+    }
+
+    /// Offer `text` as a download named `filename`, via a Blob and a
+    /// synthetic <a download> click.
+    ///
+    /// The DOM equivalent of writing a file: the browser decides where it
+    /// lands (its own download directory, or a save dialog if the page has
+    /// asked for one), and the app never learns the path -- which is honest,
+    /// because there is no path to learn. Returns once the click is
+    /// dispatched; the download itself is the browser's to complete.
+    pub fn save_file_content(filename: &str, text: &str) -> Result<(), Error> {
+        let parts = js_sys::Array::new();
+        parts.push(&wasm_bindgen::JsValue::from_str(text));
+        let opts = web_sys::BlobPropertyBag::new();
+        opts.set_type("text/plain;charset=utf-8");
+        let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &opts)
+            .map_err(|e| Error::Backend(format!("save_file_content: {e:?}")))?;
+        let url = web_sys::Url::create_object_url_with_blob(&blob)
+            .map_err(|e| Error::Backend(format!("create_object_url: {e:?}")))?;
+
+        let anchor: HtmlAnchorElement = create_element("a").dyn_into().map_err(|e| {
+            Error::Backend(format!("save_file_content anchor: {e:?}"))
+        })?;
+        anchor.set_href(&url);
+        anchor.set_download(filename);
+        set_css(&anchor, "display", "none");
+        body().append_child(&anchor).ok();
+        anchor.click();
+        anchor.remove();
+
+        // Revoking immediately would race the download in some browsers; the
+        // URL is released when the document is, which is the documented
+        // escape for a one-shot object URL.
+        Ok(())
     }
 
     /// Run `f` every `ms` milliseconds until it returns `false`.

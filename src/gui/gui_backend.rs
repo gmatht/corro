@@ -5408,7 +5408,112 @@ fn finish_menu_tour_stop(state: &Rc<GuiState>, section: &str, item: &str, action
     state.window.queue_redraw();
 }
 
+/// WASM "Open": run a real file picker and load the chosen file's contents.
+///
+/// A browser cannot be handed a path, so this does not go through
+/// [`dialogs::file_open_dialog`] (which is a no-op there) and does not call
+/// `std::fs`. The picker is modal and async, so the result arrives in a
+/// callback; `state` is cloned into it because the `App` behind the raw
+/// pointer outlives this call but the borrow of it does not.
+///
+/// The accept list is the same set the GTK filter offers, expressed as the
+/// `accept` attribute's extension form -- a hint that greys the rest of the
+/// list, exactly as a GTK filter does.
+#[cfg(target_arch = "wasm32")]
+fn wasm_open_file(state: &Rc<GuiState>) {
+    let state = state.clone();
+    let _ = rswidgets::backends_wasm_adapter::open_file_content(
+        Some(".corro,.ods,.csv,.tsv"),
+        Box::new(move |name: Option<String>, text: Option<String>| {
+            let Some(text) = text else {
+                // Cancelled, or the read failed. A cancel is not an error
+                // worth a status line.
+                return;
+            };
+            let app = state.app_mut();
+            match crate::io::load_workbook_text(&text) {
+                Ok(workbook) => {
+                    app.core.workbook = workbook;
+                    app.core.offset = 0;
+                    app.core.ops_applied = 0;
+                    // No path: there is none to record. `path` staying `None`
+                    // is what routes a later "save" through the download path
+                    // instead of a silent write to a stale file.
+                    app.core.path = None;
+                    app.core.status = match name {
+                        Some(n) => format!("Opened {n}"),
+                        None => "Opened file".into(),
+                    };
+                    recompute_viewport(&state);
+                    state.canvas.queue_redraw();
+                }
+                Err(e) => app.core.status = format!("Open error: {e}"),
+            }
+        }),
+    );
+}
+
+/// WASM "Save As": serialize the workbook and hand it to the browser as a
+/// download.
+///
+/// A page cannot be told where the file went and cannot be asked afterwards --
+/// the browser owns the destination -- so there is no `path` to set and no
+/// "Saved to ..." to report. The status line says what actually happened, and
+/// `path` is left `None` so that a plain "save" also downloads rather than
+/// pretending it wrote somewhere.
+#[cfg(target_arch = "wasm32")]
+fn wasm_save_file(state: &Rc<GuiState>, suggested: &str) {
+    let app = state.app_ref();
+    let text = crate::io::serialize_workbook_log(
+        &app.core.workbook,
+        &app.core.persisted_view_sort_cols,
+    );
+    let name = if suggested.is_empty() {
+        "Sheet1.corro".to_string()
+    } else {
+        suggested.to_string()
+    };
+    match rswidgets::backends_wasm_adapter::save_file_content(&name, &text) {
+        Ok(()) => {
+            let app = state.app_mut();
+            app.core.path = None;
+            app.core.status = format!("Downloaded {name}");
+            state.canvas.queue_redraw();
+        }
+        Err(e) => {
+            let app = state.app_mut();
+            app.core.status = format!("Save error: {e}");
+        }
+    }
+}
+
 fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
+    // WASM: the file menu items are handled before `app_mut()` is taken,
+    // because the picker and the download are asynchronous (and the picker
+    // must be triggered from inside the click gesture, so it cannot go behind
+    // a borrow that outlives the call).
+    #[cfg(target_arch = "wasm32")]
+    {
+        match name {
+            "open" => return wasm_open_file(state),
+            "save_as" => {
+                let suggested = state
+                    .app_ref()
+                    .core
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "Sheet1.corro".to_string());
+                return wasm_save_file(state, &suggested);
+            }
+            "save" => {
+                // A page has no file to overwrite, so "save" and "save as" are
+                // the same operation: serialize and download.
+                return wasm_save_file(state, "Sheet1.corro");
+            }
+            _ => {}
+        }
+    }
     let app = state.app_mut();
     log_ui_action("menu_action", name);
     match name {
