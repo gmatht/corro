@@ -402,10 +402,21 @@ jobs:
             # Is the app still running? A screenshot of a dead process is a
             # screenshot of the springboard, which is the failure this whole
             # step exists to catch, and "is it corro's sheet" cannot tell that
-            # from a live-but-wrong frame. `simctl spawn launchctl list` is
-            # the one probe that answers it.
-            if ! "${SIMCTL[@]}" spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -q corro; then
-              echo "::warning::the app is no longer running at attempt ${attempt}"
+            # from a live-but-wrong frame.
+            #
+            # Read from the app's OWN log rather than `launchctl list`: inside
+            # a simulator, `launchctl list` enumerates launch daemons and does
+            # not list a GUI app at all, so it reports "(none)" whether the app
+            # is running or not. The first version of this probe used it and
+            # so reported the app dead on a run where it was demonstrably
+            # drawing.
+            #
+            # `main.m` logs "UIApplicationMain RETURNED" when the run loop
+            # unwinds, so its ABSENCE plus a fall-off in the app's own
+            # markers is the honest signal.
+            if grep -qa "UIApplicationMain RETURNED" /tmp/corro-live.log 2>/dev/null; then
+              echo "::error::the app's run loop unwound (UIApplicationMain returned) - the app is exiting"
+              break
             fi
             "${SIMCTL[@]}" io "$SIM_UDID" screenshot "$SHOT" >/dev/null 2>&1 || true
             # `--populated`, not just the light-surface gate: the chrome draws
