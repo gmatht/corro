@@ -606,6 +606,13 @@ mod nwg_adapter {
                 &nwg::ControlHandle::Hwnd(hwnd),
                 handler_id,
                 move |_h, msg, _w, l| {
+                    if msg == winapi::um::winuser::WM_PAINT {
+                        // TEMPORARY ReactOS diagnosis: does the toplevel ever
+                        // get a paint? Distinguishes "no WM_PAINT at all"
+                        // from "WM_PAINT but the canvas drew nothing".
+                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                        mark95a(b"toplevel-paint\n");
+                    }
                     if msg == winapi::um::winuser::WM_SIZE {
                         let w = (l & 0xFFFF) as i32;
                         let h = ((l >> 16) & 0xFFFF) as i32;
