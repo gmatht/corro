@@ -539,7 +539,11 @@ mod nwg_adapter {
         /// manager adopts the window; on a bare Xvfb or an offscreen CI runner
         /// there is none and the window keeps its initial size. This forces it.
         pub fn resize(&self, width: i32, height: i32) {
-            self.inner.set_size(width, height);
+            // nwg's signature is (u32, u32). A negative request is meaningless
+            // and would wrap round to an enormous size, so it is clamped rather
+            // than cast blindly.
+            self.inner
+                .set_size(width.max(0) as u32, height.max(0) as u32);
         }
     }
 
