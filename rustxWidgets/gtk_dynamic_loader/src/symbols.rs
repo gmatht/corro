@@ -2,7 +2,33 @@ use crate::error::Error;
 use crate::loader::RawLib as Library;
 use std::ffi::c_void;
 
-// Minimal subset of function pointer types we need
+/// Every `char*` in these signatures is spelled `*const u8` / `*mut u8`.
+///
+/// The C type is `const char*` / `char*`, whose Rust spelling is
+/// `*const c_char` / `*mut c_char` — and `c_char` is **platform-dependent**:
+/// `i8` on x86 and every ARM, `u8` on PowerPC/s390x/other BSDs. Writing `i8`
+/// out by hand made this crate fail to typecheck on exactly those platforms
+/// (76 errors on `aarch64-linux-android`), while compiling fine on
+/// `x86_64-linux-android` because there `c_char` happens to be `u8` — the
+/// emulator ABI hid the bug and a real device would not.
+///
+/// `u8` is the right choice for two reasons, and the second is the important
+/// one:
+///
+/// 1. It is the type of `CString::as_ptr()` and `CStr::as_ptr()`
+///    unconditionally, so every call site here typechecks on every target
+///    without a cast.
+/// 2. It does not actually change the ABI. These are `extern "C"` function
+///    pointers, so the *pointed-to* element type is not part of the calling
+///    convention — a pointer to a signed byte and a pointer to an unsigned byte
+///    are passed in the same register on every ABI. Only the pointee's
+///    alignment and signedness differ, and C string literals are never
+///    dereferenced through a signedness-sensitive operation here.
+///
+/// The alternative, `*const c_char`, would be the pedantically correct
+/// spelling but would need a `as *const c_char` at each of the ~60 call
+/// sites, and would be wrong on the targets where `c_char` is not `u8`
+/// anyway. So: `u8`, with this comment as the record of why.
 pub type GMainLoopNew = unsafe extern "C" fn(context: *mut c_void, is_running: i32) -> *mut c_void;
 pub type GMainLoopRun = unsafe extern "C" fn(loop_: *mut c_void);
 pub type GMainLoopQuit = unsafe extern "C" fn(loop_: *mut c_void);
@@ -11,27 +37,27 @@ pub type GObjectRef = unsafe extern "C" fn(obj: *mut c_void) -> *mut c_void;
 pub type GObjectUnref = unsafe extern "C" fn(obj: *mut c_void);
 pub type GObjectRefSink = unsafe extern "C" fn(obj: *mut c_void) -> *mut c_void;
 
-pub type GSignalConnectData = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const i8, c_handler: *mut c_void, data: *mut c_void, destroy_data: Option<unsafe extern "C" fn(data: *mut c_void, closure: *mut c_void)>, connect_flags: u32) -> u64;
-pub type GSignalConnect = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const i8, c_handler: *mut c_void, data: *mut c_void) -> u64;
-pub type GSignalEmitByName = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const i8) -> u64;
+pub type GSignalConnectData = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const u8, c_handler: *mut c_void, data: *mut c_void, destroy_data: Option<unsafe extern "C" fn(data: *mut c_void, closure: *mut c_void)>, connect_flags: u32) -> u64;
+pub type GSignalConnect = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const u8, c_handler: *mut c_void, data: *mut c_void) -> u64;
+pub type GSignalEmitByName = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const u8) -> u64;
 /// `g_signal_emit_by_name` for `GtkEventControllerKey::key-pressed` /
 /// `key-released`, whose C signature is (keyval, keycode, state) -> bool.
 /// The symbol itself is variadic, so the same pointer is reinterpreted with
 /// the three-argument shape rather than declared twice.
 pub type GSignalEmitKeyByName = unsafe extern "C" fn(
     instance: *mut c_void,
-    detailed_signal: *const i8,
+    detailed_signal: *const u8,
     keyval: u32,
     keycode: u32,
     state: u32,
 ) -> u64;
 
 pub type GtkWindowNew = unsafe extern "C" fn(window_type: i32) -> *mut c_void;
-pub type GtkWindowSetTitle = unsafe extern "C" fn(window: *mut c_void, title: *const i8);
-pub type GtkButtonNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
-pub type GtkLabelNew = unsafe extern "C" fn(str: *const i8) -> *mut c_void;
-pub type GtkLabelSetText = unsafe extern "C" fn(label: *mut c_void, str: *const i8);
-pub type GtkLabelGetText = unsafe extern "C" fn(label: *mut c_void) -> *const i8;
+pub type GtkWindowSetTitle = unsafe extern "C" fn(window: *mut c_void, title: *const u8);
+pub type GtkButtonNewWithLabel = unsafe extern "C" fn(label: *const u8) -> *mut c_void;
+pub type GtkLabelNew = unsafe extern "C" fn(str: *const u8) -> *mut c_void;
+pub type GtkLabelSetText = unsafe extern "C" fn(label: *mut c_void, str: *const u8);
+pub type GtkLabelGetText = unsafe extern "C" fn(label: *mut c_void) -> *const u8;
 pub type GtkBoxNew = unsafe extern "C" fn(orientation: i32, spacing: i32) -> *mut c_void;
 
 pub type GtkBoxAppend = unsafe extern "C" fn(box_: *mut c_void, child: *mut c_void);
@@ -46,63 +72,63 @@ pub type GtkWidgetHide = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetShowAll = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWindowPresent = unsafe extern "C" fn(window: *mut c_void);
 pub type GtkInit = unsafe extern "C" fn(argc: *mut libc::c_int, argv: *mut *mut *mut libc::c_char);
-pub type GtkLabelSetMarkup = unsafe extern "C" fn(label: *mut c_void, markup: *const i8);
+pub type GtkLabelSetMarkup = unsafe extern "C" fn(label: *mut c_void, markup: *const u8);
 pub type GtkWidgetSetVisible = unsafe extern "C" fn(widget: *mut c_void, visible: i32);
 pub type GtkWidgetGrabFocus = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetHasFocus = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetStyleContext = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
-pub type GtkStyleContextAddClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const i8);
-pub type GtkStyleContextRemoveClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const i8);
+pub type GtkStyleContextAddClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const u8);
+pub type GtkStyleContextRemoveClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const u8);
 pub type GtkCssProviderNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkCssProviderLoadFromData = unsafe extern "C" fn(provider: *mut c_void, data: *const i8, length: isize, error: *mut *mut c_void) -> i32;
+pub type GtkCssProviderLoadFromData = unsafe extern "C" fn(provider: *mut c_void, data: *const u8, length: isize, error: *mut *mut c_void) -> i32;
 pub type GtkStyleContextAddProvider = unsafe extern "C" fn(context: *mut c_void, provider: *mut c_void, priority: u32);
 // GApplication / GMenu / Actions (gio)
-pub type GtkApplicationNew = unsafe extern "C" fn(application_id: *const i8, flags: u32) -> *mut c_void;
-pub type GApplicationRun = unsafe extern "C" fn(application: *mut c_void, argc: i32, argv: *mut *mut i8) -> i32;
+pub type GtkApplicationNew = unsafe extern "C" fn(application_id: *const u8, flags: u32) -> *mut c_void;
+pub type GApplicationRun = unsafe extern "C" fn(application: *mut c_void, argc: i32, argv: *mut *mut u8) -> i32;
 pub type GApplicationRegister = unsafe extern "C" fn(application: *mut c_void, cancellable: *mut c_void, error: *mut *mut c_void) -> i32;
-pub type GSimpleActionNew = unsafe extern "C" fn(name: *const i8, parameter_type: *mut c_void) -> *mut c_void;
+pub type GSimpleActionNew = unsafe extern "C" fn(name: *const u8, parameter_type: *mut c_void) -> *mut c_void;
 pub type GSimpleActionGroupNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GActionMapAddAction = unsafe extern "C" fn(map: *mut c_void, action: *mut c_void);
-pub type GActionGroupActivateAction = unsafe extern "C" fn(group: *mut c_void, action_name: *const i8, parameter: *mut c_void);
-pub type GActionMapLookupAction = unsafe extern "C" fn(map: *mut c_void, action_name: *const i8) -> *mut c_void;
+pub type GActionGroupActivateAction = unsafe extern "C" fn(group: *mut c_void, action_name: *const u8, parameter: *mut c_void);
+pub type GActionMapLookupAction = unsafe extern "C" fn(map: *mut c_void, action_name: *const u8) -> *mut c_void;
 pub type GActionActivate = unsafe extern "C" fn(action: *mut c_void, parameter: *mut c_void);
 pub type GMenuNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GMenuAppend = unsafe extern "C" fn(menu: *mut c_void, label: *const i8, detailed_action: *const i8);
+pub type GMenuAppend = unsafe extern "C" fn(menu: *mut c_void, label: *const u8, detailed_action: *const u8);
 pub type GApplicationSetAppMenu = unsafe extern "C" fn(application: *mut c_void, menu: *mut c_void);
 pub type GApplicationSetMenubar = unsafe extern "C" fn(application: *mut c_void, menu: *mut c_void);
-pub type GMenuAppendSubmenu = unsafe extern "C" fn(menu: *mut c_void, label: *const i8, submenu: *mut c_void);
+pub type GMenuAppendSubmenu = unsafe extern "C" fn(menu: *mut c_void, label: *const u8, submenu: *mut c_void);
 pub type GtkPopoverMenuBarNewFromModel = unsafe extern "C" fn(model: *mut c_void) -> *mut c_void;
 // GTK3 menu bar
 pub type GtkMenuBarNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkMenuNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkMenuItemNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
-pub type GtkMenuItemNewWithMnemonic = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
+pub type GtkMenuItemNewWithLabel = unsafe extern "C" fn(label: *const u8) -> *mut c_void;
+pub type GtkMenuItemNewWithMnemonic = unsafe extern "C" fn(label: *const u8) -> *mut c_void;
 pub type GtkMenuShellAppend = unsafe extern "C" fn(shell: *mut c_void, child: *mut c_void);
 pub type GtkMenuItemSetSubmenu = unsafe extern "C" fn(item: *mut c_void, submenu: *mut c_void);
 pub type GtkWindowSetApplication = unsafe extern "C" fn(window: *mut c_void, application: *mut c_void);
 // Widget action group resolution (needed for GtkPopoverMenuBar to find actions)
-pub type GtkWidgetInsertActionGroup = unsafe extern "C" fn(widget: *mut c_void, name: *const i8, group: *mut c_void);
+pub type GtkWidgetInsertActionGroup = unsafe extern "C" fn(widget: *mut c_void, name: *const u8, group: *mut c_void);
 // GtkActionable (for setting action names on GTK3 menu items)
-pub type GtkActionableSetDetailedActionName = unsafe extern "C" fn(actionable: *mut c_void, detailed_action_name: *const i8);
+pub type GtkActionableSetDetailedActionName = unsafe extern "C" fn(actionable: *mut c_void, detailed_action_name: *const u8);
 // GMenuModel iteration (for GTK3 fallback)
 pub type GMenuModelGetNItems = unsafe extern "C" fn(model: *mut c_void) -> i32;
-pub type GMenuModelGetItemAttributeValue = unsafe extern "C" fn(model: *mut c_void, item_index: i32, attribute: *const i8, expected_type: *const c_void) -> *mut c_void;
-pub type GMenuModelGetItemLink = unsafe extern "C" fn(model: *mut c_void, item_index: i32, link: *const i8) -> *mut c_void;
-pub type GVariantGetString = unsafe extern "C" fn(value: *mut c_void, length: *mut usize) -> *const i8;
+pub type GMenuModelGetItemAttributeValue = unsafe extern "C" fn(model: *mut c_void, item_index: i32, attribute: *const u8, expected_type: *const c_void) -> *mut c_void;
+pub type GMenuModelGetItemLink = unsafe extern "C" fn(model: *mut c_void, item_index: i32, link: *const u8) -> *mut c_void;
+pub type GVariantGetString = unsafe extern "C" fn(value: *mut c_void, length: *mut usize) -> *const u8;
 pub type GVariantUnref = unsafe extern "C" fn(value: *mut c_void);
 
 // File chooser / native dialog
-pub type GtkFileChooserNativeNew = unsafe extern "C" fn(title: *const i8, parent: *mut c_void, action: i32, accept_label: *const i8, cancel_label: *const i8) -> *mut c_void;
+pub type GtkFileChooserNativeNew = unsafe extern "C" fn(title: *const u8, parent: *mut c_void, action: i32, accept_label: *const u8, cancel_label: *const u8) -> *mut c_void;
 pub type GtkNativeDialogRun = unsafe extern "C" fn(native: *mut c_void) -> i32;
-pub type GtkFileChooserGetFilename = unsafe extern "C" fn(chooser: *mut c_void) -> *const i8;
+pub type GtkFileChooserGetFilename = unsafe extern "C" fn(chooser: *mut c_void) -> *const u8;
 // File filters (GtkFileFilter + GtkFileChooser filter API, stable across
 // GTK 3.20+ and GTK 4): optional best-effort enhancement for save dialogs.
 pub type GtkFileFilterNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkFileFilterSetName = unsafe extern "C" fn(filter: *mut c_void, name: *const i8);
-pub type GtkFileFilterAddPattern = unsafe extern "C" fn(filter: *mut c_void, pattern: *const i8);
+pub type GtkFileFilterSetName = unsafe extern "C" fn(filter: *mut c_void, name: *const u8);
+pub type GtkFileFilterAddPattern = unsafe extern "C" fn(filter: *mut c_void, pattern: *const u8);
 pub type GtkFileChooserAddFilter = unsafe extern "C" fn(chooser: *mut c_void, filter: *mut c_void);
 pub type GtkFileChooserSetFilter = unsafe extern "C" fn(chooser: *mut c_void, filter: *mut c_void);
-pub type GtkFileChooserSetCurrentName = unsafe extern "C" fn(chooser: *mut c_void, name: *const i8) -> i32;
+pub type GtkFileChooserSetCurrentName = unsafe extern "C" fn(chooser: *mut c_void, name: *const u8) -> i32;
 pub type GtkWidgetDestroy = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWindowClose = unsafe extern "C" fn(window: *mut c_void);
 pub type GFree = unsafe extern "C" fn(ptr: *mut c_void);
@@ -113,7 +139,7 @@ pub type GdkEventGetState = unsafe extern "C" fn(event: *mut c_void, state: *mut
 // (stable across GTK3/GTK4). Needed because the unfiltered "event" signal
 // also delivers releases, which are indistinguishable downstream.
 pub type GdkEventGetEventType = unsafe extern "C" fn(event: *const c_void) -> i32;
-pub type GdkKeyvalFromName = unsafe extern "C" fn(name: *const i8) -> u32;
+pub type GdkKeyvalFromName = unsafe extern "C" fn(name: *const u8) -> u32;
 pub type GdkDisplayGetDefault = unsafe extern "C" fn() -> *mut c_void;
 pub type GdkScreenGetDefault = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkStyleContextAddProviderForDisplay = unsafe extern "C" fn(display: *mut c_void, provider: *mut c_void, priority: u32);
@@ -150,12 +176,12 @@ pub type GtkPopoverSetChild = unsafe extern "C" fn(popover: *mut c_void, child: 
 // GtkMenuButton — for manual menu bar construction
 pub type GtkMenuButtonNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkMenuButtonSetPopover = unsafe extern "C" fn(button: *mut c_void, popover: *mut c_void);
-pub type GtkMenuButtonSetLabel = unsafe extern "C" fn(button: *mut c_void, label: *const i8);
+pub type GtkMenuButtonSetLabel = unsafe extern "C" fn(button: *mut c_void, label: *const u8);
 pub type GtkMenuButtonGetPopover = unsafe extern "C" fn(button: *mut c_void) -> *mut c_void;
 pub type GtkMenuButtonSetHasFrame = unsafe extern "C" fn(button: *mut c_void, has_frame: i32);
 pub type GtkMenuButtonSetPrimary = unsafe extern "C" fn(button: *mut c_void, primary: i32);
 pub type GtkButtonSetHasFrame = unsafe extern "C" fn(button: *mut c_void, has_frame: i32);
-pub type GtkWidgetAddCssClass = unsafe extern "C" fn(widget: *mut c_void, css_class: *const i8);
+pub type GtkWidgetAddCssClass = unsafe extern "C" fn(widget: *mut c_void, css_class: *const u8);
 
 
 
@@ -167,14 +193,14 @@ pub type GdkDisplaySync = unsafe extern "C" fn(display: *mut c_void);
 
 // Dialog
 pub type GtkDialogNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkDialogAddButton = unsafe extern "C" fn(dialog: *mut c_void, button_text: *const i8, response_id: i32) -> *mut c_void;
+pub type GtkDialogAddButton = unsafe extern "C" fn(dialog: *mut c_void, button_text: *const u8, response_id: i32) -> *mut c_void;
 pub type GtkDialogSetDefaultResponse = unsafe extern "C" fn(dialog: *mut c_void, response_id: i32);
 pub type GtkDialogGetContentArea = unsafe extern "C" fn(dialog: *mut c_void) -> *mut c_void;
 pub type GtkDialogRun = unsafe extern "C" fn(dialog: *mut c_void) -> i32;
 // Dropdown - GTK3 ComboBoxText
 pub type GtkComboBoxTextNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkComboBoxTextAppendText = unsafe extern "C" fn(combo: *mut c_void, text: *const i8);
-pub type GtkComboBoxTextGetActiveText = unsafe extern "C" fn(combo: *mut c_void) -> *const i8;
+pub type GtkComboBoxTextAppendText = unsafe extern "C" fn(combo: *mut c_void, text: *const u8);
+pub type GtkComboBoxTextGetActiveText = unsafe extern "C" fn(combo: *mut c_void) -> *const u8;
 pub type GtkComboBoxSetActive = unsafe extern "C" fn(combo: *mut c_void, index_: i32);
 pub type GtkComboBoxGetActive = unsafe extern "C" fn(combo: *mut c_void) -> i32;
 
@@ -182,10 +208,10 @@ pub type GtkComboBoxGetActive = unsafe extern "C" fn(combo: *mut c_void) -> i32;
 pub type GtkDropDownNew = unsafe extern "C" fn(model: *mut c_void, expression: *mut c_void) -> *mut c_void;
 pub type GtkDropDownSetSelected = unsafe extern "C" fn(dropdown: *mut c_void, selected: u32);
 pub type GtkDropDownGetSelected = unsafe extern "C" fn(dropdown: *mut c_void) -> u32;
-pub type GtkStringListNew = unsafe extern "C" fn(strings: *const *const i8) -> *mut c_void;
+pub type GtkStringListNew = unsafe extern "C" fn(strings: *const *const u8) -> *mut c_void;
 
 // Checkbox / CheckButton
-pub type GtkCheckButtonNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
+pub type GtkCheckButtonNewWithLabel = unsafe extern "C" fn(label: *const u8) -> *mut c_void;
 pub type GtkCheckButtonGetActive = unsafe extern "C" fn(check_button: *mut c_void) -> i32;
 pub type GtkCheckButtonSetActive = unsafe extern "C" fn(check_button: *mut c_void, is_active: i32);
 pub type GtkCheckButtonSetGroup = unsafe extern "C" fn(check_button: *mut c_void, group: *mut c_void);
@@ -193,7 +219,7 @@ pub type GtkToggleButtonGetActive = unsafe extern "C" fn(toggle_button: *mut c_v
 pub type GtkToggleButtonSetActive = unsafe extern "C" fn(toggle_button: *mut c_void, is_active: i32);
 
 // RadioButton
-pub type GtkRadioButtonNewWithLabel = unsafe extern "C" fn(group: *mut c_void, label: *const i8) -> *mut c_void;
+pub type GtkRadioButtonNewWithLabel = unsafe extern "C" fn(group: *mut c_void, label: *const u8) -> *mut c_void;
 // Returns the GSList* group of a radio button (NOT a widget pointer: passing
 // a widget as the ctor's `group` arg segfaults inside GTK).
 pub type GtkRadioButtonGetGroup = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
@@ -202,13 +228,13 @@ pub type GtkRadioButtonGetGroup = unsafe extern "C" fn(widget: *mut c_void) -> *
 pub type GtkTextViewNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkTextBufferNew = unsafe extern "C" fn(table: *mut c_void) -> *mut c_void;
 pub type GtkTextViewGetBuffer = unsafe extern "C" fn(text_view: *mut c_void) -> *mut c_void;
-pub type GtkTextBufferSetText = unsafe extern "C" fn(buffer: *mut c_void, text: *const i8, len: i32);
+pub type GtkTextBufferSetText = unsafe extern "C" fn(buffer: *mut c_void, text: *const u8, len: i32);
 pub type GtkTextBufferGetText = unsafe extern "C" fn(buffer: *mut c_void, start: *mut c_void, end: *mut c_void, include_hidden_chars: i32) -> *mut c_void;
 pub type GtkTextBufferGetStartIter = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void);
 pub type GtkTextBufferGetEndIter = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void);
 /// `gtk_text_buffer_insert_at_cursor(buffer, iter, text, len)`; the iterator
 /// is honoured, which is how `TextView::append_text` targets the end.
-pub type GtkTextBufferInsertAtCursor = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void, text: *const i8, len: i32);
+pub type GtkTextBufferInsertAtCursor = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void, text: *const u8, len: i32);
 pub type GtkTextIterCopy = unsafe extern "C" fn(iter: *mut c_void) -> *mut c_void;
 pub type GtkTextIterFree = unsafe extern "C" fn(iter: *mut c_void);
 pub type GtkTextViewSetWrapMode = unsafe extern "C" fn(text_view: *mut c_void, wrap_mode: i32);
@@ -221,8 +247,8 @@ pub type GtkWidgetGetHexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetVexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 
 // GtkEditable (GTK4 replacement for gtk_entry_get_text/set_text)
-pub type GtkEditableGetText = unsafe extern "C" fn(editable: *mut c_void) -> *const i8;
-pub type GtkEditableSetText = unsafe extern "C" fn(editable: *mut c_void, text: *const i8);
+pub type GtkEditableGetText = unsafe extern "C" fn(editable: *mut c_void) -> *const u8;
+pub type GtkEditableSetText = unsafe extern "C" fn(editable: *mut c_void, text: *const u8);
 pub type GtkEditableSetPosition = unsafe extern "C" fn(editable: *mut c_void, position: i32);
 /// `int gtk_editable_get_position(GtkEditable*)` (GTK3/GTK4).
 pub type GtkEditableGetPosition = unsafe extern "C" fn(editable: *mut c_void) -> i32;
@@ -290,10 +316,10 @@ pub type GtkWidgetActivate = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetGetVisible = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 
 // GtkWidget activate_action — activates a named action on a widget
-pub type GtkWidgetActivateAction = unsafe extern "C" fn(widget: *mut c_void, detailed_name: *const i8, parameter: *mut c_void);
+pub type GtkWidgetActivateAction = unsafe extern "C" fn(widget: *mut c_void, detailed_name: *const u8, parameter: *mut c_void);
 
 // GtkMenuButton (GTK4 submenu opener)
-pub type GtkMenuButtonGetLabel = unsafe extern "C" fn(button: *mut c_void) -> *const i8;
+pub type GtkMenuButtonGetLabel = unsafe extern "C" fn(button: *mut c_void) -> *const u8;
 pub type GtkMenuButtonSetActive = unsafe extern "C" fn(button: *mut c_void, active: i32);
 
 // GtkWindow default size
@@ -307,8 +333,8 @@ pub type GtkWindowSetDefaultSize = unsafe extern "C" fn(window: *mut c_void, wid
 pub type GtkGridNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkGridAttach = unsafe extern "C" fn(grid: *mut c_void, child: *mut c_void, left: i32, top: i32, width: i32, height: i32);
 pub type GtkEntryNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkEntrySetText = unsafe extern "C" fn(entry: *mut c_void, text: *const i8);
-pub type GtkEntryGetText = unsafe extern "C" fn(entry: *mut c_void) -> *const i8;
+pub type GtkEntrySetText = unsafe extern "C" fn(entry: *mut c_void, text: *const u8);
+pub type GtkEntryGetText = unsafe extern "C" fn(entry: *mut c_void) -> *const u8;
 pub type GtkEntrySetWidthChars = unsafe extern "C" fn(entry: *mut c_void, n_chars: i32);
 pub type GtkWidgetSetSizeRequest = unsafe extern "C" fn(widget: *mut c_void, width: i32, height: i32);
 pub type GtkEntrySetHasFrame = unsafe extern "C" fn(entry: *mut c_void, has_frame: i32);
@@ -346,7 +372,7 @@ pub type GdkFrameClockBeginUpdating = unsafe extern "C" fn(clock: *mut c_void);
 pub type GdkFrameClockEndUpdating = unsafe extern "C" fn(clock: *mut c_void);
 
 // Cairo additions
-pub type CairoTextExtents = unsafe extern "C" fn(cr: *mut c_void, utf8: *const i8, extents: *mut c_void);
+pub type CairoTextExtents = unsafe extern "C" fn(cr: *mut c_void, utf8: *const u8, extents: *mut c_void);
 pub type CairoSave = unsafe extern "C" fn(cr: *mut c_void);
 pub type CairoRestore = unsafe extern "C" fn(cr: *mut c_void);
 pub type CairoClip = unsafe extern "C" fn(cr: *mut c_void);
@@ -490,7 +516,7 @@ pub struct Symbols {
     pub g_timeout_add: Option<unsafe extern "C" fn(interval_ms: u32, func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>,
     // pango (optional)
     pub pango_layout_new: Option<unsafe extern "C" fn(context: *mut c_void) -> *mut c_void>,
-    pub pango_layout_set_text: Option<unsafe extern "C" fn(layout: *mut c_void, text: *const i8, len: i32)>,
+    pub pango_layout_set_text: Option<unsafe extern "C" fn(layout: *mut c_void, text: *const u8, len: i32)>,
     pub pango_layout_get_size: Option<unsafe extern "C" fn(layout: *mut c_void, width: *mut i32, height: *mut i32)>,
     // cairo surface/context helpers
     pub cairo_create: Option<unsafe extern "C" fn(surface: *mut c_void) -> *mut c_void>,
@@ -515,9 +541,9 @@ pub struct Symbols {
     pub cairo_fill: Option<unsafe extern "C" fn(cr: *mut c_void)>,
     pub cairo_stroke: Option<unsafe extern "C" fn(cr: *mut c_void)>,
     pub cairo_set_line_width: Option<unsafe extern "C" fn(cr: *mut c_void, w: f64)>,
-    pub cairo_select_font_face: Option<unsafe extern "C" fn(cr: *mut c_void, family: *const i8, slant: i32, weight: i32)>,
+    pub cairo_select_font_face: Option<unsafe extern "C" fn(cr: *mut c_void, family: *const u8, slant: i32, weight: i32)>,
     pub cairo_set_font_size: Option<unsafe extern "C" fn(cr: *mut c_void, size: f64)>,
-    pub cairo_show_text: Option<unsafe extern "C" fn(cr: *mut c_void, utf8: *const i8)>,
+    pub cairo_show_text: Option<unsafe extern "C" fn(cr: *mut c_void, utf8: *const u8)>,
     // widget helpers
     pub gtk_widget_queue_draw: Option<unsafe extern "C" fn(widget: *mut c_void)>,
     pub gtk_widget_set_can_focus: Option<GtkWidgetSetCanFocus>,
@@ -855,9 +881,9 @@ impl Symbols {
         let cairo_fill = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_fill").or_else(|| None);
         let cairo_stroke = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_stroke").or_else(|| None);
         let cairo_set_line_width = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64), "cairo_set_line_width").or_else(|| None);
-        let cairo_select_font_face = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *const i8, i32, i32), "cairo_select_font_face").or_else(|| None);
+        let cairo_select_font_face = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *const u8, i32, i32), "cairo_select_font_face").or_else(|| None);
         let cairo_set_font_size = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64), "cairo_set_font_size").or_else(|| None);
-        let cairo_show_text = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *const i8), "cairo_show_text").or_else(|| None);
+        let cairo_show_text = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *const u8), "cairo_show_text").or_else(|| None);
         let cairo_text_extents = open_sym_try!(libs, "libcairo", CairoTextExtents, "cairo_text_extents").or_else(|| None);
         let cairo_save = open_sym_try!(libs, "libcairo", CairoSave, "cairo_save").or_else(|| None);
         let cairo_restore = open_sym_try!(libs, "libcairo", CairoRestore, "cairo_restore").or_else(|| None);

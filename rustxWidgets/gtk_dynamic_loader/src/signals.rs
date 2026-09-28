@@ -163,14 +163,14 @@ pub unsafe fn connect_signal(lib_symbols: &crate::symbols::Symbols, instance: *m
             _ => gtk_compat_trampoline_2 as *const () as *mut c_void,
         };
         let destroy_ptr = Some(gtk_compat_destroy_notify as unsafe extern "C" fn(*mut c_void, *mut c_void));
-        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        let id = gscd(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
         Ok(id)
     } else if let Some(gsc) = lib_symbols.g_signal_connect {
         let handler_ptr = match arity {
             3 => gtk_compat_trampoline_3 as *const () as *mut c_void,
             _ => gtk_compat_trampoline_2 as *const () as *mut c_void,
         };
-        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        let id = gsc(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw);
         // We didn't register a destroy notify; closure will leak. It's acceptable for the demo.
         Ok(id)
     } else {
@@ -187,11 +187,11 @@ pub unsafe fn connect_signal_param(lib_symbols: &crate::symbols::Symbols, instan
     if let Some(gscd) = lib_symbols.g_signal_connect_data {
         let handler_ptr = gtk_compat_trampoline_param as *const () as *mut c_void;
         let destroy_ptr = Some(gtk_compat_destroy_notify_param as unsafe extern "C" fn(*mut c_void, *mut c_void));
-        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        let id = gscd(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
         Ok(id)
     } else if let Some(gsc) = lib_symbols.g_signal_connect {
         let handler_ptr = gtk_compat_trampoline_param as *const () as *mut c_void;
-        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        let id = gsc(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw);
         Ok(id)
     } else { Err("no g_signal_connect available".into()) }
 }
@@ -224,11 +224,11 @@ pub unsafe fn connect_signal_gesture(lib_symbols: &crate::symbols::Symbols, inst
     if let Some(gscd) = lib_symbols.g_signal_connect_data {
         let handler_ptr = gtk_compat_trampoline_gesture as *const () as *mut c_void;
         let destroy_ptr = Some(gtk_compat_destroy_notify_gesture as unsafe extern "C" fn(*mut c_void, *mut c_void));
-        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        let id = gscd(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
         Ok(id)
     } else if let Some(gsc) = lib_symbols.g_signal_connect {
         let handler_ptr = gtk_compat_trampoline_gesture as *const () as *mut c_void;
-        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        let id = gsc(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw);
         Ok(id)
     } else { Err("no g_signal_connect available".into()) }
 }
@@ -261,11 +261,11 @@ pub unsafe fn connect_signal_motion(lib_symbols: &crate::symbols::Symbols, insta
     if let Some(gscd) = lib_symbols.g_signal_connect_data {
         let handler_ptr = gtk_compat_trampoline_motion as *const () as *mut c_void;
         let destroy_ptr = Some(gtk_compat_destroy_notify_motion as unsafe extern "C" fn(*mut c_void, *mut c_void));
-        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        let id = gscd(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
         Ok(id)
     } else if let Some(gsc) = lib_symbols.g_signal_connect {
         let handler_ptr = gtk_compat_trampoline_motion as *const () as *mut c_void;
-        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        let id = gsc(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw);
         Ok(id)
     } else { Err("no g_signal_connect available".into()) }
 }
@@ -278,11 +278,11 @@ pub unsafe fn connect_signal_bool(lib_symbols: &crate::symbols::Symbols, instanc
     if let Some(gscd) = lib_symbols.g_signal_connect_data {
         let handler_ptr = gtk_compat_trampoline_bool as *const () as *mut c_void;
         let destroy_ptr = Some(gtk_compat_destroy_notify_bool as unsafe extern "C" fn(*mut c_void, *mut c_void));
-        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        let id = gscd(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
         Ok(id)
     } else if let Some(gsc) = lib_symbols.g_signal_connect {
         let handler_ptr = gtk_compat_trampoline_bool as *const () as *mut c_void;
-        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        let id = gsc(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw);
         Ok(id)
     } else { Err("no g_signal_connect available".into()) }
 }

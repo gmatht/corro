@@ -180,7 +180,7 @@ impl Window {
         guard_widget!(self, "Window", "set_title");
         if let Some(set_title) = self.loader.symbols.gtk_window_set_title {
             let c = CString::new(title).unwrap();
-            unsafe { set_title(self.inner, c.as_ptr()); }
+            unsafe { set_title(self.inner, c.as_ptr() as *const u8); }
         }
     }
 
@@ -353,7 +353,7 @@ impl Window {
         guard_widget!(self, "Window", "insert_action_group");
         if let Some(insert) = self.loader.symbols.gtk_widget_insert_action_group {
             let c = CString::new(name).unwrap();
-            unsafe { insert(self.inner, c.as_ptr(), group_ptr); }
+            unsafe { insert(self.inner, c.as_ptr() as *const u8, group_ptr); }
         }
     }
 }
@@ -378,7 +378,7 @@ impl Button {
         let symbols = &loader.symbols;
         let ctor = symbols.gtk_button_new_with_label.ok_or(Error::MissingSymbol("gtk_button_new_with_label".into()))?;
         let c = CString::new(label).unwrap();
-        let inner = unsafe { ctor(c.as_ptr()) };
+        let inner = unsafe { ctor(c.as_ptr() as *const u8) };
         unsafe { take_ownership(&symbols, &loader.version, inner); }
         Ok(Button { inner, loader, _not_send: PhantomData })
     }
@@ -407,7 +407,7 @@ impl Button {
         guard_widget_or!(self, "Button", "emit_clicked", Err(Error::Other("button dropped".into())));
         if let Some(emit) = self.loader.symbols.g_signal_emit_by_name {
             let name = CString::new("clicked").unwrap();
-            let id = unsafe { emit(self.inner, name.as_ptr()) };
+            let id = unsafe { emit(self.inner, name.as_ptr() as *const u8) };
             Ok(id)
         } else { Err(Error::MissingSymbol("g_signal_emit_by_name".into())) }
     }
@@ -457,7 +457,7 @@ impl Button {
                 let c = CString::new(class_name).unwrap();
                 unsafe {
                     let ctx = get_ctx(self.inner);
-                    if !ctx.is_null() { add_class(ctx, c.as_ptr()); }
+                    if !ctx.is_null() { add_class(ctx, c.as_ptr() as *const u8); }
                 }
             }
         }
@@ -470,7 +470,7 @@ impl Button {
                 let c = CString::new(class_name).unwrap();
                 unsafe {
                     let ctx = get_ctx(self.inner);
-                    if !ctx.is_null() { remove_class(ctx, c.as_ptr()); }
+                    if !ctx.is_null() { remove_class(ctx, c.as_ptr() as *const u8); }
                 }
             }
         }
@@ -506,7 +506,7 @@ impl Label {
         let symbols = &loader.symbols;
         let ctor = symbols.gtk_label_new.ok_or(Error::MissingSymbol("gtk_label_new".into()))?;
         let c = CString::new(text).unwrap();
-        let inner = unsafe { ctor(c.as_ptr()) };
+        let inner = unsafe { ctor(c.as_ptr() as *const u8) };
         unsafe { take_ownership(&symbols, &loader.version, inner); }
         Ok(Label { inner, loader, _not_send: PhantomData })
     }
@@ -515,7 +515,7 @@ impl Label {
         guard_widget!(self, "Label", "set_text");
         if let Some(set_text) = self.loader.symbols.gtk_label_set_text {
             let c = CString::new(text).unwrap();
-            unsafe { set_text(self.inner, c.as_ptr()); }
+            unsafe { set_text(self.inner, c.as_ptr() as *const u8); }
         }
     }
 
@@ -525,7 +525,7 @@ impl Label {
             unsafe {
                 let s = get_text(self.inner);
                 if s.is_null() { return None; }
-                let c = std::ffi::CStr::from_ptr(s);
+                let c = std::ffi::CStr::from_ptr(s as *const std::ffi::c_char);
                 return Some(c.to_string_lossy().into_owned());
             }
         }
@@ -536,7 +536,7 @@ impl Label {
         guard_widget!(self, "Label", "set_markup");
         if let Some(set_markup) = self.loader.symbols.gtk_label_set_markup {
             let c = CString::new(markup).unwrap();
-            unsafe { set_markup(self.inner, c.as_ptr()); }
+            unsafe { set_markup(self.inner, c.as_ptr() as *const u8); }
         } else {
             self.set_text(markup);
         }
@@ -549,7 +549,7 @@ impl Label {
                 let c = CString::new(class_name).unwrap();
                 unsafe {
                     let ctx = get_ctx(self.inner);
-                    if !ctx.is_null() { add_class(ctx, c.as_ptr()); }
+                    if !ctx.is_null() { add_class(ctx, c.as_ptr() as *const u8); }
                 }
             }
         }
@@ -562,7 +562,7 @@ impl Label {
                 let c = CString::new(class_name).unwrap();
                 unsafe {
                     let ctx = get_ctx(self.inner);
-                    if !ctx.is_null() { remove_class(ctx, c.as_ptr()); }
+                    if !ctx.is_null() { remove_class(ctx, c.as_ptr() as *const u8); }
                 }
             }
         }
@@ -643,7 +643,7 @@ impl Application {
         // If possible try to create a GApplication via symbol (glib/gio)
         if let Some(app_new) = loader.symbols.gtk_application_new {
             let id_c = CString::new("org.example.GtkCompatApp").unwrap();
-            let app = unsafe { app_new(id_c.as_ptr(), 0) };
+            let app = unsafe { app_new(id_c.as_ptr() as *const u8, 0) };
             if !app.is_null() {
                 return Ok(Application { inner: app, loader });
             }
@@ -1095,11 +1095,11 @@ impl DrawingArea {
         if let Some(gscd) = self.loader.symbols.g_signal_connect_data {
             let handler_ptr = crate::signals::gtk_compat_trampoline_draw_gtk3 as *const () as *mut std::ffi::c_void;
             let destroy_ptr = Some(crate::signals::gtk_compat_destroy_notify_draw_gtk3 as unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void));
-            let id = unsafe { gscd(self.inner, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0) };
+            let id = unsafe { gscd(self.inner, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0) };
             Ok(id)
         } else if let Some(gsc) = self.loader.symbols.g_signal_connect {
             let handler_ptr = crate::signals::gtk_compat_trampoline_draw_gtk3 as *const () as *mut std::ffi::c_void;
-            let id = unsafe { gsc(self.inner, sig_name.as_ptr(), handler_ptr, raw) };
+            let id = unsafe { gsc(self.inner, sig_name.as_ptr() as *const u8, handler_ptr, raw) };
             Ok(id)
         } else {
             Err("no g_signal_connect available".into())
@@ -1308,11 +1308,11 @@ impl EventControllerKey {
         if let Some(gscd) = self.loader.symbols.g_signal_connect_data {
             let handler_ptr = crate::signals::gtk_compat_trampoline_key_pressed as *const () as *mut c_void;
             let destroy_ptr = Some(crate::signals::gtk_compat_destroy_notify_key_pressed as unsafe extern "C" fn(*mut c_void, *mut c_void));
-            let id = gscd(self.inner, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+            let id = gscd(self.inner, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
             Ok(id)
         } else if let Some(gsc) = self.loader.symbols.g_signal_connect {
             let handler_ptr = crate::signals::gtk_compat_trampoline_key_pressed as *const () as *mut c_void;
-            let id = gsc(self.inner, sig_name.as_ptr(), handler_ptr, raw);
+            let id = gsc(self.inner, sig_name.as_ptr() as *const u8, handler_ptr, raw);
             Ok(id)
         } else {
             Err(Error::Other("no g_signal_connect available".into()))
@@ -1346,11 +1346,11 @@ impl EventControllerKey {
         if let Some(gscd) = self.loader.symbols.g_signal_connect_data {
             let handler_ptr = crate::signals::gtk_compat_trampoline_key_released as *const () as *mut c_void;
             let destroy_ptr = Some(crate::signals::gtk_compat_destroy_notify_key_released as unsafe extern "C" fn(*mut c_void, *mut c_void));
-            let id = gscd(self.inner, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+            let id = gscd(self.inner, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
             Ok(id)
         } else if let Some(gsc) = self.loader.symbols.g_signal_connect {
             let handler_ptr = crate::signals::gtk_compat_trampoline_key_released as *const () as *mut c_void;
-            let id = gsc(self.inner, sig_name.as_ptr(), handler_ptr, raw);
+            let id = gsc(self.inner, sig_name.as_ptr() as *const u8, handler_ptr, raw);
             Ok(id)
         } else {
             Err(Error::Other("no g_signal_connect available".into()))
@@ -1396,7 +1396,7 @@ impl EventControllerKey {
             // GtkEventControllerKey's (keyval, keycode, state) signature.
             let emit_key: crate::symbols::GSignalEmitKeyByName =
                 unsafe { std::mem::transmute(emit) };
-            let id = unsafe { emit_key(self.inner, name.as_ptr(), keyval, 0u32, state) };
+            let id = unsafe { emit_key(self.inner, name.as_ptr() as *const u8, keyval, 0u32, state) };
             Ok(id)
         } else {
             Err(Error::MissingSymbol("g_signal_emit_by_name".into()))
@@ -1468,8 +1468,8 @@ impl FileChooserNative {
         let title_c = CString::new(title).unwrap();
         let accept_c = CString::new(accept_label).unwrap();
         let cancel_c = cancel_label.map(|s| CString::new(s).unwrap());
-        let cancel_ptr = cancel_c.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null::<i8>() as *const i8);
-        let inner = unsafe { ctor(title_c.as_ptr(), parent, action, accept_c.as_ptr(), cancel_ptr) };
+        let cancel_ptr = cancel_c.as_ref().map(|c| c.as_ptr() as *const u8).unwrap_or(std::ptr::null::<i8>() as *const u8);
+        let inner = unsafe { ctor(title_c.as_ptr() as *const u8, parent, action, accept_c.as_ptr() as *const u8, cancel_ptr) };
         if inner.is_null() { return Err(Error::Other("gtk_file_chooser_native_new returned null".into())); }
         Ok(FileChooserNative { inner, loader })
     }
@@ -1490,7 +1490,7 @@ impl FileChooserNative {
         if let Some(get_fn) = self.loader.symbols.gtk_file_chooser_get_filename {
             let ptr = unsafe { get_fn(self.inner) };
             if !ptr.is_null() {
-                let filename = unsafe { std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned() };
+                let filename = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char).to_string_lossy().into_owned() };
                 if let Some(gfree) = self.loader.symbols.g_free {
                     unsafe { gfree(ptr as *mut c_void); }
                 }
@@ -1523,11 +1523,11 @@ impl FileChooserNative {
             return;
         }
         if let Ok(name_c) = std::ffi::CString::new(name) {
-            unsafe { set_name(filter, name_c.as_ptr()); }
+            unsafe { set_name(filter, name_c.as_ptr() as *const u8); }
         }
         for pat in patterns {
             if let Ok(pat_c) = std::ffi::CString::new(*pat) {
-                unsafe { add_pattern(filter, pat_c.as_ptr()); }
+                unsafe { add_pattern(filter, pat_c.as_ptr() as *const u8); }
             }
         }
         unsafe {
@@ -1544,7 +1544,7 @@ impl FileChooserNative {
         }
         if let Some(set_fn) = self.loader.symbols.gtk_file_chooser_set_current_name {
             if let Ok(name_c) = std::ffi::CString::new(name) {
-                unsafe { set_fn(self.inner, name_c.as_ptr()); }
+                unsafe { set_fn(self.inner, name_c.as_ptr() as *const u8); }
             }
         }
     }
@@ -1615,7 +1615,7 @@ impl<'a> CairoContext<'a> {
     pub fn select_font_face(&self, family: &str, slant: i32, weight: i32) {
         if let Some(f) = self.loader.symbols.cairo_select_font_face {
             let c = CString::new(family).unwrap();
-            unsafe { f(self.cr, c.as_ptr(), slant, weight); }
+            unsafe { f(self.cr, c.as_ptr() as *const u8, slant, weight); }
         }
     }
 
@@ -1626,7 +1626,7 @@ impl<'a> CairoContext<'a> {
     pub fn show_text(&self, text: &str) {
         if let Some(f) = self.loader.symbols.cairo_show_text {
             let c = CString::new(text).unwrap();
-            unsafe { f(self.cr, c.as_ptr()); }
+            unsafe { f(self.cr, c.as_ptr() as *const u8); }
         }
     }
 
@@ -1634,7 +1634,7 @@ impl<'a> CairoContext<'a> {
         if let Some(f) = self.loader.symbols.cairo_text_extents {
             let c = CString::new(text).unwrap();
             let mut ext: crate::symbols::CairoTextExtentsT = unsafe { std::mem::zeroed() };
-            unsafe { f(self.cr, c.as_ptr(), &mut ext as *mut _ as *mut c_void); }
+            unsafe { f(self.cr, c.as_ptr() as *const u8, &mut ext as *mut _ as *mut c_void); }
             CairoTextExtents {
                 x_bearing: ext.x_bearing,
                 y_bearing: ext.y_bearing,
@@ -1779,10 +1779,10 @@ impl Entry {
         // GTK4 uses gtk_editable_set_text; GTK3 uses gtk_entry_set_text
         if let Some(set_text) = self.loader.symbols.gtk_editable_set_text {
             let c = CString::new(text).unwrap();
-            unsafe { set_text(self.inner, c.as_ptr()); }
+            unsafe { set_text(self.inner, c.as_ptr() as *const u8); }
         } else if let Some(set_text) = self.loader.symbols.gtk_entry_set_text {
             let c = CString::new(text).unwrap();
-            unsafe { set_text(self.inner, c.as_ptr()); }
+            unsafe { set_text(self.inner, c.as_ptr() as *const u8); }
         }
     }
 
@@ -1793,14 +1793,14 @@ impl Entry {
             unsafe {
                 let s = get_text(self.inner);
                 if s.is_null() { return None; }
-                let c = std::ffi::CStr::from_ptr(s);
+                let c = std::ffi::CStr::from_ptr(s as *const std::ffi::c_char);
                 return Some(c.to_string_lossy().into_owned());
             }
         } else if let Some(get_text) = self.loader.symbols.gtk_entry_get_text {
             unsafe {
                 let s = get_text(self.inner);
                 if s.is_null() { return None; }
-                let c = std::ffi::CStr::from_ptr(s);
+                let c = std::ffi::CStr::from_ptr(s as *const std::ffi::c_char);
                 return Some(c.to_string_lossy().into_owned());
             }
         }
@@ -1907,7 +1907,7 @@ impl Entry {
                 let c = CString::new(class_name).unwrap();
                 unsafe {
                     let ctx = get_ctx(self.inner);
-                    if !ctx.is_null() { add_class(ctx, c.as_ptr()); }
+                    if !ctx.is_null() { add_class(ctx, c.as_ptr() as *const u8); }
                 }
             }
         }
@@ -1920,7 +1920,7 @@ impl Entry {
                 let c = CString::new(class_name).unwrap();
                 unsafe {
                     let ctx = get_ctx(self.inner);
-                    if !ctx.is_null() { remove_class(ctx, c.as_ptr()); }
+                    if !ctx.is_null() { remove_class(ctx, c.as_ptr() as *const u8); }
                 }
             }
         }
@@ -2009,7 +2009,7 @@ impl Entry {
                     let ctrl = new_ctrl();
                     connect(
                         ctrl,
-                        signal.as_ptr(),
+                        signal.as_ptr() as *const u8,
                         crate::signals::gtk_compat_trampoline_focus as *const () as *mut c_void,
                         cb_ptr as *mut c_void,
                         Some(crate::signals::gtk_compat_destroy_notify_focus as unsafe extern "C" fn(*mut c_void, *mut c_void)),
@@ -2040,7 +2040,7 @@ impl Entry {
                     let ctrl = new_ctrl();
                     connect(
                         ctrl,
-                        signal.as_ptr(),
+                        signal.as_ptr() as *const u8,
                         crate::signals::gtk_compat_trampoline_focus as *const () as *mut c_void,
                         cb_ptr as *mut c_void,
                         Some(crate::signals::gtk_compat_destroy_notify_focus as unsafe extern "C" fn(*mut c_void, *mut c_void)),
@@ -2077,9 +2077,9 @@ pub unsafe fn measure_text_px(loader: &Arc<Loader>, widget: Option<*mut c_void>,
 
     unsafe {
         // Prefer helper that takes a widget and text
-        if let Ok(create_layout) = gtk_lib.get::<unsafe extern "C" fn(*mut c_void, *const i8) -> *mut c_void>(b"gtk_widget_create_pango_layout") {
+        if let Ok(create_layout) = gtk_lib.get::<unsafe extern "C" fn(*mut c_void, *const u8) -> *mut c_void>(b"gtk_widget_create_pango_layout") {
             let c = CString::new(text).unwrap();
-            let layout = create_layout(widget_ptr, c.as_ptr());
+            let layout = create_layout(widget_ptr, c.as_ptr() as *const u8);
             if !layout.is_null() {
                 if let Ok(get_pixel) = pango_lib.get::<unsafe extern "C" fn(*mut c_void, *mut i32, *mut i32)>(b"pango_layout_get_pixel_size") {
                     let mut w: i32 = 0; let mut h: i32 = 0;
@@ -2102,18 +2102,18 @@ pub fn create_css_provider(loader: &Arc<Loader>, css: &str) -> Option<*mut c_voi
         let c = CString::new(css).unwrap_or_default();
         match loader.version {
             Version::Gtk4 => {
-                type LoadGtk4 = unsafe extern "C" fn(*mut c_void, *const i8, isize);
+                type LoadGtk4 = unsafe extern "C" fn(*mut c_void, *const u8, isize);
                 if let Some(lib) = loader.libs.get("libgtk") {
                     if let Ok(f) = unsafe { lib.get::<LoadGtk4>(b"gtk_css_provider_load_from_data") } {
                         let fn4 = *f;
-                        unsafe { fn4(provider, c.as_ptr(), c.as_bytes().len() as isize); }
+                        unsafe { fn4(provider, c.as_ptr() as *const u8, c.as_bytes().len() as isize); }
                     }
                 }
             }
             _ => {
                 if let Some(load_fn) = loader.symbols.gtk_css_provider_load_from_data {
                     let mut err: *mut c_void = std::ptr::null_mut();
-                    unsafe { load_fn(provider, c.as_ptr(), c.as_bytes().len() as isize, &mut err as *mut *mut c_void); }
+                    unsafe { load_fn(provider, c.as_ptr() as *const u8, c.as_bytes().len() as isize, &mut err as *mut *mut c_void); }
                 }
             }
         }
@@ -2500,7 +2500,7 @@ impl Menu {
         if let Some(append) = self.loader.symbols.g_menu_append {
             let l = CString::new(plain_label).unwrap();
             let a = CString::new(detailed_action).unwrap();
-            unsafe { append(self.inner, l.as_ptr(), a.as_ptr()); }
+            unsafe { append(self.inner, l.as_ptr() as *const u8, a.as_ptr() as *const u8); }
         }
         self.items.push(MenuItem {
             label: label.to_string(),
@@ -2514,7 +2514,7 @@ impl Menu {
         let plain_label = label.replace('_', "");
         if let Some(append_sub) = self.loader.symbols.g_menu_append_submenu {
             let l = CString::new(plain_label).unwrap();
-            unsafe { append_sub(self.inner, l.as_ptr(), submenu.inner); }
+            unsafe { append_sub(self.inner, l.as_ptr() as *const u8, submenu.inner); }
         } else {
             self.append(label, "");
         }
@@ -2568,7 +2568,7 @@ impl SimpleAction {
         let symbols = &loader.symbols;
         let ctor = symbols.g_simple_action_new.ok_or(Error::MissingSymbol("g_simple_action_new".into()))?;
         let n = CString::new(name).unwrap();
-        let inner = unsafe { ctor(n.as_ptr(), std::ptr::null_mut()) };
+        let inner = unsafe { ctor(n.as_ptr() as *const u8, std::ptr::null_mut()) };
         if inner.is_null() {
             return Err(Error::Other("g_simple_action_new returned null".into()));
         }
@@ -2742,9 +2742,9 @@ impl MenuBar {
             // mnemonic symbol can never leak a literal underscore.
             let plain_label = item.label.replace('_', "");
             let new_item = symbols.gtk_menu_item_new_with_mnemonic
-                .and_then(|f| CString::new(item.label.as_str()).ok().map(|c_label| unsafe { f(c_label.as_ptr()) }))
+                .and_then(|f| CString::new(item.label.as_str()).ok().map(|c_label| unsafe { f(c_label.as_ptr() as *const u8) }))
                 .or_else(|| match CString::new(plain_label.as_str()) {
-                    Ok(c_label) => symbols.gtk_menu_item_new_with_label.map(|f| unsafe { f(c_label.as_ptr()) }),
+                    Ok(c_label) => symbols.gtk_menu_item_new_with_label.map(|f| unsafe { f(c_label.as_ptr() as *const u8) }),
                     Err(_) => None,
                 });
             if let Some(gtk_item) = new_item {
@@ -3006,7 +3006,7 @@ impl MenuBar {
             unsafe {
                 connect(
                     submenu,
-                    sig.as_ptr(),
+                    sig.as_ptr() as *const u8,
                     free_wanted as *const () as *mut c_void,
                     wanted as *mut c_void,
                     Some(free_wanted),
@@ -3081,7 +3081,7 @@ impl MenuBar {
             .unwrap_or('\0');
 
         fn search_items(items: &[MenuItem], key_upper: char,
-            activate_action: unsafe extern "C" fn(*mut c_void, *const i8, *mut c_void),
+            activate_action: unsafe extern "C" fn(*mut c_void, *const u8, *mut c_void),
             action_group: *mut c_void) -> bool
         {
             for sub_item in items {
@@ -3095,7 +3095,7 @@ impl MenuBar {
                             Ok(c) => c,
                             Err(_) => continue,
                         };
-                        unsafe { activate_action(action_group, c_action.as_ptr(), std::ptr::null_mut()); }
+                        unsafe { activate_action(action_group, c_action.as_ptr() as *const u8, std::ptr::null_mut()); }
                         return true;
                     }
                 }
@@ -3123,7 +3123,7 @@ impl MenuBar {
 fn set_detailed_action_name(symbols: &crate::symbols::Symbols, item: *mut c_void, action_str: &str) -> Result<(), ()> {
     if let Some(set_action) = symbols.gtk_actionable_set_detailed_action_name {
         let c = CString::new(action_str).unwrap();
-        unsafe { set_action(item, c.as_ptr()); }
+        unsafe { set_action(item, c.as_ptr() as *const u8); }
         Ok(())
     } else { Err(()) }
 }
@@ -3137,7 +3137,7 @@ impl MenuBar {
         guard_widget!(self, "MenuBar", "insert_action_group");
         if let Some(insert) = self.loader.symbols.gtk_widget_insert_action_group {
             let c = CString::new(name).unwrap();
-            unsafe { insert(self.inner, c.as_ptr(), group_ptr); }
+            unsafe { insert(self.inner, c.as_ptr() as *const u8, group_ptr); }
         }
     }
 
@@ -3181,7 +3181,7 @@ impl MenuBar {
                     popover = get_first(menu_btn);
                 }
                 if !popover.is_null() {
-                    insert(popover, c_name.as_ptr(), group_ptr);
+                    insert(popover, c_name.as_ptr() as *const u8, group_ptr);
                     count += 1;
                 }
                 child = get_next(child);
@@ -3207,7 +3207,7 @@ impl MenuBar {
             .unwrap_or('\0');
 
         fn search_items(items: &[MenuItem], key_upper: char,
-            activate_action: unsafe extern "C" fn(*mut c_void, *const i8, *mut c_void),
+            activate_action: unsafe extern "C" fn(*mut c_void, *const u8, *mut c_void),
             action_group: *mut c_void) -> Option<String>
         {
             for sub_item in items {
@@ -3254,7 +3254,7 @@ impl MenuBar {
 
         if let Some(action_name) = found_action {
             if let Ok(c_action) = std::ffi::CString::new(action_name.as_str()) {
-                unsafe { activate_action(action_group, c_action.as_ptr(), std::ptr::null_mut()); }
+                unsafe { activate_action(action_group, c_action.as_ptr() as *const u8, std::ptr::null_mut()); }
             }
             // Clear the keyboard menu flag: after the action is activated,
             // the menu interaction is complete.  If this flag stays true,
@@ -3399,7 +3399,7 @@ impl MenuBar {
                 Ok(n) => n,
                 Err(_) => continue,
             };
-            let found = unsafe { lookup(group_ptr, c.as_ptr()) };
+            let found = unsafe { lookup(group_ptr, c.as_ptr() as *const u8) };
             s.push_str(&format!("action_lookup: {name}={}\n", !found.is_null()));
         }
         let _ = std::fs::write(out_path, &s);
@@ -3419,7 +3419,7 @@ impl MenuBar {
         let n = unsafe { get_n_items(model_ptr) };
         let mut s = format!("g_menu_model_get_n_items: {n}\n");
         for i in 0..n {
-            let link = unsafe { get_link(model_ptr, i as i32, b"submenu\0".as_ptr() as *const i8) };
+            let link = unsafe { get_link(model_ptr, i as i32, b"submenu\0".as_ptr() as *const u8) };
             s.push_str(&format!("  item[{i}]: submenu_link={}\n", !link.is_null()));
         }
         let _ = std::fs::write(out_path, &s);
@@ -3525,7 +3525,7 @@ impl Dialog {
         guard_widget!(self, "Dialog", "set_title");
         if let Some(set_title) = self.loader.symbols.gtk_window_set_title {
             let c = CString::new(title).unwrap();
-            unsafe { set_title(self.inner, c.as_ptr()); }
+            unsafe { set_title(self.inner, c.as_ptr() as *const u8); }
         }
     }
 
@@ -3540,7 +3540,7 @@ impl Dialog {
         guard_widget!(self, "Dialog", "add_button");
         if let Some(add_btn) = self.loader.symbols.gtk_dialog_add_button {
             let c = CString::new(button_text).unwrap();
-            unsafe { add_btn(self.inner, c.as_ptr(), response_id); }
+            unsafe { add_btn(self.inner, c.as_ptr() as *const u8, response_id); }
         }
     }
 
@@ -3622,7 +3622,7 @@ impl Dialog {
                 unsafe { let _boxed: Box<Box<dyn FnMut(*mut c_void, i32)>> = Box::from_raw(data as *mut _); }
             }
             unsafe {
-                let id = gscd(self.inner, sig_name.as_ptr(), trampoline_response as *const () as *mut c_void, raw, Some(destroy_response as unsafe extern "C" fn(*mut c_void, *mut c_void)), 0);
+                let id = gscd(self.inner, sig_name.as_ptr() as *const u8, trampoline_response as *const () as *mut c_void, raw, Some(destroy_response as unsafe extern "C" fn(*mut c_void, *mut c_void)), 0);
                 Ok(id)
             }
         } else if let Some(gsc) = self.loader.symbols.g_signal_connect {
@@ -3635,7 +3635,7 @@ impl Dialog {
                 }
             }
             unsafe {
-                let id = gsc(self.inner, sig_name.as_ptr(), trampoline_response_simple as *const () as *mut c_void, raw);
+                let id = gsc(self.inner, sig_name.as_ptr() as *const u8, trampoline_response_simple as *const () as *mut c_void, raw);
                 Ok(id)
             }
         } else {
@@ -3721,7 +3721,7 @@ impl Dialog {
             let name = CString::new("response").unwrap();
             // We need to pass response_id as a parameter; but g_signal_emit_by_name only takes
             // instance and name. For simplicity, just emit the signal without the param.
-            unsafe { emit(self.inner, name.as_ptr()); }
+            unsafe { emit(self.inner, name.as_ptr() as *const u8); }
         }
     }
 }
@@ -3769,7 +3769,7 @@ impl DropDown {
         // Try GTK4 DropDown API first
         if let (Some(dd_new), Some(sl_new)) = (symbols.gtk_drop_down_new, symbols.gtk_string_list_new) {
             let c_strings: Vec<CString> = items.iter().map(|s| CString::new(*s).unwrap()).collect();
-            let mut raw_ptrs: Vec<*const i8> = c_strings.iter().map(|c| c.as_ptr()).collect();
+            let mut raw_ptrs: Vec<*const u8> = c_strings.iter().map(|c| c.as_ptr() as *const u8).collect();
             raw_ptrs.push(std::ptr::null());
             let string_list = unsafe { sl_new(raw_ptrs.as_ptr()) };
             if string_list.is_null() {
@@ -3790,7 +3790,7 @@ impl DropDown {
             }
             for item in items {
                 let c = CString::new(*item).unwrap();
-                unsafe { ct_append(inner, c.as_ptr()); }
+                unsafe { ct_append(inner, c.as_ptr() as *const u8); }
             }
             unsafe { take_ownership(&symbols, &loader.version, inner); }
             Ok(DropDown { inner, loader, _not_send: PhantomData, string_list: None })
@@ -3976,7 +3976,7 @@ impl CheckButton {
         let symbols = &loader.symbols;
         let ctor = symbols.gtk_check_button_new_with_label.ok_or(Error::MissingSymbol("gtk_check_button_new_with_label".into()))?;
         let c = CString::new(label).unwrap();
-        let inner = unsafe { ctor(c.as_ptr()) };
+        let inner = unsafe { ctor(c.as_ptr() as *const u8) };
         if inner.is_null() { return Err(Error::Other("gtk_check_button_new_with_label returned null".into())); }
         unsafe { take_ownership(&symbols, &loader.version, inner); }
         Ok(CheckButton { inner, loader, _not_send: PhantomData })
@@ -4074,7 +4074,7 @@ impl RadioButton {
                     .unwrap_or(std::ptr::null_mut()),
                 None => std::ptr::null_mut(),
             };
-            let inner = unsafe { ctor(group_list, c.as_ptr()) };
+            let inner = unsafe { ctor(group_list, c.as_ptr() as *const u8) };
             if inner.is_null() { return Err(Error::Other("gtk_radio_button_new_with_label returned null".into())); }
             unsafe { take_ownership(&symbols, &loader.version, inner); }
             return Ok(RadioButton { inner, loader, _not_send: PhantomData });
@@ -4082,7 +4082,7 @@ impl RadioButton {
         // GTK4: GtkRadioButton was removed; use GtkCheckButton with set_group
         if let (Some(ctor_cb), Some(set_group)) = (symbols.gtk_check_button_new_with_label, symbols.gtk_check_button_set_group) {
             let c = CString::new(label).unwrap();
-            let inner = unsafe { ctor_cb(c.as_ptr()) };
+            let inner = unsafe { ctor_cb(c.as_ptr() as *const u8) };
             if inner.is_null() { return Err(Error::Other("gtk_check_button_new_with_label returned null".into())); }
             if let Some(g) = group {
                 unsafe { set_group(inner, g.inner); }
@@ -4194,7 +4194,7 @@ impl TextView {
             let buf = unsafe { get_buf(self.inner) };
             if !buf.is_null() {
                 let c = CString::new(text).unwrap();
-                unsafe { set_text(buf, c.as_ptr(), -1); }
+                unsafe { set_text(buf, c.as_ptr() as *const u8, -1); }
             }
         }
     }
@@ -4218,7 +4218,14 @@ impl TextView {
                 get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
                 let c_str = get_text_fn(buf, start_iter.as_mut_ptr() as *mut c_void, end_iter.as_mut_ptr() as *mut c_void, 1);
                 if c_str.is_null() { return None; }
-                let s = std::ffi::CStr::from_ptr(c_str as *const i8).to_string_lossy().into_owned();
+                // `get_text_fn` hands back a `char*` as a `c_void*` (it is a
+                // GtkTextIter-derived call, whose signature the loader types
+                // loosely). Reinterpreting it as a C string is what the GTK C
+                // API actually returns, so the cast is the intent rather
+                // than a type pun to make the compiler quiet.
+                let s = std::ffi::CStr::from_ptr(c_str as *const std::ffi::c_char)
+                    .to_string_lossy()
+                    .into_owned();
                 if let Some(free_fn) = symbols.g_free { free_fn(c_str as *mut c_void); }
                 Some(s)
             }
@@ -4254,7 +4261,7 @@ impl TextView {
             let mut end_iter: [u8; 256] = [0; 256];
             get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
             if let Ok(c) = CString::new(text) {
-                insert(buf, end_iter.as_mut_ptr() as *mut c_void, c.as_ptr(), -1);
+                insert(buf, end_iter.as_mut_ptr() as *mut c_void, c.as_ptr() as *const u8, -1);
             }
         }
     }

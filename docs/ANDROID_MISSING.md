@@ -311,15 +311,30 @@ and NWG too, or are not applicable to a phone:
 
 * `cargo ndk -t x86_64 build` in `android/corro` — clean, no warnings from
   the Android adapter or the app-level glue.
-* `cargo ndk -t arm64-v8a build` — 76 errors, **all** in
-  `rustxWidgets/gtk_dynamic_loader/{wrappers,signals}.rs`, and **all**
-  pre-existing: the base commit produces the same 76 in the same two files.
-  They are `CString::as_ptr()` giving `*const u8` where a `*const c_char`
-  signature is declared, and that crate is Linux-only code that an Android
-  target compiles but cannot link. Not addressed here because it is a
-  pre-existing, platform-unrelated problem in a crate this work does not
-  otherwise touch; fixing it means cfg-gating the loader out of non-Linux
-  builds, which is a separate change.
+* `cargo ndk -t arm64-v8a build` — clean, and `build_apk.sh arm64-v8a` produces
+  a signed APK with a real `ELF 64-bit LSB shared object, ARM aarch64` and all
+  25 JNI exports in it.
+
+  This took two fixes, and both are worth recording because the first one made
+  the second invisible:
+
+  1. **`build_apk.sh` never actually built arm64.** Its case statement set
+     `TARGET="aarch64"` and passed that to `cargo ndk -t`, but cargo-ndk wants
+     the *ABI* name (`arm64-v8a`), not the rustc triple's first component. The
+     build line piped cargo through `tail -1`, so the resulting
+     `invalid value 'aarch64' for '--target <TARGET>'` was discarded and the
+     script exited silently. The correct line, and the `tail` removal, are
+     both in that commit.
+  2. **With a real arm64 build finally attempted, 76 type errors appeared** in
+     `gtk_dynamic_loader`. Its `extern "C"` signatures spelled C strings
+     `*const i8`, while the wrappers pass `CString::as_ptr()`, which is
+     `*const c_char` — and `c_char` is `i8` on x86 and ARM but `u8`
+     elsewhere. So the crate could not typecheck on *either* Android ABI; it
+     only compiled on x86_64 because there the two happened to agree, which
+     is why the emulator hid it. The signatures are now `*const u8` and the
+     call sites cast. The pointee's signedness is not part of any ABI's
+     calling convention, so the FFI boundary is unaffected; the reasoning is
+     recorded at the top of `symbols.rs` where the next reader will hit it.
 * `cargo build --features gui` (desktop, Linux/GTK) — clean. Several changes
   here are additions to `common.rs` and the GTK3 loader rather than to the
   Android adapter, and those had to keep the desktop building.
