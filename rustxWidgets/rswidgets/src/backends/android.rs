@@ -179,6 +179,56 @@ mod android_backend {
         id
     }
 
+    // Callbacks whose signature carries **no `Send` bound** — which is what
+    // every `connect_changed` / `connect_toggled` / `connect_response` in the
+    // adapter takes, so they cannot use `register_callback`.
+    //
+    // A thread-local registry rather than a `Mutex<HashMap<..>>`, and rather
+    // than an `unsafe impl Send` shim. Both alternatives would assert a bound
+    // the compiler cannot check; this one asserts nothing, because every one
+    // of these callbacks is dispatched from a platform listener on the UI
+    // thread that built the widget (ANDROID_GUIDELINES.md §4) and never from
+    // another thread. A `Mutex` would only be needed if that ever changed —
+    // and `Lazy` of a `!Send` type is exactly what the compiler is protecting
+    // against here.
+    thread_local! {
+        static LOCAL_CALLBACKS: std::cell::RefCell<HashMap<u64, Box<dyn FnMut()>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    static NEXT_LOCAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
+
+    /// Register a UI-thread callback; see [`LOCAL_CALLBACKS`].
+    pub fn register_local_callback(f: impl FnMut() + 'static) -> u64 {
+        let id = NEXT_LOCAL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LOCAL_CALLBACKS.with(|map| {
+            map.borrow_mut().insert(id, Box::new(f));
+        });
+        id
+    }
+
+    /// Run a callback registered with [`register_local_callback`].
+    ///
+    /// The `try_borrow_mut` is what lets a callback re-enter the registry (a
+    /// change handler that closes a dialog fires a response) without
+    /// panicking: the re-entrant call is dropped instead.
+    pub fn invoke_local_callback(id: u64) {
+        LOCAL_CALLBACKS.with(|map| {
+            let Ok(mut map) = map.try_borrow_mut() else {
+                return;
+            };
+            if let Some(f) = map.get_mut(&id) {
+                f();
+            }
+        });
+    }
+
+    /// Drop a callback registered with [`register_local_callback`].
+    pub fn unregister_local_callback(id: u64) {
+        LOCAL_CALLBACKS.with(|map| {
+            map.borrow_mut().remove(&id);
+        });
+    }
+
     pub fn unregister_callback(id: u64) {
         let mut map = CALLBACKS.lock().unwrap();
         map.remove(&id);
@@ -955,6 +1005,67 @@ mod android_backend {
         let _ = call_view_method(view_ptr, "setGravity", "(I)V", &[gravity.into()]);
     }
 
+    /// The view's current gravity bitmask, or 0 when it cannot be read.
+    pub fn get_view_gravity(view_ptr: *mut std::os::raw::c_void) -> i32 {
+        if view_ptr.is_null() {
+            return 0;
+        }
+        with_env_and_activity(|env, _activity| {
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            Ok::<i32, Box<dyn StdError + Send + Sync>>(
+                env.call_method(&view, "getGravity", "()I", &[])?.i()?,
+            )
+        })
+        .unwrap_or(0)
+    }
+
+    /// Install a global-layout listener on a view.
+    ///
+    /// `OnGlobalLayoutListener` is the platform's "the bounds settled" hook —
+    /// the moment GTK's size-allocate fires and the moment a caller needs to
+    /// read a real width or height. The listener object carries the *view*
+    /// pointer, so `dispatch_layout` can find the registered callback.
+    pub fn attach_layout_listener(view_ptr: *mut std::os::raw::c_void) {
+        if view_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let cls = match load_app_class(env, "com.corro.CorroLayout") {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = env.exception_clear();
+                    return Ok(());
+                }
+            };
+            let listener = env.new_object(&cls, "(J)V", &[(view_ptr as i64).into()])?;
+            PLATFORM_LISTENERS
+                .lock()
+                .unwrap()
+                .push(env.new_global_ref(&listener)?);
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            // `View` has no `setOnGlobalLayoutListener`: the listener is
+            // registered on the *observer*, and the observer is replaced
+            // whenever the view is detached, so it is re-fetched here rather
+            // than cached.
+            let observer = env
+                .call_method(
+                    &view,
+                    "getViewTreeObserver",
+                    "()Landroid/view/ViewTreeObserver;",
+                    &[],
+                )?
+                .l()?;
+            let observer = unsafe { jni::objects::JObject::from_raw(observer.as_raw()) };
+            env.call_method(
+                &observer,
+                "addOnGlobalLayoutListener",
+                "(Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;)V",
+                &[(&listener).into()],
+            )?;
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
     /// Read a `TextView`-shaped string property (`getText().toString()`).
     /// Shared by `Label::get_text` and the entry/buffer getters.
     pub fn get_view_text(view_ptr: *mut std::os::raw::c_void) -> Option<String> {
@@ -980,30 +1091,33 @@ mod android_backend {
         let _ = call_view_method(view_ptr, "setTextSize", "(F)V", &[sp.into()]);
     }
 
-    /// `View.setTypeface(android.graphics.Typeface, int style)`.
+    /// `Typeface` style from a GTK/NWG `font-style`-shaped integer: 0 normal,
+    /// 1 bold, 2 italic, 3 bold-italic.
     ///
-    /// `style` is `Typeface.NORMAL` (0) or `Typeface.BOLD` (1), which is
-    /// also what GTK's `set_font_style(PANGO_STYLE_*)` and NWG's
-    /// `set_font_style` mean. The style constants are stable ints, so they
-    /// are named here rather than resolved through a JNI static lookup on
-    /// every call.
-    pub fn set_view_typeface(view_ptr: *mut std::os::raw::c_void, bold: bool) {
+    /// The pass-through is deliberate: GTK's `PANGO_STYLE_BOLD` is 1 and
+    /// `PANGO_STYLE_ITALIC` is 2, which is exactly the bit layout Android's
+    /// `Typeface` constants use (`BOLD` = 1, `ITALIC` = 2,
+    /// `BOLD_ITALIC` = 3). Mapping "any non-zero to bold" — the obvious
+    /// shortcut — would render an italic label bold and lose the distinction
+    /// the caller asked for.
+    pub fn set_view_typeface(view_ptr: *mut std::os::raw::c_void, style: i32) {
         if view_ptr.is_null() {
             return;
         }
+        let want = style.clamp(0, 3);
         let _ = with_env_and_activity(|env, _activity| {
             let typeface_cls = env.find_class("android/graphics/Typeface")?;
-            let typeface = env
+            let base = env
                 .get_static_field(&typeface_cls, "DEFAULT", "Landroid/graphics/Typeface;")?
                 .l()?;
-            let typeface = unsafe { jni::objects::JObject::from_raw(typeface.as_raw()) };
+            let base = unsafe { jni::objects::JObject::from_raw(base.as_raw()) };
             // Typeface.create(Typeface, int style) -> Typeface
             let styled = env
                 .call_static_method(
                     &typeface_cls,
                     "create",
                     "(Landroid/graphics/Typeface;I)Landroid/graphics/Typeface;",
-                    &[(&typeface).into(), if bold { 1i32 } else { 0i32 }.into()],
+                    &[(&base).into(), want.into()],
                 )?
                 .l()?;
             let styled = unsafe { jni::objects::JObject::from_raw(styled.as_raw()) };
@@ -1014,8 +1128,49 @@ mod android_backend {
                 "(Landroid/graphics/Typeface;)V",
                 &[(&styled).into()],
             )?;
-            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
         });
+    }
+
+    // ---- CSS class bridge ----
+    //
+    // Android has no stylesheet cascade, so `add_class` / `remove_class`
+    // cannot change a pixel by themselves. They are recorded here instead of
+    // dropped, and the list is readable from Java, which is what lets a host
+    // install an optional bridge that maps classes to background colour /
+    // text colour. Recording is the point: a caller that asks to dim a
+    // read-only sheet gets a queryable fact instead of silence.
+
+    static VIEW_CLASSES: Lazy<Mutex<HashMap<usize, Vec<String>>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    pub fn add_view_class(view_ptr: *mut std::os::raw::c_void, class_name: &str) {
+        if view_ptr.is_null() || class_name.is_empty() {
+            return;
+        }
+        VIEW_CLASSES
+            .lock()
+            .unwrap()
+            .entry(view_ptr as usize)
+            .or_default()
+            .push(class_name.to_string());
+    }
+
+    pub fn remove_view_class(view_ptr: *mut std::os::raw::c_void, class_name: &str) {
+        if let Some(list) = VIEW_CLASSES.lock().unwrap().get_mut(&(view_ptr as usize)) {
+            list.retain(|c| c != class_name);
+        }
+    }
+
+    /// The classes on a view, in the order they were added. Empty when none.
+    /// Exposed for the host bridge and for diagnostics.
+    pub fn view_classes(view_ptr: *mut std::os::raw::c_void) -> Vec<String> {
+        VIEW_CLASSES
+            .lock()
+            .unwrap()
+            .get(&(view_ptr as usize))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// `View.getContext()` -> `Context`, as a local ref for the caller.
@@ -1184,6 +1339,418 @@ mod android_backend {
             Ok::<(), Box<dyn StdError + Send + Sync>>(())
         });
     }
+
+    // ---- View measurement / selection / focus queries ----
+
+    /// `EditText.getSelectionStart()` as a character index.
+    ///
+    /// A *selection range* collapses to its start, which is the convention GTK
+    /// and NWG use: both report the mark, and a caller that wants the extent
+    /// asks for the end separately.
+    pub fn get_view_selection_start(view_ptr: *mut std::os::raw::c_void) -> Option<usize> {
+        if view_ptr.is_null() {
+            return None;
+        }
+        with_env_and_activity(|env, _activity| {
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            let start = env
+                .call_method(&view, "getSelectionStart", "()I", &[])?
+                .i()?;
+            if start < 0 {
+                // -1 means "no selection", which is what an EditText reports
+                // when it has never been focused. Treat it as the start of the
+                // text rather than as "cannot answer", so a caller that
+                // probes before focusing gets 0 instead of None.
+                return Ok(0usize);
+            }
+            Ok(start as usize)
+        })
+        .ok()
+    }
+
+    /// Character length of a `TextView`'s text, read through JNI.
+    fn view_text_len(env: &mut JNIEnv<'_>, view: &JObject<'_>) -> Result<usize, Box<dyn StdError + Send + Sync>> {
+        let value = env.call_method(view, "getText", "()Ljava/lang/CharSequence;", &[])?;
+        let obj = value.l()?;
+        let jstr = JString::from(obj);
+        let text: String = env.get_string(&jstr)?.into();
+        Ok(text.chars().count())
+    }
+
+    /// Move the selection to a character index, clamped to the text length.
+    /// A `start == end` selection is the caret.
+    pub fn set_view_selection(view_ptr: *mut std::os::raw::c_void, pos: usize) {
+        if view_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            // Clamp against the real text length, so a caller that computed a
+            // stale index cannot make `setSelection` throw and leave the
+            // caret where it was.
+            let text = view_text_len(env, &view)?;
+            let clamped = pos.min(text) as i32;
+            env.call_method(&view, "setSelection", "(II)V", &[clamped.into(), clamped.into()])?;
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    /// The view's top-left in *screen* coordinates, from
+    /// `getLocationOnScreen`.
+    ///
+    /// Not the same as the view's position in its parent: the sheet is nested
+    /// under the Activity's root beneath a pinned menu strip, so a caller
+    /// popping a menu at a guessed position puts it off by the strip's height.
+    pub fn get_view_screen_origin(view_ptr: *mut std::os::raw::c_void) -> Option<(i32, i32)> {
+        if view_ptr.is_null() {
+            return None;
+        }
+        with_env_and_activity(|env, _activity| {
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            // getLocationOnScreen fills an int[2]; it is an out-param, not a
+            // return value, so the array is allocated here and read back.
+            let out = env.new_int_array(2)?;
+            env.call_method(&view, "getLocationOnScreen", "([I)V", &[(&out).into()])?;
+            let mut buf = [0i32; 2];
+            env.get_int_array_region(&out, 0, &mut buf)?;
+            Ok::<(i32, i32), Box<dyn StdError + Send + Sync>>((buf[0], buf[1]))
+        })
+        .ok()
+    }
+
+    // ---- ScrolledWindow: a real ScrollView ----
+
+    /// `ScrollView.setHorizontalScrollBarEnabled` / `setVerticalScrollBarEnabled`.
+    ///
+    /// The policy constants are the shared backend-agnostic ones GTK's
+    /// `set_policy` and NWG's use: 0 never, 1 always, 2 automatic. Any other
+    /// value falls back to automatic, which is Android's default and the safe
+    /// answer for a value this backend did not define.
+    pub fn set_scrolled_policy(view_ptr: *mut std::os::raw::c_void, h: u32, v: u32) {
+        if view_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            // 1 = always on, 0 = off. `never` and `automatic` both mean "the
+            // platform decides", which is `setEnabled(false)` for a
+            // never-policy and leave-it-alone otherwise... but a never-policy
+            // must actively hide the bar, so: always -> true, everything
+            // else -> false is wrong for automatic. The distinction that
+            // matters to a caller is "on" vs "off"; automatic is the
+            // platform default, which is *on but only when needed*, so it is
+            // expressed as enabled.
+            let horiz = h != 0;
+            let vert = v != 0;
+            env.call_method(
+                &view,
+                "setHorizontalScrollBarEnabled",
+                "(Z)V",
+                &[horiz.into()],
+            )?;
+            env.call_method(&view, "setVerticalScrollBarEnabled", "(Z)V", &[vert.into()])?;
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    /// Scroll a `ScrollView` to a position expressed in the backend-agnostic
+    /// *item* model (`value` of `upper`, page size `page`).
+    ///
+    /// The platform's `scrollTo` is in pixels, so the item index is turned
+    /// into a fraction of the scrollable extent. `upper <= page` means
+    /// everything fits and there is nothing to scroll to, so it is 0 rather
+    /// than a division by zero — that check is the entire reason this
+    /// function does not just call `scrollTo(0, ratio * height)`.
+    pub fn scroll_scrolled_window(
+        view_ptr: *mut std::os::raw::c_void,
+        hval: f64,
+        hupper: f64,
+        hpage: f64,
+        vval: f64,
+        vupper: f64,
+        vpage: f64,
+    ) {
+        if view_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            let child = env
+                .call_method(&view, "getChildAt", "(I)Landroid/view/View;", &[0i32.into()])?
+                .l()?;
+            if child.is_null() {
+                return Ok(());
+            }
+            let child = unsafe { jni::objects::JObject::from_raw(child.as_raw()) };
+            let w = env.call_method(&child, "getWidth", "()I", &[])?.i()?;
+            let h = env.call_method(&child, "getHeight", "()I", &[])?.i()?;
+            let frac = |val: f64, upper: f64, page: f64| -> f64 {
+                let span = upper - page;
+                if !span.is_finite() || span <= 0.0 {
+                    0.0
+                } else {
+                    (val / span).clamp(0.0, 1.0)
+                }
+            };
+            let x = (frac(hval, hupper, hpage) * w.max(0) as f64) as i32;
+            let y = (frac(vval, vupper, vpage) * h.max(0) as f64) as i32;
+            // smoothScrollTo animates, which is what a scrollbar drag wants
+            // and what scroll_to from a program *usually* wants on the
+            // desktop backends too.
+            env.call_method(
+                &view,
+                "smoothScrollTo",
+                "(II)V",
+                &[x.into(), y.into()],
+            )?;
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    // ---- Platform listener attachment ----
+    //
+    // JNI cannot create a proxy for a Java interface, so each Android
+    // listener needs a concrete host class. Each takes the id the callback
+    // registry keyed on and forwards; all of them are optional, and a host
+    // that ships none gets a widget that renders and reports its value but
+    // never notifies — which is strictly better than the silent no-op that
+    // was here before.
+
+    fn attach_listener(
+        view_ptr: *mut std::os::raw::c_void,
+        class_name: &str,
+        setter: &str,
+        iface: &str,
+        ctor_sig: &str,
+        ctor_args: &[jni::objects::JValue<'_, '_>],
+    ) {
+        if view_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let cls = match load_app_class(env, class_name) {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = env.exception_clear();
+                    logcat_rs(&format!("listener class {class_name} not found"));
+                    return Ok(());
+                }
+            };
+            let listener = env.new_object(&cls, ctor_sig, ctor_args)?;
+            // Keep a global ref: the platform holds the listener past this
+            // call and a collected one is a silently dead callback rather
+            // than a crash.
+            PLATFORM_LISTENERS
+                .lock()
+                .unwrap()
+                .push(env.new_global_ref(&listener)?);
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            let setter_sig = format!("({iface})V");
+            env.call_method(&view, setter, &setter_sig, &[(&listener).into()])?;
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    /// Install `OnItemSelectedListener` on a `Spinner`, dispatching to the
+    /// UI-thread callback registered under `cb_id`.
+    pub fn attach_item_selected_listener(view_ptr: *mut std::os::raw::c_void, cb_id: u64) {
+        attach_listener(
+            view_ptr,
+            "com.corro.CorroItemSelected",
+            "setOnItemSelectedListener",
+            "android/widget/AdapterView$OnItemSelectedListener",
+            "(J)V",
+            &[(cb_id as i64).into()],
+        );
+    }
+
+    /// Install `OnCheckedChangeListener` on a `CheckBox` / `RadioButton`.
+    pub fn attach_checked_listener(view_ptr: *mut std::os::raw::c_void, cb_id: u64) {
+        attach_listener(
+            view_ptr,
+            "com.corro.CorroChecked",
+            "setOnCheckedChangeListener",
+            "android/widget/CompoundButton$OnCheckedChangeListener",
+            "(J)V",
+            &[(cb_id as i64).into()],
+        );
+    }
+
+    /// Install `OnScrollChangeListener` on a scrolled window.
+    ///
+    /// The id is the *window* pointer, not a registry id: the adapter's
+    /// scroll registry is keyed by the view, and a `ScrollView` has at most
+    /// one handler, so an id indirection would only add a way for the two
+    /// keys to disagree.
+    pub fn attach_scroll_listener(view_ptr: *mut std::os::raw::c_void) {
+        attach_listener(
+            view_ptr,
+            "com.corro.CorroScrolled",
+            "setOnScrollChangeListener",
+            "android/view/View$OnScrollChangeListener",
+            "(J)V",
+            &[(view_ptr as i64).into()],
+        );
+    }
+
+    /// Keep the platform listener objects alive; without a global ref the
+    /// platform would collect one that is still installed on a live view.
+    static PLATFORM_LISTENERS: Lazy<Mutex<Vec<GlobalRef>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+    // ---- Dialog content / response plumbing ----
+
+    /// The vertical container a dialog's children are added to, created on
+    /// first use and remembered per builder.
+    pub fn dialog_content_area(builder_ptr: *mut std::os::raw::c_void) -> jni::sys::jobject {
+        if builder_ptr.is_null() {
+            return std::ptr::null_mut();
+        }
+        if let Some(existing) = DIALOG_CONTENT.lock().unwrap().get(&(builder_ptr as usize)) {
+            if existing.0 != std::ptr::null_mut() {
+                return existing.0;
+            }
+        }
+        let mut created = std::ptr::null_mut();
+        let _ = with_env_and_activity(|env, activity| {
+            let ctx = activity.as_obj();
+            let layout = env.new_object(
+                "android/widget/LinearLayout",
+                "(Landroid/content/Context;)V",
+                &[(&ctx).into()],
+            )?;
+            // A phone dialog stacks its content vertically: the rows are
+            // labels, entries and toggles, and a horizontal box would put them
+            // side by side off the right edge.
+            let vertical = env.get_static_field("android/widget/LinearLayout", "VERTICAL", "I")?.i()?;
+            env.call_method(&layout, "setOrientation", "(I)V", &[vertical.into()])?;
+            let padding = (16.0 * display_density_or(env, activity, 1.0) as f32) as i32;
+            env.call_method(
+                &layout,
+                "setPadding",
+                "(IIII)V",
+                &[padding.into(), padding.into(), padding.into(), 0i32.into()],
+            )?;
+            created = make_global_ref(env, &layout)?;
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
+        });
+        if created != std::ptr::null_mut() {
+            DIALOG_CONTENT
+                .lock()
+                .unwrap()
+                .insert(builder_ptr as usize, RawJob(created));
+        }
+        created
+    }
+
+    /// The display density, or `fallback` when it cannot be read. Small
+    /// helper so the dialog padding does not need the whole `DisplayMetrics`
+    /// walk spelled out at each call site.
+    fn display_density_or(env: &mut JNIEnv<'_>, activity: &GlobalRef, fallback: f64) -> f64 {
+        env.call_method(
+            activity.as_obj(),
+            "getResources",
+            "()Landroid/content/res/Resources;",
+            &[],
+        )
+        .ok()
+        .and_then(|r| r.l().ok())
+        .and_then(|res| {
+            env.call_method(
+                &res,
+                "getDisplayMetrics",
+                "()Landroid/util/DisplayMetrics;",
+                &[],
+            )
+            .ok()
+            .and_then(|m| m.l().ok())
+        })
+        .and_then(|metrics| env.get_field(&metrics, "density", "F").ok())
+        .and_then(|f| f.f().ok())
+        .map(|d| d as f64)
+        .unwrap_or(fallback)
+    }
+
+    /// A dialog's click listener for one button role, created on demand by
+    /// `Dialog::add_button`.
+    ///
+    /// The listener *is* per-role, because that is the only place the role
+    /// exists: Android hands an `OnClickListener` the `DialogInterface` and a
+    /// `which` constant but nothing identifying the button that was
+    /// registered. So the role travels in the object and arrives in Rust as
+    /// the string, which the adapter maps to the response id.
+    pub fn dialog_listener(builder_ptr: *mut std::os::raw::c_void, role: &str) -> Option<jni::sys::jobject> {
+        if builder_ptr.is_null() {
+            return None;
+        }
+        with_env_and_activity(|env, _activity| {
+            let cls = load_app_class(env, "com.corro.CorroDialogListener")?;
+            let j_role = env.new_string(role)?;
+            let listener = env.new_object(
+                &cls,
+                "(JLjava/lang/String;)V",
+                &[(builder_ptr as i64).into(), (&j_role).into()],
+            )?;
+            let gref = env.new_global_ref(&listener)?;
+            let raw = gref.as_obj().as_raw();
+            DIALOG_LISTENERS.lock().unwrap().push(gref);
+            Ok(raw)
+        })
+        .ok()
+    }
+
+    /// Global refs for the dialog click listeners. One per (dialog, role);
+    /// kept alive because the platform holds the listener past the
+    /// `add_button` call and a collected one is a dead button.
+    static DIALOG_LISTENERS: Lazy<Mutex<Vec<GlobalRef>>> = Lazy::new(|| Mutex::new(Vec::new()));
+    /// Mirror of `crate::backends_android_adapter`'s table, so `add_button`
+    /// can read the listener raw pointer without depending on the adapter
+    /// module (which is `#[cfg(target_os = "android")]` inside a different
+    /// module tree).
+    /// A raw `jobject` in a `'static` map. The pointer is only ever a global
+    /// ref kept alive by [`KEEP_ALIVE`] (see `make_global_ref`), and every
+    /// use is on the UI thread; the `Send` impl is justified by the mutex
+    /// plus that single-threaded access, exactly like the `Send*Callback`
+    /// newtypes in the adapter.
+    #[derive(Clone, Copy)]
+    pub struct RawJob(pub jni::sys::jobject);
+    // SAFETY: see the type's doc comment.
+    unsafe impl Send for RawJob {}
+
+    static DIALOG_CONTENT: Lazy<Mutex<HashMap<usize, RawJob>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    /// Install the `OnKeyListener` on an entry so raw keys reach corro's edit
+    /// model. The Java shim is `com.corro.CorroKeyListener`, already wired by
+    /// `attach_editor_action`; this only has to make sure the class is present
+    /// for an entry that got a key handler *before* an activate handler.
+    pub fn attach_key_listener(entry_ptr: *mut std::os::raw::c_void) {
+        if entry_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let entry = unsafe { jni::objects::JObject::from_raw(entry_ptr as jni::sys::jobject) };
+            let cls = match load_app_class(env, "com/corro/CorroKeyListener") {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = env.exception_clear();
+                    return Ok(());
+                }
+            };
+            let listener = env.new_object(&cls, "(J)V", &[(entry_ptr as i64).into()])?;
+            let gref = env.new_global_ref(&listener)?;
+            ENTRY_KEY_LISTENERS.lock().unwrap().push(gref);
+            env.call_method(
+                &entry,
+                "setOnKeyListener",
+                "(Landroid/view/View$OnKeyListener;)V",
+                &[(&listener).into()],
+            )?;
+            Ok::<(), Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    static ENTRY_KEY_LISTENERS: Lazy<Mutex<Vec<GlobalRef>>> =
+        Lazy::new(|| Mutex::new(Vec::new()));
 
     pub fn attach_child(container_ptr: *mut std::os::raw::c_void, child_ptr: *mut std::os::raw::c_void) {
         if container_ptr.is_null() || child_ptr.is_null() {

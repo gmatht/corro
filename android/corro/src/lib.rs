@@ -261,3 +261,85 @@ pub extern "system" fn Java_com_corro_CorroTimer_nativeFire(
 ) {
     rswidgets::backends::android::dispatch_timeout(timer_id as u64);
 }
+
+/// Called from `CorroItemSelected.onItemSelected`: a `Spinner` selection
+/// reached Rust, so a dropdown's `connect_changed` callback fires.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_CorroItemSelected_nativeItemSelected(
+    _env: JNIEnv,
+    _class: JClass,
+    callback_id: i64,
+    _position: i32,
+) {
+    rswidgets::backends::android::invoke_local_callback(callback_id as u64);
+}
+
+/// Called from `CorroChecked.onCheckedChanged`: a `CheckBox` / `RadioButton`
+/// toggle reached Rust, so `connect_toggled` fires. Without this a toggle
+/// could be set and read but never *report* a user tap.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_CorroChecked_nativeChecked(
+    _env: JNIEnv,
+    _class: JClass,
+    callback_id: i64,
+    _checked: jni::sys::jboolean,
+) {
+    rswidgets::backends::android::invoke_local_callback(callback_id as u64);
+}
+
+/// Called from `CorroScrolled.onScroll`: the user scrolled a `ScrollView`, so
+/// `ScrolledWindow::on_scroll` fires. This is the notification path that was
+/// missing — a program scroll (`scroll_to`) and a user scroll now both reach
+/// the model, so a host cannot end up with a view and a value that disagree.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_CorroScrolled_nativeScrolled(
+    _env: JNIEnv,
+    _class: JClass,
+    window_ptr: i64,
+    vertical: i32,
+    value: i32,
+) {
+    rswidgets::backends_android_adapter::dispatch_scrolled(
+        window_ptr as *mut _,
+        vertical != 0,
+        value as f64,
+    );
+}
+
+/// Called from `CorroDialogListener.onClick`: a dialog button was pressed.
+///
+/// The listener object carries the *role* (`positive` / `negative` /
+/// `neutral`), because Android's `OnClickListener` callback receives the
+/// dialog and a `which` constant but nothing identifying which button was
+/// registered. Rust maps the role to the response id that
+/// `Dialog::add_button` recorded, and runs the `connect_response` handler.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_CorroDialogListener_nativeDialogButton(
+    mut env: JNIEnv,
+    _class: JClass,
+    builder_ptr: i64,
+    role: JObject,
+) {
+    let jstr: &jni::objects::JString = (&role).into();
+    let Ok(role) = env.get_string(jstr) else {
+        return;
+    };
+    let role: String = role.into();
+    rswidgets::backends_android_adapter::dispatch_dialog_response(
+        builder_ptr as *mut _,
+        role.as_str(),
+    );
+}
+
+/// Called from `CorroLayout.onGlobalLayout`: the view's bounds settled, so
+/// run the `Window::set_layout_cb` callback. This is Android's counterpart of
+/// GTK's size-allocate, and it is the only point at which a real width or
+/// height exists — `nativeInit` returns before the first layout pass.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_CorroLayout_nativeLayout(
+    _env: JNIEnv,
+    _class: JClass,
+    view_ptr: i64,
+) {
+    rswidgets::backends_android_adapter::dispatch_layout(view_ptr as *mut _);
+}
