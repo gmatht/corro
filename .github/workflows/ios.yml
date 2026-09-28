@@ -284,6 +284,20 @@ jobs:
           disown 2>/dev/null || true
           disown 2>/dev/null || true
 
+          # Read the app's own log file (see the capture step for why this is
+          # not simply the pty). Cached per call: the file is fetched once and
+          # the markers are then grepped locally, because `simctl spawn` is far
+          # too slow to run once a second inside a 180 s poll.
+          APP_LOG=""
+          app_log_has() {
+            [ -n "$APP_LOG" ] || APP_LOG="$(timeout 60 xcrun simctl spawn "$SIM_UDID" cat /tmp/corro-app.log 2>/dev/null || true)"
+            printf '%s' "$APP_LOG" | grep -qa "$1"
+          }
+          app_log_hasE() {
+            [ -n "$APP_LOG" ] || APP_LOG="$(timeout 60 xcrun simctl spawn "$SIM_UDID" cat /tmp/corro-app.log 2>/dev/null || true)"
+            printf '%s' "$APP_LOG" | grep -qaE "$1"
+          }
+
           # Wait for the app's own readiness marker. `ios backend initialised`
           # is printed by Rust once the host has handed over the root view, so
           # it is strictly before anything can draw - the earliest honest "the
@@ -293,7 +307,8 @@ jobs:
           echo "--- waiting for the UI to come up (the app needs ~90s cold) ---"
           READY=0
           for i in $(seq 1 180); do
-            if grep -qa "ios backend initialised" /tmp/corro-live.log 2>/dev/null; then
+            APP_LOG="$(timeout 60 xcrun simctl spawn "$SIM_UDID" cat /tmp/corro-app.log 2>/dev/null || true)"
+            if app_log_has "ios backend initialised"; then
               echo "  t+${i}s: ios backend initialised"
               READY=1
               break
@@ -347,7 +362,8 @@ jobs:
           echo "last scripted edit at ${LAST_MS}ms"
           ARMED=0
           for i in $(seq 1 120); do
-            if grep -qa "edit script armed" /tmp/corro-live.log 2>/dev/null; then
+            APP_LOG="$(timeout 60 xcrun simctl spawn "$SIM_UDID" cat /tmp/corro-app.log 2>/dev/null || true)"
+            if app_log_has "edit script armed"; then
               echo "  t+${i}s: edit script armed"
               ARMED=1
               break
@@ -414,7 +430,8 @@ jobs:
             # `main.m` logs "UIApplicationMain RETURNED" when the run loop
             # unwinds, so its ABSENCE plus a fall-off in the app's own
             # markers is the honest signal.
-            if grep -qa "UIApplicationMain RETURNED" /tmp/corro-live.log 2>/dev/null; then
+            if timeout 60 xcrun simctl spawn "$SIM_UDID" cat /tmp/corro-app.log 2>/dev/null \
+               | grep -qa "UIApplicationMain RETURNED"; then
               echo "::error::the app's run loop unwound (UIApplicationMain returned) - the app is exiting"
               break
             fi
@@ -436,7 +453,8 @@ jobs:
             # loop ground through all eight before the diagnostics ran, so the
             # real error had to be dug out of a step whose output was eight
             # copies of "not corro's sheet".
-            if grep -qaE "fatal runtime error|SIGABRT|SIGSEGV|Terminating app" /tmp/corro-live.log 2>/dev/null; then
+            if timeout 60 xcrun simctl spawn "$SIM_UDID" cat /tmp/corro-app.log 2>/dev/null \
+                 | grep -qaE "fatal runtime error|SIGABRT|SIGSEGV|Terminating app"; then
               echo "::error::the app has crashed (see the trace in the startup-output step); not retrying the screenshot"
               break
             fi
@@ -454,7 +472,16 @@ jobs:
           # The app has been running with `--console-pty` since the launch step,
           # streaming to /tmp/corro-live.log - so there is nothing to relaunch.
           # Copy it aside for the check, then stop the app.
-          cp /tmp/corro-live.log /tmp/corro-console.log 2>/dev/null || : > /tmp/corro-console.log
+          # The app's OWN log file, not its stderr. `--console-pty` gives the
+          # app a PTY that simctl drains as fast as it can; diagnostics arrive
+          # in bursts (a commit repaints the whole grid) and a burst that
+          # outruns the reader is silently lost. That is not hypothetical: with
+          # only stderr, the "edit script armed" line was missing while the
+          # per-edit lines after it were present, which made a lost log look
+          # like a hang. The file is inside the app's container, so it is read
+          # back with `simctl spawn`, which runs in the same namespace.
+          timeout 60 xcrun simctl spawn "$SIM_UDID" cat /tmp/corro-app.log \
+            > /tmp/corro-console.log 2>/dev/null || : > /tmp/corro-console.log
           timeout 120 xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
           echo "--- app output ---"
           tr -d '\000' < /tmp/corro-console.log | head -80 || echo "(no output)"

@@ -139,6 +139,28 @@ pub fn log_ios(msg: &str) {
 /// to stop them.
 pub fn log_mobile(msg: &str) {
     log_ios(msg);
+    // The same second copy rswidgets' logger makes, for the same reason: the
+    // app's stderr is a PTY on the iOS CI runner and bursts of diagnostics are
+    // dropped when the reader falls behind. A file does not drop them, and the
+    // per-edit commit line is the one diagnostic that says whether the
+    // scripted edits ran at all.
+    append_to_app_log(msg);
+}
+
+/// Append one line to the app's own log file. Best-effort: a failure to open
+/// is not worth reporting, because the stderr copy has already been made.
+fn append_to_app_log(msg: &str) {
+    use std::io::Write;
+    let mut line = String::with_capacity(msg.len() + 1);
+    line.push_str(msg);
+    line.push('\n');
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/corro-app.log")
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 // ---------------------------------------------------------------------------
