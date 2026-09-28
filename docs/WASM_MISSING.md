@@ -14,9 +14,38 @@ ranked by severity, and tracks which are implemented.
 Method: mechanically diff the public inherent-method surface of the WASM
 adapter against `backends_gtk_adapter_impl.rs` (GTK, 1823 lines) and
 `backends_nwg_adapter.rs` (NWG/Win32, 3536 lines), then subtract the surface
-that `common.rs` / `core.rs` actually require, and verify each surviving row
-by compiling `cargo check -p rswidgets --target wasm32-unknown-unknown
---no-default-features`.
+that `common.rs` / `core.rs` actually require.
+
+### A note on the method, written after the fact
+
+To be fair to the diff: it was right. Every method §1 and §3 list as missing
+was missing, and §0's error count (34) was within one of the 35 the compiler
+produced when the enumeration was finally checked — a surface diff against a
+file that is nominally a first-class backend is good evidence.
+
+What it could not reach is the honest limit of the method. The diff compares
+the *adapter* against GTK and NWG; it does not compile anything, and so it
+never saw the seven cfg errors in the app crate itself (`corro_main` compiled
+for a platform with no CLI, `libc::EXDEV` named where `libc` is excluded,
+`ios_backend` absent while six call sites referenced it). Those were on no
+list — not because the diff was careless, but because a diff of one file
+against two others cannot find a fourth. `gui_loop.sh` would have caught them
+if it had run; it is guarded on the target being installed for the `nightly`
+toolchain, which does not have it, so it printed `skip` and exited 0 — a green
+run that proved nothing.
+
+Two consequences, both now in place:
+
+- The build is checked in CI. `.github/workflows/wasm.yml` pins `+stable`,
+  installs the target, sets `-D warnings`, builds the app (not just checks
+  it), and asserts the emitted `.wasm` has the right magic number. The
+  app-crate cfg gates are only compiled by that job's second step, so
+  "rswidgets builds" alone would still be blind to them.
+- The lesson is in §0: **check the build before enumerating gaps.** The order
+  here was inverted — enumerate, then implement — and it worked only because
+  the enumeration happened to be thorough. For a backend with no CI coverage,
+  "does it even compile?" is a question with a one-line answer and a large
+  payoff, and it should be the first question.
 
 Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` deliberately not
 applicable to a browser DOM (with a reason).
@@ -32,7 +61,10 @@ checks) are clean. The history of this section, kept because it explains why
 the rest of the document reads as it does:
 
 `cargo +stable check -p rswidgets --target wasm32-unknown-unknown
---no-default-features` fails with **34 errors**. The backend is dead code the
+--no-default-features` fails with **34 errors** (34 as counted by hand from the
+tables below; the compiler reports 35 — the extra one is a downstream
+consequence of another row, so the two counts are consistent). The backend is
+dead code the
 same way `zork` was before §0 of `ZORK_MISSING.md`: no CI job builds it.
 (The `nightly` toolchain in `rust-toolchain.toml` has no `wasm32-unknown-unknown`
 std installed, so the check must be run `+stable`.)
