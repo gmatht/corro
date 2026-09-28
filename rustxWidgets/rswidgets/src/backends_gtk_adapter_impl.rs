@@ -860,10 +860,57 @@ mod gtk_adapter {
     struct PressHandlers {
         plain: Option<Box<dyn FnMut(f64, f64)>>,
         with_button: Option<Box<dyn FnMut(f64, f64, u32, u32)>>,
+        /// Canonical gesture stream, fed from the same three native signals as
+        /// the other callbacks so a caller can use one handler instead of three.
+        gesture: Option<Box<dyn FnMut(crate::core::Gesture)>>,
         installed: bool,
     }
 
     impl PressHandlers {
+        /// Map a GDK button number to the portable `Button` enum.
+        ///
+        /// GDK numbers 1/2/3 are left/middle/right, as everywhere else; the
+        /// rest are passed through so a caller can still see 4..n.
+        fn map_button(b: u32) -> crate::core::Button {
+            match b {
+                1 => crate::core::Button::Primary,
+                2 => crate::core::Button::Middle,
+                3 => crate::core::Button::Secondary,
+                other => crate::core::Button::Other(other.min(255) as u8),
+            }
+        }
+
+        /// Decode a GDK modifier mask into the portable `Modifiers`.
+        ///
+        /// The bits are gdk-sys' GdkModifierType: shift 1 << 0, lock 1 << 1,
+        /// control 1 << 2, mod1 (alt) 1 << 3, and the super/command key is
+        /// mod4 (1 << 6) on X11/Wayland and on Windows.
+        fn map_state(state: u32) -> crate::core::Modifiers {
+            crate::core::Modifiers {
+                shift: state & (1 << 0) != 0,
+                ctrl: state & (1 << 2) != 0,
+                alt: state & (1 << 3) != 0,
+                meta: state & (1 << 6) != 0,
+            }
+        }
+
+        /// Whether any mouse button is down, per the GDK state mask.
+        ///
+        /// The button mask bits are 1 << 8 (button 1) through 1 << 12
+        /// (button 5), so bits 8..=12 set means a drag rather than a hover.
+        /// `on_motion` is documented as firing for both, and this is how the two
+        /// are told apart without a second native handler.
+        fn button_held(state: u32) -> bool {
+            (state >> 8) & 0b1_1111 != 0
+        }
+
+        /// Feed the gesture stream, if one is registered.
+        fn dispatch_gesture(&mut self, g: crate::core::Gesture) {
+            if let Some(cb) = self.gesture.as_mut() {
+                cb(g);
+            }
+        }
+
         /// Invoke whichever callbacks are registered, and report whether the
         /// press should be consumed.
         ///
@@ -1182,8 +1229,205 @@ mod gtk_adapter {
                         };
                         let button = gtk_dynamic_loader::gdk_event_get_button(&l2, ev).unwrap_or(1);
                         let state = gtk_dynamic_loader::gdk_event_get_state(&l2, ev).unwrap_or(0);
-                        let consumed = handlers.borrow_mut().dispatch(x, y, button, state);
+                        let consumed = {
+                            let mut h = handlers.borrow_mut();
+                            h.dispatch_gesture(crate::core::Gesture::Button {
+                                button: PressHandlers::map_button(button),
+                                pressed: true,
+                                x,
+                                y,
+                                mods: PressHandlers::map_state(state),
+                            });
+                            h.dispatch(x, y, button, state)
+                        };
                         if consumed { 1 } else { 0 }
+                    }),
+                );
+            }
+        }
+
+        /// The canonical gesture stream: one callback for hover, drag, buttons
+        /// and (with `on_scroll` installed by the host) scroll.
+        ///
+        /// This is the recommended way to handle pointer input on a canvas.
+        /// The older `on_click` / `on_motion` / `on_release` remain for callers
+        /// that want the raw numbers, but a caller that needs a drag has to
+        /// reassemble one from three separate signals by hand -- including
+        /// working out the click-versus-drag threshold, which is the part
+        /// that is easy to get subtly wrong. Feeding everything into one
+        /// `Gesture` and letting [`crate::core::DragTracker`] do that is why
+        /// this exists.
+        ///
+        /// Shares the single signal connection the other callbacks use, so
+        /// registering it does not add a second connection per widget.
+        pub fn on_gesture(&self, cb: Box<dyn FnMut(crate::core::Gesture)>) {
+            let loader = crate::backends::gtk::loader()
+                .expect("GTK loader not initialized after Canvas creation");
+            let inner = *self.drawing_area.as_ref();
+            if loader.symbols.gtk_drawing_area_set_draw_func.is_some() {
+                // GTK4 uses event controllers rather than widget signals; the
+                // existing click path handles that and the motion path does
+                // not yet (see `on_motion`). Not a silent no-op: the caller
+                // gets no events on GTK4 rather than wrong ones.
+                return;
+            }
+            // press 256, release 512, motion 4, button1-motion 32. The drag
+            // needs 32: plain POINTER_MOTION is only delivered with no button
+            // held. `gtk_widget_add_events` only adds bits, so this is safe to
+            // call alongside the other registrations.
+            const GDK_BUTTON_PRESS_MASK: i32 = 256;
+            const GDK_BUTTON_RELEASE_MASK: i32 = 512;
+            const GDK_POINTER_MOTION_MASK: i32 = 4;
+            const GDK_BUTTON1_MOTION_MASK: i32 = 32;
+            unsafe {
+                gtk_dynamic_loader::widget_add_events(
+                    &loader,
+                    inner,
+                    GDK_BUTTON_PRESS_MASK
+                        | GDK_BUTTON_RELEASE_MASK
+                        | GDK_POINTER_MOTION_MASK
+                        | GDK_BUTTON1_MOTION_MASK,
+                );
+            }
+            {
+                let mut h = self.click_handlers.borrow_mut();
+                h.gesture = Some(cb);
+            }
+
+            // Install the connections that feed the stream. This is the part
+            // that is easy to omit: registering the callback and adding the
+            // event masks is not enough, because a widget only delivers
+            // `motion-notify-event` to a handler that is actually connected to
+            // it. `on_click_button`/`on_motion`/`on_release` each connect their
+            // own signal; on_gesture has to connect too, or it silently never
+            // fires -- which is exactly what the first version of this did.
+            self.install_scroll_gesture();
+
+            let handlers = self.click_handlers.clone();
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+
+            unsafe {
+                let h = l2.clone();
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3,
+                    inner,
+                    "motion-notify-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&h, ev) else {
+                            return 0;
+                        };
+                        let state = gtk_dynamic_loader::gdk_event_get_state(&h, ev).unwrap_or(0);
+                        let g = if PressHandlers::button_held(state) {
+                            crate::core::Gesture::Drag { x, y, mods: PressHandlers::map_state(state) }
+                        } else {
+                            crate::core::Gesture::Hover { x, y, mods: PressHandlers::map_state(state) }
+                        };
+                        handlers.borrow_mut().dispatch_gesture(g);
+                        0
+                    }),
+                );
+            }
+
+            let handlers = self.click_handlers.clone();
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+            unsafe {
+                let h = l2.clone();
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3,
+                    inner,
+                    "button-press-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&h, ev) else {
+                            return 0;
+                        };
+                        let button = gtk_dynamic_loader::gdk_event_get_button(&h, ev).unwrap_or(1);
+                        let state = gtk_dynamic_loader::gdk_event_get_state(&h, ev).unwrap_or(0);
+                        handlers.borrow_mut().dispatch_gesture(crate::core::Gesture::Button {
+                            button: PressHandlers::map_button(button),
+                            pressed: true,
+                            x,
+                            y,
+                            mods: PressHandlers::map_state(state),
+                        });
+                        0
+                    }),
+                );
+            }
+
+            let handlers = self.click_handlers.clone();
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+            unsafe {
+                let h = l2.clone();
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3,
+                    inner,
+                    "button-release-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&h, ev) else {
+                            return 0;
+                        };
+                        let button = gtk_dynamic_loader::gdk_event_get_button(&h, ev).unwrap_or(1);
+                        let state = gtk_dynamic_loader::gdk_event_get_state(&h, ev).unwrap_or(0);
+                        handlers.borrow_mut().dispatch_gesture(crate::core::Gesture::Button {
+                            button: PressHandlers::map_button(button),
+                            pressed: false,
+                            x,
+                            y,
+                            mods: PressHandlers::map_state(state),
+                        });
+                        0
+                    }),
+                );
+            }
+        }
+
+        /// Connect the wheel / touchpad scroll signal to the gesture stream.
+        ///
+        /// Called by `on_gesture`; exposed separately so a host that wants a
+        /// scroll handler without the rest can install just this one.
+        fn install_scroll_gesture(&self) {
+            let loader = crate::backends::gtk::loader()
+                .expect("GTK loader not initialized after Canvas creation");
+            let inner = *self.drawing_area.as_ref();
+            if loader.symbols.gtk_drawing_area_set_draw_func.is_some() {
+                return; // GTK4: as `on_gesture`.
+            }
+            // GDK_SCROLL_MASK = 1 << 21 (2097152).
+            const GDK_SCROLL_MASK: i32 = 1 << 21;
+            unsafe {
+                gtk_dynamic_loader::widget_add_events(&loader, inner, GDK_SCROLL_MASK);
+            }
+            let handlers = self.click_handlers.clone();
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+            unsafe {
+                let h = l2.clone();
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3,
+                    inner,
+                    "scroll-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        let Some((dx, dy)) = gtk_dynamic_loader::gdk_event_get_scroll_deltas(&h, ev)
+                        else {
+                            return 0;
+                        };
+                        // Horizontal deltas are carried through: the `Gesture`
+                        // type distinguishes them, and `ZoomState` is the thing
+                        // that decides to ignore them. Deciding here would make
+                        // a horizontal pan impossible.
+                        let (x, y) =
+                            gtk_dynamic_loader::gdk_event_get_coords(&h, ev).unwrap_or((0.0, 0.0));
+                        let state = gtk_dynamic_loader::gdk_event_get_state(&h, ev).unwrap_or(0);
+                        handlers.borrow_mut().dispatch_gesture(crate::core::Gesture::Scroll {
+                            delta: crate::core::ScrollDelta { dx, dy },
+                            x,
+                            y,
+                            mods: PressHandlers::map_state(state),
+                        });
+                        1 // consumed: a wheel over the canvas should not scroll the page
                     }),
                 );
             }
@@ -1217,6 +1461,10 @@ mod gtk_adapter {
                     GDK_POINTER_MOTION_MASK | GDK_BUTTON1_MOTION_MASK,
                 );
             }
+            // The shared handler, so the gesture stream is fed from the same
+            // single signal connection the other callbacks use rather than a
+            // second one.
+            let gesture_handlers = self.click_handlers.clone();
             let mut cb = cb;
             let l2 = loader.clone();
             let l3 = l2.clone();
@@ -1229,6 +1477,15 @@ mod gtk_adapter {
                         if let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&l2, ev) {
                             let state =
                                 gtk_dynamic_loader::gdk_event_get_state(&l2, ev).unwrap_or(0);
+                            {
+                                let mut h = gesture_handlers.borrow_mut();
+                                let g = if PressHandlers::button_held(state) {
+                                    crate::core::Gesture::Drag { x, y, mods: PressHandlers::map_state(state) }
+                                } else {
+                                    crate::core::Gesture::Hover { x, y, mods: PressHandlers::map_state(state) }
+                                };
+                                h.dispatch_gesture(g);
+                            }
                             cb(x, y, state);
                             return 0; // do not consume: hover must not block others
                         }
@@ -1249,6 +1506,10 @@ mod gtk_adapter {
             }
             const GDK_BUTTON_RELEASE_MASK: i32 = 512;
             unsafe { gtk_dynamic_loader::widget_add_events(&loader, inner, GDK_BUTTON_RELEASE_MASK); }
+            // The shared handler, so the gesture stream is fed from the same
+            // single signal connection the other callbacks use rather than a
+            // second one.
+            let gesture_handlers = self.click_handlers.clone();
             let mut cb = cb;
             let l2 = loader.clone();
             let l3 = l2.clone();
@@ -1263,6 +1524,16 @@ mod gtk_adapter {
                                 gtk_dynamic_loader::gdk_event_get_button(&l2, ev).unwrap_or(1);
                             let state =
                                 gtk_dynamic_loader::gdk_event_get_state(&l2, ev).unwrap_or(0);
+                            {
+                                let mut h = gesture_handlers.borrow_mut();
+                                h.dispatch_gesture(crate::core::Gesture::Button {
+                                    button: PressHandlers::map_button(button),
+                                    pressed: false,
+                                    x,
+                                    y,
+                                    mods: PressHandlers::map_state(state),
+                                });
+                            }
                             cb(x, y, button, state);
                         }
                         // Do NOT consume the release: a popup menu opened over

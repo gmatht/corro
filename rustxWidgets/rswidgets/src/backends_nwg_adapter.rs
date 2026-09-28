@@ -2514,6 +2514,24 @@ mod nwg_adapter {
         }
         pub fn set_can_focus(&self, _can: bool) {}
         pub fn force_draw(&self, _window_ptr: *mut c_void, _fallback_w: i32, _fallback_h: i32) {}
+        /// The canonical gesture stream. See `core::Gesture`.
+        ///
+        /// ACCEPTED BUT NOT YET DELIVERED ON THIS BACKEND.
+        ///
+        /// NWG gives a `Canvas` only a click callback; its `on_motion`,
+        /// `on_release` and `on_click_button` are all documented no-ops that never
+        /// fire, because NWG does not plumb Win32 motion or button transitions
+        /// through to a frame. This accepts the callback so application code
+        /// compiles and behaves identically on both backends, and simply never
+        /// fires here.
+        ///
+        /// The consequence is concrete and worth stating: a drag or wheel-zoom
+        /// written against this API is live on GTK and inert on Windows until the
+        /// NWG path is implemented. It is not a silent difference in feel -- the
+        /// gesture simply does not arrive, so code that only pans on drag will look
+        /// broken rather than subtly different on Windows. The viewer is the
+        /// reason this is called out rather than papered over.
+        pub fn on_gesture(&self, _cb: Box<dyn FnMut(crate::core::Gesture)>) {}
     }
 
     impl Clone for Canvas {

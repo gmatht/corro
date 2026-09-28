@@ -886,6 +886,284 @@ pub fn terminal_size_with_override() -> (usize, usize) {
 /// Opaque handler id returned when connecting signals
 pub type HandlerId = u64;
 
+/// Which mouse/key button produced a pointer event.
+///
+/// A small fixed set rather than a raw button number, because the raw numbering
+/// differs between GTK, GDI and UIKit and a caller porting a handler should not
+/// have to know that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Button {
+    Primary,
+    Middle,
+    Secondary,
+    /// Any additional button (4..n), reported as `Other(n)`.
+    Other(u8),
+}
+
+/// Set of modifiers held during a pointer event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    /// The platform's "command"/"meta"/"super" key.
+    pub meta: bool,
+}
+
+impl Modifiers {
+    /// True when no modifier is held, which is what a plain drag needs.
+    pub fn is_empty(self) -> bool {
+        !(self.shift || self.ctrl || self.alt || self.meta)
+    }
+}
+
+/// A wheel / trackpad scroll.
+///
+/// `dx` and `dy` are *deltas*, not absolute scroll positions: they are how far
+/// the gesture moved since the last event. That distinction matters, and it is
+/// why this is a type rather than the bare `f64` the older `on_scroll` took --
+/// an absolute value has to be differenced by every caller, and getting that
+/// wrong is a zoom that drifts instead of tracking the wheel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollDelta {
+    pub dx: f64,
+    pub dy: f64,
+}
+
+impl ScrollDelta {
+    /// The vertical component, which is what a zoom gesture reads.
+    pub fn vertical(self) -> f64 {
+        self.dy
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.dx == 0.0 && self.dy == 0.0
+    }
+}
+
+/// A single gesture event.
+///
+/// Built by the backend from its native event, so application code sees one
+/// vocabulary on GTK, NWG and UIKit instead of three. Coordinates are relative
+/// to the widget, in logical (device-independent) pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Gesture {
+    /// A pointer moved with no button held. Not part of a drag.
+    Hover { x: f64, y: f64, mods: Modifiers },
+    /// A drag in progress. `x, y` is the current position; the previous one is
+    /// in [`DragEvent`] so a handler can work in deltas.
+    Drag { x: f64, y: f64, mods: Modifiers },
+    /// A press or release.
+    Button { button: Button, pressed: bool, x: f64, y: f64, mods: Modifiers },
+    /// Wheel or trackpad scroll.
+    Scroll { delta: ScrollDelta, x: f64, y: f64, mods: Modifiers },
+}
+
+/// A drag event with the movement already computed.
+///
+/// The backends deliver positions, not deltas; doing the subtraction once here
+/// means every handler agrees on the sign convention and on what happens on the
+/// first event of a drag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DragEvent {
+    /// Where the pointer is now, widget-relative.
+    pub x: f64,
+    pub y: f64,
+    /// Movement since the previous event, in the same units as `x`/`y`.
+    pub dx: f64,
+    pub dy: f64,
+    /// Total movement since the drag began. Useful for a velocity or a
+    /// "has it moved far enough to count as a drag" test.
+    pub total_dx: f64,
+    pub total_dy: f64,
+    /// Which button is being dragged (the one that went down first).
+    pub button: Button,
+    pub mods: Modifiers,
+}
+
+impl DragEvent {
+    /// True once the pointer has moved more than `threshold` logical pixels in
+    /// total, which is the usual "this is a drag, not a click" test.
+    pub fn exceeds(&self, threshold: f64) -> bool {
+        self.total_dx.abs() > threshold || self.total_dy.abs() > threshold
+    }
+
+    /// The movement as a vector, for feeding straight into a pan.
+    pub fn delta(&self) -> ScrollDelta {
+        ScrollDelta { dx: self.dx, dy: self.dy }
+    }
+}
+
+/// Tracks a drag across events.
+///
+/// A backend delivers press / motion / release; turning that into "a drag
+/// started", "it moved by this much", "it ended" is identical on every
+/// platform, so it lives here once instead of in each backend. Construct one,
+/// feed it the events, and read the answers.
+#[derive(Debug, Clone)]
+pub struct DragTracker {
+    active: Option<DragState>,
+    last: (f64, f64),
+    /// Movement below this in total is treated as a click, not a drag.
+    click_threshold: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DragState {
+    origin: (f64, f64),
+    last: (f64, f64),
+    button: Button,
+}
+
+impl Default for DragTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DragTracker {
+    pub fn new() -> Self {
+        Self {
+            active: None,
+            last: (0.0, 0.0),
+            click_threshold: 3.0,
+        }
+    }
+
+    /// Movement (in logical pixels) that separates a click from a drag.
+    pub fn with_click_threshold(mut self, px: f64) -> Self {
+        self.click_threshold = px;
+        self
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Feeds a gesture in; returns a `DragEvent` only while a drag is in
+    /// progress and has moved far enough to matter.
+    pub fn feed(&mut self, g: Gesture) -> Option<DragEvent> {
+        match g {
+            Gesture::Button { button, pressed: true, x, y, mods } => {
+                // A second button during a drag does not start another one.
+                if self.active.is_none() {
+                    self.active = Some(DragState { origin: (x, y), last: (x, y), button });
+                    self.last = (x, y);
+                }
+                let _ = mods;
+                None
+            }
+            Gesture::Button { pressed: false, .. } => {
+                self.active = None;
+                None
+            }
+            Gesture::Drag { x, y, mods } => {
+                let st = self.active?;
+                let dx = x - st.last.0;
+                let dy = y - st.last.1;
+                let ev = DragEvent {
+                    x,
+                    y,
+                    dx,
+                    dy,
+                    total_dx: x - st.origin.0,
+                    total_dy: y - st.origin.1,
+                    button: st.button,
+                    mods,
+                };
+                // Advance the stored position AFTER taking the delta. `st` is a
+                // copy of the state, so the write-back is what makes the *next*
+                // event report an increment; without it every event reports the
+                // distance from the press point instead.
+                if let Some(slot) = self.active.as_mut() {
+                    slot.last = (x, y);
+                }
+                self.last = (x, y);
+                // Suppress sub-threshold jitter so a shaky hand does not pan.
+                if ev.exceeds(self.click_threshold) {
+                    Some(ev)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A zoom / pan gesture, accumulated over time.
+///
+/// Wheel events arrive as deltas with no notion of a gesture's extent, so
+/// "zoom by 10% per notch" has to be accumulated somewhere. This holds the
+/// factor and clamps it, which is the part every caller otherwise reinvents
+/// (usually with a bug: unbounded, so a long scroll overflows the scale).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoomState {
+    pub factor: f64,
+    min: f64,
+    max: f64,
+    /// How much one wheel notch multiplies by.
+    step: f64,
+}
+
+impl Default for ZoomState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ZoomState {
+    /// A zoom starting at 1.0, clamped to 0.05..=16.0, 10% per notch.
+    pub fn new() -> Self {
+        Self {
+            factor: 1.0,
+            min: 0.05,
+            max: 16.0,
+            step: 0.1,
+        }
+    }
+
+    pub fn with_range(mut self, min: f64, max: f64) -> Self {
+        self.min = min;
+        self.max = max;
+        self.factor = self.factor.clamp(min, max);
+        self
+    }
+
+    pub fn with_step(mut self, step: f64) -> Self {
+        self.step = step;
+        self
+    }
+
+    pub fn factor(&self) -> f64 {
+        self.factor
+    }
+
+    pub fn set_factor(&mut self, f: f64) {
+        self.factor = f.clamp(self.min, self.max);
+    }
+
+    pub fn reset(&mut self) {
+        self.factor = 1.0;
+    }
+
+    /// Applies a scroll delta as a zoom step. Returns the new factor.
+    ///
+    /// A horizontal wheel is deliberately ignored: on a trackpad a two-finger
+    /// horizontal swipe means "scroll sideways", and treating it as zoom makes
+    /// the view jump when the user scrolls a list.
+    pub fn scroll(&mut self, delta: ScrollDelta) -> f64 {
+        if delta.dy == 0.0 {
+            return self.factor;
+        }
+        // Scrolling up (positive dy) zooms in, matching the convention of every
+        // image viewer and map.
+        let mult = (1.0 + self.step).powf(delta.dy);
+        self.set_factor(self.factor * mult);
+        self.factor
+    }
+}
+
 /// Cross-platform 2D drawing surface.
 /// Each backend implements this trait with its own drawing primitives.
 pub trait DrawContext {
@@ -2637,4 +2915,116 @@ pub fn add_periodic_tick(
     _f: Box<dyn FnMut() -> bool>,
 ) -> Result<(), Error> {
     Ok(())
+}
+
+
+#[cfg(test)]
+mod gesture_tests {
+    use super::*;
+
+    fn press(x: f64, y: f64) -> Gesture {
+        Gesture::Button { button: Button::Primary, pressed: true, x, y, mods: Modifiers::default() }
+    }
+
+    fn drag(x: f64, y: f64) -> Gesture {
+        Gesture::Drag { x, y, mods: Modifiers::default() }
+    }
+
+    #[test]
+    fn jitter_below_the_threshold_is_not_a_drag() {
+        let mut t = DragTracker::new().with_click_threshold(3.0);
+        t.feed(press(10.0, 10.0));
+        assert!(t.feed(drag(11.0, 10.0)).is_none(), "1px of hand shake is not a drag");
+    }
+
+    #[test]
+    fn movement_past_the_threshold_reports_the_delta() {
+        let mut t = DragTracker::new().with_click_threshold(3.0);
+        t.feed(press(0.0, 0.0));
+        let e = t.feed(drag(10.0, 4.0)).unwrap();
+        assert_eq!((e.dx, e.dy), (10.0, 4.0));
+        assert_eq!((e.total_dx, e.total_dy), (10.0, 4.0));
+        assert!(e.exceeds(3.0));
+    }
+
+    /// The regression that motivated computing the delta before the write-back:
+    /// a naive version returns the distance from the press point every time, so
+    /// panning speeds up instead of tracking the pointer.
+    #[test]
+    fn each_move_reports_only_its_own_increment() {
+        let mut t = DragTracker::new();
+        t.feed(press(0.0, 0.0));
+        t.feed(drag(20.0, 0.0));
+        let e = t.feed(drag(25.0, 0.0)).unwrap();
+        assert_eq!(e.dx, 5.0, "increment, not distance from the press");
+        assert_eq!(e.total_dx, 25.0, "the total is measured from the press");
+    }
+
+    #[test]
+    fn a_release_ends_the_drag() {
+        let mut t = DragTracker::new();
+        t.feed(press(0.0, 0.0));
+        assert!(t.is_dragging());
+        t.feed(Gesture::Button { button: Button::Primary, pressed: false, x: 5.0, y: 5.0, mods: Modifiers::default() });
+        assert!(!t.is_dragging());
+        assert!(t.feed(drag(99.0, 99.0)).is_none(), "motion after release is ignored");
+    }
+
+    #[test]
+    fn a_second_button_does_not_restart_the_drag() {
+        let mut t = DragTracker::new();
+        t.feed(press(0.0, 0.0));
+        let first = t.feed(drag(50.0, 0.0)).unwrap();
+        assert_eq!(first.button, Button::Primary);
+        t.feed(Gesture::Button { button: Button::Secondary, pressed: true, x: 50.0, y: 0.0, mods: Modifiers::default() });
+        let second = t.feed(drag(60.0, 0.0)).unwrap();
+        assert_eq!(second.button, Button::Primary, "the drag keeps its original button");
+        assert_eq!(second.total_dx, 60.0, "the origin is still the first press");
+    }
+
+    #[test]
+    fn zoom_clamps_at_both_ends_instead_of_overflowing() {
+        let mut z = ZoomState::new();
+        for _ in 0..500 {
+            z.scroll(ScrollDelta { dx: 0.0, dy: 1.0 });
+        }
+        assert_eq!(z.factor(), 16.0);
+        for _ in 0..900 {
+            z.scroll(ScrollDelta { dx: 0.0, dy: -1.0 });
+        }
+        assert_eq!(z.factor(), 0.05);
+    }
+
+    #[test]
+    fn scrolling_up_zooms_in_and_down_zooms_out() {
+        let mut z = ZoomState::new();
+        z.scroll(ScrollDelta { dx: 0.0, dy: 1.0 });
+        assert!(z.factor() > 1.0);
+        z.reset();
+        z.scroll(ScrollDelta { dx: 0.0, dy: -1.0 });
+        assert!(z.factor() < 1.0);
+    }
+
+    #[test]
+    fn horizontal_scroll_does_not_zoom() {
+        // A two-finger horizontal trackpad swipe means "scroll sideways";
+        // treating it as zoom makes the view jump while scrolling a list.
+        let mut z = ZoomState::new();
+        z.scroll(ScrollDelta { dx: 3.0, dy: 0.0 });
+        assert_eq!(z.factor(), 1.0);
+    }
+
+    #[test]
+    fn a_zero_delta_changes_nothing() {
+        let mut z = ZoomState::new();
+        assert!(ScrollDelta { dx: 0.0, dy: 0.0 }.is_zero());
+        z.scroll(ScrollDelta { dx: 0.0, dy: 0.0 });
+        assert_eq!(z.factor(), 1.0);
+    }
+
+    #[test]
+    fn modifiers_report_emptiness() {
+        assert!(Modifiers::default().is_empty());
+        assert!(!Modifiers { ctrl: true, ..Modifiers::default() }.is_empty());
+    }
 }

@@ -2341,6 +2341,112 @@ pub unsafe fn connect_gesture_click_pressed(
 }
 
 /// Get coordinates from a GDK event. Returns `None` if the symbol is unavailable.
+/// The scroll direction of a `GdkEventScroll`, as a delta in wheel units.
+///
+/// A discrete wheel notch is reported as a direction (up/down/left/right) with
+/// no magnitude, so it is normalised to 1.0 per notch. GDK_SCROLL_SMOOTH (4)
+/// has no direction and is left to `gdk_event_get_scroll_deltas`; returning
+/// zero here for it is correct, because a smooth event already produced real
+/// deltas.
+pub unsafe fn scroll_direction_as_delta(
+    loader: &Arc<Loader>,
+    event: *mut c_void,
+) -> Option<(f64, f64)> {
+    type GetScrollDirection = unsafe extern "C" fn(*mut std::ffi::c_void) -> std::os::raw::c_int;
+    type GetScrollValuations =
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
+    let dir_fn = loader.libs.get("libgdk").and_then(|l| unsafe {
+        l.get::<GetScrollDirection>(b"gdk_event_get_scroll_direction").ok().map(|s| *s)
+    }).or_else(|| {
+        loader.libs.get("libgtk").and_then(|l| unsafe {
+            l.get::<GetScrollDirection>(b"gdk_event_get_scroll_direction").ok().map(|s| *s)
+        })
+    })?;
+
+    // GDK_SCROLL_SMOOTH == 4: handled by the delta path, not by direction.
+    if dir_fn(event) == 4 {
+        return Some((0.0, 0.0));
+    }
+
+    // Where available, `gdk_event_get_scroll_valuations` gives the notches
+    // consumed (0.0 when the event comes from a wheel rather than a touchpad),
+    // which is a better magnitude than a flat 1.0. It is newer than
+    // `get_scroll_deltas`, so it is optional.
+    let mut n_val: f64 = 0.0;
+    let mut n_discrete: f64 = 0.0;
+    let got_valuations = loader
+        .libs
+        .get("libgdk")
+        .and_then(|l| unsafe {
+            l.get::<GetScrollValuations>(b"gdk_event_get_scroll_valuations")
+                .ok()
+                .map(|s| *s)
+        })
+        .or_else(|| {
+            loader.libs.get("libgtk").and_then(|l| unsafe {
+                l.get::<GetScrollValuations>(b"gdk_event_get_scroll_valuations")
+                    .ok()
+                    .map(|s| *s)
+            })
+        })
+        .map(|f| f(event, &mut n_val, &mut n_discrete) != 0)
+        .unwrap_or(false);
+    let step = if got_valuations && n_discrete != 0.0 { n_discrete } else { 1.0 };
+
+    let (dx, dy) = match dir_fn(event) {
+        0 => (0.0, step),  // GDK_SCROLL_UP
+        1 => (0.0, -step), // GDK_SCROLL_DOWN
+        2 => (-step, 0.0), // GDK_SCROLL_LEFT
+        3 => (step, 0.0),  // GDK_SCROLL_RIGHT
+        _ => (0.0, 0.0),
+    };
+    Some((dx, dy))
+}
+
+/// The scroll deltas of a `GdkEventScroll`, in pixels for a wheel event and
+/// in scroll units for a touchpad.
+///
+/// `gdk_event_get_scroll_deltas` is the one to prefer over
+/// `gdk_event_get_scroll_valuations`: the latter is only meaningful for smooth
+/// scroll events and returns zeros for a discrete wheel notch, so a wheel-zoom
+/// built on it does nothing on a conventional mouse -- the most common input
+/// device there is.
+///
+/// Returns `None` when the event is not a scroll event or the symbol is absent,
+/// so a caller can treat "not a scroll" and "no deltas available" the same way.
+pub unsafe fn gdk_event_get_scroll_deltas(
+    loader: &Arc<Loader>,
+    event: *mut c_void,
+) -> Option<(f64, f64)> {
+    type GetScrollDeltas = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
+    let get = loader.libs.get("libgdk").and_then(|l| unsafe {
+        l.get::<GetScrollDeltas>(b"gdk_event_get_scroll_deltas").ok().map(|s| *s)
+    }).or_else(|| {
+        loader.libs.get("libgtk").and_then(|l| unsafe {
+            l.get::<GetScrollDeltas>(b"gdk_event_get_scroll_deltas").ok().map(|s| *s)
+        })
+    })?;
+
+    let mut dx: f64 = 0.0;
+    let mut dy: f64 = 0.0;
+    if get(event, &mut dx, &mut dy) == 0 {
+        // gdk_event_get_scroll_deltas reports fractional scroll units and is
+        // documented to return 0 for a *discrete* wheel notch -- which is what
+        // a conventional mouse sends. So on a real mouse it is always 0 and
+        // the delta has to come from the direction instead. Without this
+        // fallback a wheel-zoom works on a trackpad and does nothing on a mouse,
+        // which is the most confusing possible failure: it looks correct on the
+        // machine that was tested.
+        return scroll_direction_as_delta(loader, event);
+    }
+    // GDK_SCROLL_SMOOTH == 0 means the deltas are fractional scroll units
+    // (touchpad); GDK_SCROLL_UNIT == 1 means pixels (a wheel notch). Both are
+    // usable as-is for a zoom step, which is why no unit conversion is done
+    // here: a caller wants "how much did this gesture move", and normalising
+    // that to pixels is a policy decision, not a platform fact.
+    Some((dx, dy))
+}
+
 pub unsafe fn gdk_event_get_coords(loader: &Arc<Loader>, event: *mut c_void) -> Option<(f64, f64)> {
     type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
 
