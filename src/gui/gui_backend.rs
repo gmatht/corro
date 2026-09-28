@@ -6369,6 +6369,12 @@ pub fn run_gui_with_movie(
     log_ui_action("gui_started", &format!("title={}", env!("CARGO_PKG_VERSION")));
 
     win.set_child_box(&vbox);
+    // TEMPORARY Win95 diagnosis: setup reached the child box; the remaining
+    // marks bracket focus + present, the two steps that can still fault.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"m-setbox\n");
+    }
     // Grab focus on the formula entry BEFORE present() so the entry receives
     // initial keyboard focus when the window is mapped.  This ensures that
     // keystrokes from the external replayer (which detects the window during
@@ -6424,9 +6430,22 @@ pub fn run_gui_with_movie(
 
     update_formula_bar(&shared, shared.last_row.get(), shared.last_col.get());
     sync_tabbar(&shared);
+    // TEMPORARY Win95 diagnosis: locate the exact setup step that faults.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"m-prefocus\n");
+    }
     formula_entry.grab_focus();
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"m-postfocus\n");
+    }
     eprintln!("PHASE: about_to_present");
     win.present();
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"m-postpresent\n");
+    }
     // TEMPORARY Win95 diagnosis: probe each known window (parent/class/
     // rect/visible) to find where the controls really live.
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
