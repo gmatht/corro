@@ -1193,6 +1193,14 @@ static mut SUBCLASS_FRAME95: Option<(usize, usize)> = None;
 
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
 // TEMPORARY Win95 diagnosis: raw file marker (std::fs is broken on 9x).
+//
+// The path honours the same CORRO_WIN95_LOG override as the rest of the
+// rust9x diagnostics, so a bring-up harness that points the log at a writable
+// volume sees these marks too. Hardcoding c:\gcorro.log here sent every
+// window-proc mark to the (read-only) live CD, where it was lost - which is
+// why the subclass-trampoline trace looked empty while the app was actually
+// faulting inside present(). Read here rather than through corro's
+// debug_log: this crate is a dependency of corro, so it cannot name it.
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
 pub(crate) unsafe fn mark95w(s: &[u8]) {
     use winapi::um::fileapi::{CreateFileA, SetFilePointer, WriteFile, OPEN_ALWAYS};
@@ -1200,7 +1208,21 @@ pub(crate) unsafe fn mark95w(s: &[u8]) {
     use winapi::um::winnt::{GENERIC_WRITE, FILE_SHARE_READ, FILE_ATTRIBUTE_NORMAL, HANDLE};
     use winapi::shared::minwindef::{DWORD, LPCVOID, LPDWORD};
     use winapi::um::winnt::LPCSTR;
-    let h: HANDLE = CreateFileA(b"c:\\gcorro.log\0".as_ptr() as LPCSTR,
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Vec<u8>> = OnceLock::new();
+    let path = PATH.get_or_init(|| {
+        let mut p = std::env::var("CORRO_WIN95_LOG")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "c:\\gcorro.log".to_string())
+            .into_bytes();
+        p.truncate(259);
+        p.push(0);
+        p
+    });
+    let h: HANDLE = CreateFileA(
+        path.as_ptr() as LPCSTR,
         GENERIC_WRITE, FILE_SHARE_READ, ptr::null_mut(), OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, ptr::null_mut());
     if h.is_null() || h == winapi::um::handleapi::INVALID_HANDLE_VALUE {

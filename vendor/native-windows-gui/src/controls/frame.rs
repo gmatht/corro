@@ -1,4 +1,4 @@
-use winapi::um::winuser::{WS_VISIBLE, WS_DISABLED, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT};
+use winapi::um::winuser::{WS_VISIBLE, WS_DISABLED, WS_BORDER, WS_CHILD, WS_EX_CONTROLPARENT};
 use crate::win32::window_helper as wh;
 use crate::win32::base_helper::check_hwnd;
 use crate::NwgError;
@@ -134,7 +134,15 @@ impl Frame {
 
     /// Winapi flags required by the control
     pub fn forced_flags(&self) -> u32 {
-        WS_CHILD | WS_CLIPCHILDREN
+        // (Fix-ReactOS) Do NOT set WS_CLIPCHILDREN. On Windows it only clips
+        // the parent's own painting to the window rect minus its children; the
+        // children still paint. On ReactOS the flag instead suppresses the
+        // painting of child windows altogether: a canvas parented to a Frame
+        // receives WM_PAINT and runs its whole draw callback (the log shows
+        // healthy paints) but none of its pixels are ever composited, so the
+        // grid area stays blank white. The Frame draws no background of its
+        // own, so the clip buys nothing here and costs the content.
+        WS_CHILD
     }
 
 }

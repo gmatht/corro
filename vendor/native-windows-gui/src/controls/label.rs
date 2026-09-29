@@ -253,7 +253,18 @@ impl Label {
         // (Fix-ReactOS) Break the WM_SIZE -> SetWindowPos(FRAMECHANGED) ->
         // WM_NCCALCSIZE -> WM_SIZE loop (see text_input.rs): only re-assert
         // the frame when the size actually changed.
+        //
+        // A size guard alone is not enough. ReactOS re-fires WM_SIZE from
+        // SetWindowPos(SWP_FRAMECHANGED) with a *recomputed* client rect, and
+        // that rect can differ by a pixel or two on each pass (the frame
+        // rounding is not idempotent), so consecutive WM_SIZE values keep
+        // alternating and the guard never sees two identical ones - the loop
+        // runs until the stack dies. Bound the number of frame re-assertions
+        // per control as well: a couple of passes is enough for a settled
+        // layout, and giving up just leaves the frame as ReactOS last laid it
+        // out, which is strictly better than a livelock.
         let last_size = std::cell::Cell::new((-1i32, -1i32));
+        let reassigns = std::cell::Cell::new(0u32);
         let handler1 = bind_raw_event_handler_inner(&self.handle, 0, move |hwnd, msg, w, l| {
             match msg {
                 WM_NCCALCSIZE  => {
@@ -345,14 +356,34 @@ impl Label {
                     let now = ((size & 0xffff) as i32, ((size >> 16) & 0xffff) as i32);
                     if last_size.get() != now {
                         last_size.set(now);
-                        // TEMPORARY ReactOS diagnosis: guard fired.
+                        // A changed size restarts the re-assert budget; an
+                        // unchanged one spends it. Once the budget is spent,
+                        // stop re-asserting the frame: a ReactOS that keeps
+                        // returning a slightly different recomputed rect
+                        // cannot drive this handler in a loop (see the note
+                        // on `reassigns` above).
+                        //
+                        // (Fix-ReactOS) On rust9x the frame does not need
+                        // re-asserting at all: the WM_NCCALCSIZE body above is
+                        // disabled on this target, so the frame ReactOS
+                        // computes is already the one we want. The
+                        // SetWindowPos(SWP_FRAMECHANGED) then does nothing but
+                        // make ReactOS re-run WM_NCCALCSIZE -> WM_GETFONT ->
+                        // WM_SIZE on the control, which re-enters this handler
+                        // and, because the recomputed rect is not perfectly
+                        // idempotent, never settles - an unbounded message
+                        // storm that livelocks the UI thread inside
+                        // present(). Skipping it is both correct and the only
+                        // way this control terminates there.
                         #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-                        crate::win32::window::mark95w(b"sz\n");
-                        SetWindowPos(hwnd, ptr::null_mut(), 0, 0, 0, 0, SWP_NOOWNERZORDER | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
-                    } else {
-                        // TEMPORARY ReactOS diagnosis: repeat suppressed.
-                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-                        crate::win32::window::mark95w(b"sk\n");
+                        {
+                            reassigns.set(reassigns.get() + 1);
+                        }
+                        #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+                        if reassigns.get() < 2 {
+                            reassigns.set(reassigns.get() + 1);
+                            SetWindowPos(hwnd, ptr::null_mut(), 0, 0, 0, 0, SWP_NOOWNERZORDER | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
+                        }
                     }
                 },
                 _ => {}

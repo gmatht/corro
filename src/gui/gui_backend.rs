@@ -5892,8 +5892,10 @@ fn on_formula_entry_changed(state: &GuiState) {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// TEMPORARY Win95 diagnosis: append bytes to c:\gcorro.log via raw
+/// TEMPORARY Win95 diagnosis: append bytes to the diagnostic log via raw
 /// CreateFileA (std::fs is broken on 9x: CreateFileW stub, error 120).
+/// The path comes from `corro::debug_log::win95_diag_log_path`, so a harness
+/// can redirect it to a writable volume.
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
 unsafe fn mark95(s: &[u8]) {
     use std::os::raw::c_void;
@@ -5904,7 +5906,8 @@ unsafe fn mark95(s: &[u8]) {
         fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, w: *mut u32, ov: *mut c_void) -> i32;
         fn CloseHandle(h: *mut c_void) -> i32;
     }
-    let h = CreateFileA(b"c:\\gcorro.log\0".as_ptr(), 0x4000_0000, 1,
+    let h = CreateFileA(
+        crate::debug_log::win95_diag_log_path().as_ptr(), 0x4000_0000, 1,
         std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
     if h.is_null() || h as isize == -1 {
         return;
@@ -5926,9 +5929,12 @@ unsafe fn probe95(hwnd: *mut std::os::raw::c_void, tag: [u8; 5]) {
         fn GetWindowRect(h: *mut c_void, r: *mut [i32; 4]) -> i32;
         fn IsWindowVisible(h: *mut c_void) -> i32;
         fn GetWindowTextLengthA(h: *mut c_void) -> i32;
+        // TEMPORARY ReactOS diagnosis: the window's own style, so WS_VISIBLE
+        // (0x10000000) and WS_CHILD (0x40000000) can be read directly.
+        fn GetWindowLongA(h: *mut c_void, i: i32) -> i32;
     }
     let hx = b"0123456789abcdef";
-    let mut msg = [0u8; 110];
+    let mut msg = [0u8; 160];
     let mut p = 0;
     for i in 0..5 { msg[p] = tag[i]; p += 1; }
     msg[p] = b' '; p += 1;
@@ -5946,6 +5952,13 @@ unsafe fn probe95(hwnd: *mut std::os::raw::c_void, tag: [u8; 5]) {
     msg[p] = b' '; p += 1;
     msg[p] = if IsWindowVisible(hwnd) != 0 { b'V' } else { b'h' }; p += 1;
     msg[p] = b' '; p += 1;
+    {
+        let style = GetWindowLongA(hwnd, -16); // GWL_STYLE
+        for sh in [28u32, 24, 20, 16, 12, 8, 4, 0] {
+            msg[p] = hx[((style as u32 >> sh) & 0xf) as usize]; p += 1;
+        }
+        msg[p] = b' '; p += 1;
+    }
     let mut r = [0i32; 4];
     GetWindowRect(hwnd, &mut r);
     for v in [r[0], r[1], r[2], r[3]] {
@@ -6661,6 +6674,16 @@ pub fn run_gui_with_movie(
     let _ = std::fs::write("/tmp/gui_setup_phase1.txt", "before_set_draw_callback\n");
     canvas.set_draw_callback(Box::new(move |dc: &mut dyn DrawContext, w: i32, h: i32| {
         eprintln!("DRAW_CALLBACK called: w={} h={}", w, h);
+        // TEMPORARY ReactOS diagnosis: prove the grid renderer actually runs
+        // (and how many times) instead of inferring it from a blank window.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        unsafe {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static DRAWS: AtomicU32 = AtomicU32::new(0);
+            if DRAWS.fetch_add(1, Ordering::Relaxed) < 16 {
+                mark95(b"draw\n");
+            }
+        }
         let _ = std::fs::write("/tmp/dim.txt", format!("{} {}\n", w, h));
         // Size the viewport from the live canvas every frame (cheap: a few
         // visible_col_indices passes) so the sheet always fills the canvas
@@ -6700,6 +6723,12 @@ pub fn run_gui_with_movie(
     log_ui_action("gui_started", &format!("title={}", env!("CARGO_PKG_VERSION")));
 
     win.set_child_box(&vbox);
+    // TEMPORARY Win95 diagnosis: setup reached the child box; the remaining
+    // marks bracket focus + present, the two steps that can still fault.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"m-setbox\n");
+    }
     // Grab focus on the formula entry BEFORE present() so the entry receives
     // initial keyboard focus when the window is mapped.  This ensures that
     // keystrokes from the external replayer (which detects the window during
@@ -6755,14 +6784,28 @@ pub fn run_gui_with_movie(
 
     update_formula_bar(&shared, shared.last_row.get(), shared.last_col.get());
     sync_tabbar(&shared);
+    // TEMPORARY Win95 diagnosis: locate the exact setup step that faults.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"m-prefocus\n");
+    }
     formula_entry.grab_focus();
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"m-postfocus\n");
+    }
     eprintln!("PHASE: about_to_present");
     win.present();
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"m-postpresent\n");
+    }
     // TEMPORARY Win95 diagnosis: probe each known window (parent/class/
     // rect/visible) to find where the controls really live.
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe {
         probe95(win.hwnd(), *b"main ");
+        probe95(*scrolled.as_ref(), *b"scrol");
         probe95(*formula_entry.inner.as_ref(), *b"entry");
         probe95(*canvas.inner.as_ref(), *b"canv ");
         probe95(*addr_label.inner.as_ref(), *b"label");
