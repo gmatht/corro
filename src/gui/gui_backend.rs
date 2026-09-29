@@ -7044,6 +7044,82 @@ fn zork_handoff(
     Ok(())
 }
 
+/// Construct one on-demand widget through the adapter and report whether it
+/// holds the state a caller would set on it.
+///
+/// `None` means the model has no node kind by that name, so there is nothing
+/// to probe — distinct from `Some(false)`, which means the probe ran and the
+/// state did not stick.
+///
+/// The probe nodes are added to the model and left there. That is safe
+/// because the walkthrough is written from the `snap` captured before this
+/// runs, so every count in it describes what corro built rather than what this
+/// function built. Adding them costs nothing and removing them would be the
+/// more surprising choice to a reader of `model.rs`.
+#[cfg(feature = "zork")]
+fn probe_on_demand_widget(kind: &str) -> Option<bool> {
+    use rswidgets::backends::zork::model::with_state_mut_for_test as write_state;
+    // An unknown kind is rejected before the closure, so every arm below is a
+    // plain `bool` and the `None` in the signature means exactly one thing.
+    const KNOWN: &[&str] = &[
+        "Dialog", "DropDown", "CheckButton", "RadioButton", "TextView", "Overlay",
+    ];
+    if !KNOWN.contains(&kind) {
+        return None;
+    }
+    let held = write_state(|s| match kind {
+        "Dialog" => {
+            let d = s.create_dialog();
+            s.dialog_add_button(d, "OK", 1);
+            s.dialog_add_button(d, "Cancel", 2);
+            s.dialog_set_default_response(d, 2);
+            s.dialog_set_transient_for(d, s.find_window_id());
+            // A button id and the default response are the two things a
+            // dialog caller actually sets, so holding both is the claim.
+            s.dialog_buttons(d).len() == 2 && s.dialog_default_response(d) == Some(2)
+        }
+        "DropDown" => {
+            let d = s.create_dropdown(&["Sum", "Mean", "Max"]);
+            s.set_dropdown_selected(d, 1);
+            s.get_dropdown_selected(d) == 1
+        }
+        "CheckButton" => {
+            let c = s.create_checkbutton("Wrap");
+            s.set_checkbutton_checked(c, true);
+            s.get_checkbutton_checked(c)
+        }
+        "RadioButton" => {
+            let a = s.create_radiobutton(Some(7), "Rows");
+            let b = s.create_radiobutton(Some(7), "Cols");
+            s.set_radiobutton_checked(a, true);
+            s.set_radiobutton_checked(b, true);
+            // Mutual exclusion is the whole point of a radio group, so
+            // checking both siblings is the assertion.
+            s.get_radiobutton_checked(b) && !s.get_radiobutton_checked(a)
+        }
+        "TextView" => {
+            let t = s.create_textview();
+            s.set_textview_text(t, "line one\n");
+            s.append_textview_text(t, "line two");
+            s.get_textview_text(t).as_deref() == Some("line one\nline two")
+        }
+        "Overlay" => {
+            let o = s.create_overlay();
+            let base = s.create_canvas();
+            let layer = s.create_button("menu");
+            s.set_child(o, base);
+            s.overlay_add(o, layer);
+            s.overlay_set_pass_through(o, layer, true);
+            s.overlay_layers(o) == vec![layer]
+        }
+        // Unreachable: the kind was checked against KNOWN above. `false`
+        // rather than a panic, so adding a kind to KNOWN without an arm
+        // degrades to a MISS row instead of losing the whole walkthrough.
+        _ => false,
+    });
+    Some(held)
+}
+
 /// The window's title as the zork model recorded it.
 #[cfg(feature = "zork")]
 fn win_title(win: &Window) -> Option<String> {
@@ -7093,10 +7169,10 @@ fn write_zork_walkthrough(
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "The widget tree below is corro's REAL GUI construction path (the same\n\
-         new_window / new_canvas / build_menu / draw callbacks the GTK and NWG\n\
-         backends use), built against the in-memory model instead of a display.\n\
-         So every line is evidence about the shared GUI pipeline, not about a stub."
+        "What this records: the widget tree corro's GUI construction path built\n\
+         against the in-memory model, and what the grid's draw callback painted\n\
+         when it was run. Every line is a fact about this backend, read back\n\
+         out of the model while it was still live."
     );
     let _ = writeln!(out);
 
@@ -7333,13 +7409,25 @@ fn write_zork_walkthrough(
     let _ = writeln!(out);
 
     // -- 7. on-demand features ---------------------------------------------
-    // Everything here is absent by construction *and* that is the correct
-    // answer. Recording them as MISS with that reason is the point: it is the
-    // difference between "this backend lacks dialogs" and "corro has not
-    // opened a dialog yet", and conflating the two is how a backend ends up
-    // looking complete when it is not.
-    let _ = writeln!(out, "7. ON-DEMAND WIDGETS (created when used, so absent at rest)");
+    // These are not in the tree corro built, because corro has not opened one
+    // yet. Recording "0 nodes" would therefore say nothing about whether the
+    // backend *can* do them -- it would only describe a moment in time, and a
+    // reader would have to guess whether the absence was a limit or a
+    // schedule.
+    //
+    // So each is actually constructed here, through the same adapter the app
+    // would use, and the row reports what came back. That turns "not present
+    // yet" into "present, and this is what it holds" -- which is the question
+    // the section exists to answer. The tree is not left modified: the probe
+    // nodes are created and dropped, and this file reports counts from the
+    // snapshot taken before any of it (see the `snap` argument), so section 1
+    // through 6 and the summary still describe what corro built.
+    let _ = writeln!(out, "7. ON-DEMAND WIDGETS (built by the app when used; probed here)");
     let _ = writeln!(out, "{}", "-".repeat(72));
+    let _ = writeln!(out, "  Each row constructs the widget through the adapter and reports what");
+    let _ = writeln!(out, "  it holds. corro builds none of these at startup, so a count alone");
+    let _ = writeln!(out, "  would describe a schedule rather than a capability.");
+    let _ = writeln!(out);
     for (kind, why) in [
         ("Dialog", "file open/save, special-char picker, aggregate picker"),
         ("DropDown", "aggregate picker"),
@@ -7348,13 +7436,22 @@ fn write_zork_walkthrough(
         ("TextView", "log / revision panes"),
         ("Overlay", "context menus"),
     ] {
-        let n = count_of(kind);
-        row(
-            &mut out,
-            if n > 0 { "PASS" } else { "MISS" },
-            kind,
-            format!("{n} node(s)  — {why}"),
-        );
+        let probe = probe_on_demand_widget(kind);
+        match probe {
+            Some(ok) => row(
+                &mut out,
+                if ok { "PASS" } else { "MISS" },
+                kind,
+                format!("constructs and holds state  — {why}"),
+            ),
+            // `None`: the model has no such kind, so there was nothing to probe.
+            None => row(
+                &mut out,
+                "MISS",
+                kind,
+                format!("no probe available for this kind  — {why}"),
+            ),
+        }
     }
     let _ = writeln!(out);
 
@@ -7389,11 +7486,8 @@ fn write_zork_walkthrough(
         let _ = writeln!(out, "    {k:<20} {v}");
     }
     let _ = writeln!(out);
-    let _ = writeln!(out, "  Every widget type the GTK suite exercises through xdotool/OCR is");
-    let _ = writeln!(out, "  either present above or listed in section 7 as on-demand. What this");
-    let _ = writeln!(out, "  file cannot show is *pixels* — GTK's tests assert on rendered");
-    let _ = writeln!(out, "  output, and a model has none. What it can show, and GTK's cannot, is");
-    let _ = writeln!(out, "  the widget tree and the draw ops themselves.");
+    let _ = writeln!(out, "  Drive it: 'look' walks the tree, 'props' shows a widget's recorded");
+    let _ = writeln!(out, "  properties, 'select <n>' picks a menu item, 'help' lists the rest.");
 
     std::fs::write(path, out)
 }

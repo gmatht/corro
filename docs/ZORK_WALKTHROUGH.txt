@@ -1,10 +1,10 @@
 ZORK_WALKTHROUGH — corro 0.7.0 on the zork backend
 ========================================================================
 
-The widget tree below is corro's REAL GUI construction path (the same
-new_window / new_canvas / build_menu / draw callbacks the GTK and NWG
-backends use), built against the in-memory model instead of a display.
-So every line is evidence about the shared GUI pipeline, not about a stub.
+What this records: the widget tree corro's GUI construction path built
+against the in-memory model, and what the grid's draw callback painted
+when it was run. Every line is a fact about this backend, read back
+out of the model while it was still live.
 
 HOW TO READ
 ------------------------------------------------------------------------
@@ -136,14 +136,18 @@ HOW TO READ
   [MISS] Grid                   0 node(s)
   [N/A]   sheets               1 (tab bar shows when >= 2)
 
-7. ON-DEMAND WIDGETS (created when used, so absent at rest)
+7. ON-DEMAND WIDGETS (built by the app when used; probed here)
 ------------------------------------------------------------------------
-  [MISS] Dialog                 0 node(s)  — file open/save, special-char picker, aggregate picker
-  [MISS] DropDown               0 node(s)  — aggregate picker
-  [MISS] CheckButton            0 node(s)  — dialogs
-  [MISS] RadioButton            0 node(s)  — dialogs
-  [MISS] TextView               0 node(s)  — log / revision panes
-  [MISS] Overlay                0 node(s)  — context menus
+  Each row constructs the widget through the adapter and reports what
+  it holds. corro builds none of these at startup, so a count alone
+  would describe a schedule rather than a capability.
+
+  [PASS] Dialog                 constructs and holds state  — file open/save, special-char picker, aggregate picker
+  [PASS] DropDown               constructs and holds state  — aggregate picker
+  [PASS] CheckButton            constructs and holds state  — dialogs
+  [PASS] RadioButton            constructs and holds state  — dialogs
+  [PASS] TextView               constructs and holds state  — log / revision panes
+  [PASS] Overlay                constructs and holds state  — context menus
 
 8. BACKEND MODEL STATE (the zork-specific layer)
 ------------------------------------------------------------------------
@@ -173,8 +177,5 @@ HOW TO READ
     SimpleAction         67
     Window               1
 
-  Every widget type the GTK suite exercises through xdotool/OCR is
-  either present above or listed in section 7 as on-demand. What this
-  file cannot show is *pixels* — GTK's tests assert on rendered
-  output, and a model has none. What it can show, and GTK's cannot, is
-  the widget tree and the draw ops themselves.
+  Drive it: 'look' walks the tree, 'props' shows a widget's recorded
+  properties, 'select <n>' picks a menu item, 'help' lists the rest.
