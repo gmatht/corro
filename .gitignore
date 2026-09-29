@@ -75,3 +75,11 @@ DerivedData/
 # standalone workspace, so its target/ is separate from the main one and
 # would otherwise show up as a large untracked tree.
 /macos/corro/target/
+
+# Editor scratch files. These are binary, are never wanted, and `git add -A`
+# will stage them without asking -- a swap file under docs/ was picked up by a
+# commit and refused as binary, which is the right outcome but a confusing way
+# to learn it. Ignore them at the root of every directory.
+*.swp
+*.swo
+*~

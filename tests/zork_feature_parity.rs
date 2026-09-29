@@ -81,15 +81,27 @@ fn corro_bin() -> PathBuf {
         .unwrap_or_else(|_| repo_root().join("target/debug/corro"))
 }
 
-/// Build the app for `--features zork` if the binary is missing or stale.
+/// Build the app for `--features zork`, once per test process.
 ///
 /// Without this the suite would fail with a confusing "No such file" for a
 /// feature set nobody has built in this session, which is exactly the trap that
 /// let zork sit broken for so long. Building here makes the failure mode the
 /// honest one: a compile error.
-fn ensure_binary() -> PathBuf {
+///
+/// It builds *unconditionally* rather than only when the binary is missing.
+/// The first version returned early if the file existed, which meant a stale
+/// binary from an earlier build kept being exercised: a probe deliberately
+/// broken in the generator still reported `PASS`, because the walkthrough came
+/// from a binary that predated the break. An existence check is not a freshness
+/// check, and for a test whose whole subject is "does the code under test still
+/// do this" the second is the one that matters. `OnceLock` keeps it to one
+/// build per process however many tests need it.
+fn ensure_binary() -> &'static PathBuf {
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
     let bin = corro_bin();
-    if bin.exists() {
+    let always = std::env::var_os("CORRO_TEST_ALLOW_STALE").is_some();
+    if bin.exists() && always {
         return bin;
     }
     let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
@@ -99,6 +111,7 @@ fn ensure_binary() -> PathBuf {
         .expect("run cargo build for the zork feature");
     assert!(status.success(), "cargo build --features zork failed");
     bin
+    })
 }
 
 /// Run the real app once and return the tree it built, plus the walkthrough text.
@@ -482,30 +495,42 @@ fn sheet_count_drives_the_tab_bar() {
 // 7. On-demand widgets (gui_special_picker.rs, gui_file_save_test.rs)
 // ---------------------------------------------------------------------------
 
-/// Dialogs, dropdowns, check/radio buttons, text views and overlays are built
-/// on demand. The GTK suite opens them by clicking; zork's tree has none at
-/// rest.
+/// The on-demand widget types are *probed*, not merely counted.
 ///
-/// The point of the test is that this is recorded as `MISS` **with a reason**,
-/// not silently omitted. "0 dialogs" and "the dialog backend does not exist"
-/// are different claims and the walkthrough must not conflate them — see
-/// `docs/ZORK_MISSING.md` for the features that are genuinely absent.
+/// corro builds none of them at startup, so a count of zero describes a
+/// schedule, not a capability: it cannot distinguish "this backend has no
+/// dialogs" from "the app has not opened one yet". The walkthrough therefore
+/// constructs each one through the adapter and reports whether it holds the
+/// state a caller would set, and this asserts that claim.
+///
+/// Asserting `PASS` for all six is the point -- a `MISS` here is a real gap,
+/// and it is exactly the claim the previous "report the absence" version of
+/// this test could not make.
 #[test]
-fn on_demand_widgets_are_reported_as_absent_with_a_reason() {
+fn on_demand_widgets_are_probed_and_hold_state() {
     let text = walkthrough();
     for kind in ["Dialog", "DropDown", "CheckButton", "RadioButton", "TextView", "Overlay"] {
+        // The mark is the verdict; the detail text is the same either way, so
+        // asserting on the text alone would accept a failing probe.
+        assert_pass(text, kind);
         let detail = row_detail(text, kind)
             .unwrap_or_else(|| panic!("the walkthrough must have a row for {kind}"));
         assert!(
-            detail.contains('—') || detail.contains("node(s)"),
-            "the {kind} row must say both the count and why: got {detail:?}"
+            detail.contains("constructs and holds state"),
+            "the {kind} row should say what the probe did: {detail:?}"
+        );
+        assert!(
+            detail.contains('—'),
+            "the {kind} row must also say what uses it, so a reader knows which \
+             feature depends on it: {detail:?}"
         );
     }
-    // The legend is what makes those rows honest, so it must be present in the
-    // same file the reader is looking at.
+    // The heading has to say these are probed, or a reader takes the rows for
+    // a count of what corro built.
     assert!(
-        text.contains("created when used") || text.contains("on demand"),
-        "section 7's heading must say these are created on demand"
+        text.contains("probed here"),
+        "section 7's heading must say the widgets are probed, not counted from \
+         the tree; otherwise the rows read as startup contents"
     );
 }
 
