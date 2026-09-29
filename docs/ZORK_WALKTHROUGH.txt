@@ -88,17 +88,27 @@ string that gets printed.
       5. _Sheet
       6. _Help
 
-    To the east: Menu
-    To the north: Menu
+    To the east: File Menu
+    To the north: File Menu
     To the south: Window "corro 0.7.0"
 
     You see:
       0. (yourself) Menu
-      1. Menu (east)
-      2. Menu (east)
+      1. File Menu (east)
+      2. File Menu (east)
       3. Window "corro 0.7.0" (south)
-      4. Menu
-      5. Menu
+      4. Export Menu
+      5. Width Menu
+      6. Edit Menu
+      7. Insert Menu
+      8. Format Menu
+      9. Scope Menu
+      10. Number Menu
+      11. Align Menu
+      12. Sheet Menu
+      13. Freeze Menu
+      14. Help Menu
+      15. SimpleAction
       ...
 
 The six items are corro's six top-level menus, in corro's own order, with the
@@ -115,9 +125,9 @@ the parent, east is the next sibling. It is the widget hierarchy, traversed.
 
     $ printf 'light\nnorth\ngo 1\n' | ./target/debug/corro
 
-    You move to Menu.
+    You move to File Menu.
 
-    You are at a Menu.
+    You are at the File Menu.
     Items:
       1. _New
       2. _Open file
@@ -129,29 +139,35 @@ the parent, east is the next sibling. It is the widget hierarchy, traversed.
       8. _Replay
       9. E_xit
 
-    To the east: Menu
-    To the north: Menu
+    To the east: Edit Menu
+    To the north: Export Menu
     To the south: Menu
 
-That is the File menu, with all nine of corro's items. `go <n>` numbers
-siblings first then children, so the numbering is the tree's, not the
-menu's -- that is worth knowing before you get lost:
+That is the File menu, with all nine of corro's items, and the three places
+you can go from it. The direction list names each one after the item that
+opened it, so "Edit Menu" is Edit, not a second File -- a menu node has no
+name of its own in the model, and the REPL takes it from the label of the
+item that leads to it.
+
+`go <n>` numbers siblings first then children, so the numbering is the tree's,
+not the menu's. With the menus now named, that map reads as a tree:
 
     $ for n in 1 2 3 4 5 6 7 8; do printf "go %-2s -> " $n; \
         printf "light\nnorth\ngo $n\n" | ./target/debug/corro \
-        | awk '/You move to/{f=1} f&&/^  1\./{print; exit}'; done
+        | grep -m1 "You move to"; done
 
-    go 1  ->   1. _New
-    go 2  ->   1. _TSV
-    go 3  ->   1. _Default width
-    go 4  ->   1. _Cut
-    go 5  ->   1. _Rows
-    go 6  ->   1. _Scope
-    go 7  ->   1. _All
-    go 8  ->   1. _Decimal (generic)
+    go 1  -> You move to File Menu.
+    go 2  -> You move to Export Menu.
+    go 3  -> You move to Width Menu.
+    go 4  -> You move to Edit Menu.
+    go 5  -> You move to Insert Menu.
+    go 6  -> You move to Format Menu.
+    go 7  -> You move to Scope Menu.
+    go 8  -> You move to Number Menu.
 
-`_Cut` is Edit, `_Rows` is Insert, `_Scope` is Format → Scope, `_TSV` is
-File → Export. All corro's real menus, reached by walking the tree.
+Those are all corro's real menus: File with its Export and Width
+sub-submenus, Edit, Insert, Format with Scope/Number/Align, Sheet with
+Freeze, and Help.
 
 ------------------------------------------------------------------------
 5. FIRING A MENU ACTION -- `select` dispatches the corro callback
@@ -159,9 +175,9 @@ File → Export. All corro's real menus, reached by walking the tree.
 
     $ printf 'light\nnorth\ngo 6\nlook\n' | ./target/debug/corro
 
-    You move to Menu.
+    You move to Format Menu.
 
-    You are at a Menu.
+    You are at the Format Menu.
     Items:
       1. _Scope
       2. _Number
@@ -234,11 +250,11 @@ in `docs/ZORK_MISSING.md`.
 
     $ printf 'light\nnorth\ngo 1\nback\ngo 6\ninventory\n' | ./target/debug/corro
 
-    You move to Menu.
+    You move to File Menu.
     ...
     You go back south.
     ...
-    You move to Menu.
+    You move to Format Menu.
     ...
     Current path:
       Window "corro 0.7.0"

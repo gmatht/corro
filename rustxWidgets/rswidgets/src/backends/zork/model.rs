@@ -245,6 +245,20 @@ pub struct ZorkNode {
     /// Overlay layers, in insertion order, and per-child pass-through flags.
     pub overlays: Vec<usize>,
     pub overlay_pass_through: HashMap<usize, bool>,
+    /// The menu item that opened this node, e.g. `"_File"` for the File
+    /// submenu.
+    ///
+    /// `ZorkKind::Menu` is a unit variant -- a menu node carries no name of
+    /// its own -- so without this every menu in a corro session printed as
+    /// "Menu", and the direction list degenerated to "To the east: Menu" for
+    /// all twenty of them. Set from the owning `MenuItemData`'s label, so it
+    /// is only ever `Some` for a submenu.
+    ///
+    /// This is display-only. It changes what the REPL calls a node and
+    /// nothing else: the tree shape, the parent/child links and the item
+    /// lists are untouched, because an earlier attempt to also de-duplicate
+    /// the re-materialised submenu nodes cost 53 menu items (132 -> 79).
+    pub menu_label: Option<String>,
 }
 
 /// The pointer and key callbacks a `Canvas`/`Entry` can carry.
@@ -448,6 +462,7 @@ impl ZorkState {
             destroyed: false,
             overlays: Vec::new(),
             overlay_pass_through: HashMap::new(),
+            menu_label: None,
         });
         if let Some(pid) = parent {
             if let Some(p) = self.nodes.iter_mut().find(|n| n.id == pid) {
@@ -516,17 +531,20 @@ impl ZorkState {
         self.menu_items.insert(bar_id, items);
         // Re-materialise one `Menu` node per submenu so the bar has navigable
         // children (the REPL walks the tree).
-        let nested: Vec<Vec<MenuItemData>> = self
+        let nested: Vec<(String, Vec<MenuItemData>)> = self
             .menu_items
             .get(&bar_id)
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|i| i.submenu)
+            .filter_map(|i| i.submenu.map(|s| (i.label, s)))
             .collect();
-        for sub_items in nested {
+        for (label, sub_items) in nested {
             let sub_id = self.add_node(ZorkKind::Menu, Some(bar_id));
             self.menu_items.insert(sub_id, sub_items);
+            if let Some(n) = self.node_mut(sub_id) {
+                n.menu_label = Some(label);
+            }
         }
         bar_id
     }
@@ -698,6 +716,9 @@ impl ZorkState {
         item.submenu = self.menu_items.get(&submenu_id).cloned();
         if let Some(n) = self.node_mut(submenu_id) {
             n.parent = Some(menu_id);
+            // Name the submenu after the item that opened it, so the REPL can
+            // say "To the north: Edit Menu" instead of a bare "Menu".
+            n.menu_label = Some(label.to_string());
         }
         if let Some(p) = self.node_mut(menu_id) {
             if !p.children.contains(&submenu_id) {

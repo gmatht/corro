@@ -85,6 +85,25 @@ impl BackendApp for ZorkApp {
     }
 }
 
+/// Strip a menu label's accelerator marker, so `_File` reads as "File".
+///
+/// corro writes the mnemonic as an underscore anywhere in the label: `_File`
+/// is Alt+F, `Fo_rmat` is Alt+O. The direction list names places for a human,
+/// so the marker has to go. Every underscore is dropped except a trailing one,
+/// which is never a mnemonic (a label cannot end mid-mnemonic) and would turn
+/// `_File_` into `File` rather than mangling it.
+fn menu_label_plain(label: &str) -> String {
+    let chars: Vec<char> = label.chars().collect();
+    let mut out = String::with_capacity(label.len());
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '_' && i + 1 < chars.len() {
+            continue;
+        }
+        out.push(*c);
+    }
+    out
+}
+
 fn short_desc(_state: &ZorkState, node: &ZorkNode) -> String {
     match &node.kind {
         ZorkKind::Window { title } => format!("Window \"{}\"", title),
@@ -111,8 +130,14 @@ fn short_desc(_state: &ZorkState, node: &ZorkNode) -> String {
         ZorkKind::Fixed => "Fixed".into(),
         ZorkKind::Application => "Application".into(),
         ZorkKind::Spreadsheet { .. } => "Spreadsheet".into(),
-        ZorkKind::Menu => "Menu".into(),
-        ZorkKind::MenuBar => "MenuBar".into(),
+        ZorkKind::Menu => match &node.menu_label {
+            Some(label) => format!("{} Menu", menu_label_plain(label)),
+            None => "Menu".into(),
+        },
+        ZorkKind::MenuBar => match &node.menu_label {
+            Some(label) => format!("{} Menu", menu_label_plain(label)),
+            None => "MenuBar".into(),
+        },
         ZorkKind::SimpleAction => "SimpleAction".into(),
     }
 }
@@ -242,7 +267,10 @@ fn describe_room_lit(state: &ZorkState, node: &ZorkNode) {
             println!("You are in a Grid layout.");
         }
         ZorkKind::MenuBar => {
-            println!("You are at a MenuBar.");
+            match &node.menu_label {
+                Some(label) => println!("You are at the {}.", menu_label_plain(label)),
+                None => println!("You are at a MenuBar."),
+            }
             let items = state.menu_items.get(&node.id).cloned().unwrap_or_default();
             if !items.is_empty() {
                 println!("Menu items:");
@@ -252,7 +280,10 @@ fn describe_room_lit(state: &ZorkState, node: &ZorkNode) {
             }
         }
         ZorkKind::Menu => {
-            println!("You are at a Menu.");
+            match &node.menu_label {
+                Some(label) => println!("You are at the {} Menu.", menu_label_plain(label)),
+                None => println!("You are at a Menu."),
+            }
             let items = state.menu_items.get(&node.id).cloned().unwrap_or_default();
             if !items.is_empty() {
                 println!("Items:");
@@ -1080,5 +1111,36 @@ fn examine(state: &mut ZorkState, id: usize) {
         }
     } else {
         println!("Nothing to examine.");
+    }
+}
+
+
+#[cfg(test)]
+mod menu_label_tests {
+    use super::menu_label_plain;
+
+    /// corro writes a menu mnemonic as an underscore anywhere in the label.
+    /// The direction list names places for a human, so it has to come out the
+    /// other side. Both positions occur in corro's real menu: `_File` is a
+    /// leading one, `Fo_rmat` an interior one.
+    #[test]
+    fn accelerator_underscores_are_stripped() {
+        assert_eq!(menu_label_plain("_File"), "File");
+        assert_eq!(menu_label_plain("Fo_rmat"), "Format");
+        assert_eq!(menu_label_plain("S_ave as"), "Save as");
+        assert_eq!(menu_label_plain("E_xit"), "Exit");
+        assert_eq!(menu_label_plain("Edi_t in Text Editor"), "Edit in Text Editor");
+    }
+
+    /// A label with no mnemonic must pass through unchanged, and a trailing
+    /// underscore is not a mnemonic -- a label cannot end mid-mnemonic -- so
+    /// it is kept rather than silently eating the last character.
+    #[test]
+    fn labels_without_mnemonics_are_untouched() {
+        assert_eq!(menu_label_plain("Sheet"), "Sheet");
+        assert_eq!(menu_label_plain("TSV"), "TSV");
+        assert_eq!(menu_label_plain("ASCII table"), "ASCII table");
+        assert_eq!(menu_label_plain(""), "");
+        assert_eq!(menu_label_plain("Trailing_"), "Trailing_");
     }
 }
