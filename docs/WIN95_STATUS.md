@@ -1,8 +1,10 @@
 # corro's GUI on Windows 95 — where it stands
 
-Status: **starts, creates its window and canvas, paints once at 1×1, then
-aborts.** The grid is not visible. This is a bring-up note, not a claim that
-it works.
+Status: **starts, creates its window and canvas, and now survives to the end
+of the layout pass - but every child is still laid out at zero width, so the
+grid is not visible.** The stderr panic that used to kill the process is
+fixed (`cd5abc81`); the zero-width layout is the remaining problem. This is a
+bring-up note, not a claim that it works.
 
 Raw evidence from the first successful instrumented run is kept beside this
 file:
@@ -59,7 +61,7 @@ The canvas therefore paints into a **1×1** region:
 
 which is why the window is grey with no content: there is nothing to draw into.
 
-### 2. The app then aborts on a stderr write
+### 2. The app then aborted on a stderr write (FIXED - see below)
 
     PANIC std/src/io/stdio.rs: failed printing to stderr:
           FormatMessageW() returned error 120
