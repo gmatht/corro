@@ -393,16 +393,18 @@ fn win95_args() -> Vec<String> {
 #[allow(unused_assignments)]
 /// Parse the CLI's flags.
 ///
-/// Gated with the rest of the CLI: the wasm entry point reads `argv[1]` as a
-/// single workbook path and never parses flags, and the body below resolves a
-/// `determine_default_ui` for the `--ui` choice, which has no wasm arm (its
-/// `UiKind::Gui` variant needs `feature = "gui"`, which `--features wasm` does
-/// not enable). Without the gate this compiled on wasm and failed to resolve
-/// that name.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    not(all(target_family = "rust9x", target_env = "msvc"))
-))]
+/// Gated for wasm only, like every other CLI item here: the wasm entry point
+/// reads `argv[1]` as a single workbook path and never parses flags, and the
+/// body below resolves a `determine_default_ui` for the `--ui` choice, which
+/// has no wasm arm (its `UiKind::Gui` variant needs `feature = "gui"`, which
+/// `--features wasm` does not enable). Without the gate this compiled on wasm
+/// and failed to resolve that name.
+///
+/// Deliberately NOT gated on rust9x: the Win95 builds call `corro_main` ->
+/// `try_main` -> here, and it already handles that target - `cli_args`
+/// resolves to the `GetCommandLineA` shim and `argv0` to `win95_args` below,
+/// since `std::env::args()` cannot work on Windows 95.
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_args() -> Result<Args, String> {
     let mut revision = None;
     let mut export = None;
@@ -900,15 +902,19 @@ fn main() {
 
 /// The CLI entry point's body.
 ///
-/// Gated to match the `main` that calls it (above). Without this the wasm
-/// build compiled the whole CLI as dead code and then failed on `try_main`
-/// -- itself `#[cfg(not(target_arch = "wasm32"))]`, because the wasm entry
-/// point never parses argv the same way -- and on `UiKind::Gui`, which is
-/// `#[cfg(feature = "gui")]` and so does not exist under `--features wasm`.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    not(all(target_family = "rust9x", target_env = "msvc"))
-))]
+/// Gated for wasm only: the wasm entry point builds a `gui::App` straight from
+/// `argv[1]` and never parses flags, so `try_main` (itself
+/// `#[cfg(not(target_arch = "wasm32"))]`) and `UiKind::Gui` (which needs
+/// `feature = "gui"`, absent under `--features wasm`) would not resolve.
+///
+/// It must NOT also be excluded on rust9x. Both Win95 entry points above
+/// (`main` for the console build, `WinMain` for the GUI-subsystem build) call
+/// this function, so a `not(rust9x)` arm compiles the callers and drops the
+/// callee: "cannot find function `corro_main`", and with it `parse_args`,
+/// which `try_main` needs. That gate was an artefact of how this function was
+/// introduced - the `#[cfg]` that commit placed belongs to the `main` above
+/// it - and it made both Win95 builds fail to compile.
+#[cfg(not(target_arch = "wasm32"))]
 fn corro_main() {
     // Log every panic to a file as well as stderr: release profiles use
     // panic="abort" (silent death, no message), and GUI launches often
