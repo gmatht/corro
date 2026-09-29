@@ -22,7 +22,14 @@
 
 #[cfg(feature = "ratatui")]
 use corro::ui::App as TuiApp;
-#[cfg(any(feature = "gui", feature = "gui-core", feature = "pancurses"))]
+// `GuiApp` is named only by the CLI paths below (`corro_main`/`try_main`),
+// which are compiled out on wasm -- the wasm entry point builds its own `App`
+// in `fn main`. Gated on the same condition as the `PathBuf` import below so
+// a `--features wasm` build does not carry an import nothing reads.
+#[cfg(all(
+    any(feature = "gui", feature = "gui-core", feature = "pancurses"),
+    not(target_arch = "wasm32")
+))]
 use corro::gui::App as GuiApp;
 // `PathBuf` is named by the CLI items below (`Args::files`, the export
 // helpers). The wasm entry point builds its one path with a fully-qualified
