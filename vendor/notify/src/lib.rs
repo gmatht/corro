@@ -170,6 +170,12 @@ use std::path::Path;
 
 pub(crate) type Receiver<T> = std::sync::mpsc::Receiver<T>;
 pub(crate) type Sender<T> = std::sync::mpsc::Sender<T>;
+// A bounded channel is driven by the Windows and inotify backends (one slot,
+// so a watcher event cannot queue behind a slow handler). macOS's fsevent
+// backend uses an unbounded one, so gating the alias and its constructor to
+// `not(target_os = "macos")` keeps that build from warning about two items it
+// can never name — while leaving the two backends that do use them intact.
+#[cfg(not(target_os = "macos"))]
 pub(crate) type BoundSender<T> = std::sync::mpsc::SyncSender<T>;
 
 #[inline]
@@ -177,6 +183,7 @@ pub(crate) fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
     std::sync::mpsc::channel()
 }
 
+#[cfg(not(target_os = "macos"))]
 #[inline]
 pub(crate) fn bounded<T>(cap: usize) -> (BoundSender<T>, Receiver<T>) {
     std::sync::mpsc::sync_channel(cap)

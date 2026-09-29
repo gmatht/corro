@@ -916,6 +916,32 @@ impl Dialog {
     pub fn add_button(&self, label: &str, response_id: i32) {
         crate::backends::zork::dialog_add_button(self.id, label, response_id);
     }
+    /// Measure the dialog before it opens.
+    ///
+    /// GTK and NWG have a real `layout_dialog` because a dialog that opens at
+    /// the height of nothing shows its content a frame late. The zork model has
+    /// no compositor, so there is nothing to measure — but the model *can*
+    /// record the size its children asked for, which is what a caller laying
+    /// the dialog out itself actually needs to read back. So this is a real
+    /// operation (it returns the measured content extent) rather than a no-op.
+    pub fn layout_dialog(&self) {
+        let (w, h) = crate::backends::zork::measure_dialog(self.id).unwrap_or((0, 0));
+        crate::backends::zork::set_size_request(self.id, w, h);
+    }
+    /// The dialog's content extent, or `None` if it has no children.
+    pub fn measure_dialog(&self) -> Option<(i32, i32)> {
+        crate::backends::zork::measure_dialog(self.id)
+    }
+    /// Run the dialog and return the response id.
+    ///
+    /// There is no nested event loop here (the same situation as the Android
+    /// adapter): presenting is a state change, and without an input source
+    /// there is nothing to wait for. The default response is returned, which is
+    /// what a caller with no way to click a button should see.
+    pub fn run(&self) -> i32 {
+        self.present();
+        crate::backends::zork::dialog_default_response(self.id).unwrap_or(0)
+    }
     pub fn set_default_response(&self, response_id: i32) {
         crate::backends::zork::dialog_set_default_response(self.id, response_id);
     }

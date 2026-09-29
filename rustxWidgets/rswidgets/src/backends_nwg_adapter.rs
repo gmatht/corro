@@ -2112,6 +2112,17 @@ mod nwg_adapter {
                 }
             }
         }
+        /// The container a dialog's children are added to.
+        ///
+        /// A Win32 dialog has no content-area view the way `GtkDialog` does:
+        /// `append_content_area` reparents each child's HWND straight to the
+        /// dialog window and `layout_dialog` stacks them, so the dialog's own
+        /// HWND *is* the content area. Returning it (rather than null) is what
+        /// lets a caller measure or resize the area it was handed.
+        pub fn get_content_area(&self) -> *mut c_void {
+            self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
+        }
+
         pub fn append_content_area(&self, child: &impl Appendable) {
             for &ptr in &child.collect_hwnds() {
                 if !ptr.is_null() {

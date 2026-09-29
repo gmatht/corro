@@ -50,7 +50,7 @@ mod macos_adapter {
 
     use crate::backends::apple::{
         self as core_apple, alloc_init, cls, msg0, msg0i, msg0v, msg1bv, msg1cv, msg1i, msg1iv,
-        msg1v, msg4cv, nsstring, nsstring_to_rust, own, Kind, WidgetMeta,
+        msg1v, msg2cv, msg4cv, nsstring, nsstring_to_rust, own, Kind, WidgetMeta,
     };
     use crate::core::{DrawContext, Error, Widget};
 
@@ -655,6 +655,23 @@ mod macos_adapter {
 
         pub fn set_hexpand(&self, expand: bool) {
             core_apple::set_view_expanding(self.0, expand);
+        }
+
+        /// Size the stack view.
+        ///
+        /// `NSStackView` distributes along its axis by default, so an explicit
+        /// size request only matters when the caller is pinning the box
+        /// (a toolbar strip that must stay one row tall). Sent through the
+        /// host shim rather than dropped, so a pinned box is honoured where the
+        /// shim provides it.
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if self.0.is_null() {
+                return;
+            }
+            // A negative request means "unconstrained" on the GTK contract;
+            // AppKit's frame takes floats, so pass them straight through rather
+            // than clamping and silently showing a different size.
+            unsafe { msg2cv(self.0, "setFrameSize:", w as f64, h as f64) };
         }
     }
 
@@ -2160,6 +2177,57 @@ mod macos_adapter {
 
         pub fn set_default_response(&self, _response_id: i32) {}
         pub fn close(&self) {}
+
+        /// Measure the alert before it opens.
+        ///
+        /// `NSAlert` sizes itself from its message text and buttons, so there
+        /// is no separate layout pass to run — presenting already lays it out.
+        /// Kept because the shared `common::Dialog` forwards it and a caller
+        /// written for GTK/NWG calls it unconditionally.
+        pub fn layout_dialog(&self) {}
+
+        /// Show or hide without dismissing. `close` ends the alert, so this is
+        /// a different operation, not an alias. `orderOut:` hides an `NSAlert`
+        /// without ending its modal session, which is exactly the distinction.
+        pub fn set_visible(&self, visible: bool) {
+            if self.0.is_null() {
+                return;
+            }
+            unsafe { msg0v(self.0, if visible { "orderFront:nil" } else { "orderOut:nil" }) };
+        }
+
+        /// The container a dialog's children are added to. `NSAlert` has no
+        /// content-area view of its own — the host shim builds one and owns it —
+        /// so there is nothing to hand back here.
+        pub fn get_content_area(&self) -> *mut c_void { std::ptr::null_mut() }
+
+        /// Run the alert modally and return the response id.
+        ///
+        /// Unlike the Android adapter, macOS *does* have a nested loop:
+        /// `runModal` blocks until the alert is dismissed, and the host shim's
+        /// `corroPresentDialog:` picks `runModal` (standalone) or
+        /// `beginSheetModalForWindow:` (sheet) for us.
+        pub fn run(&self) -> i32 {
+            if self.0.is_null() {
+                return 0;
+            }
+            match core_apple::view_controller() {
+                Some(vc) => {
+                    raw_send!(
+                        vc,
+                        "corroPresentDialog:",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> (),
+                        (self.0)
+                    );
+                    // The shim does not report which button was clicked, so
+                    // the caller gets the neutral 0 rather than a guess.
+                    0
+                }
+                None => {
+                    unsafe { msg0i(self.0, "runModal") as i32 }
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------

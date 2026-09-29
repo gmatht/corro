@@ -230,6 +230,24 @@ pub unsafe fn msg1cv(obj: *mut std::os::raw::c_void, selname: &str, v: f64) {
     unsafe { f(obj, sel(selname), v as f32) }
 }
 
+/// `void (*)(id, SEL, CGFloat, CGFloat)` — two doubles, for a `CGSize` or
+/// `CGPoint` argument. `CGFloat` is `float` on 32-bit and `double` on 64-bit,
+/// so the width is selected at compile time exactly as in `msg4cv` below.
+#[cfg(target_pointer_width = "64")]
+pub unsafe fn msg2cv(obj: *mut std::os::raw::c_void, selname: &str, a: f64, b: f64) {
+    let f: unsafe extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void, f64, f64) =
+        unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel(selname), a, b) }
+}
+
+/// 32-bit (armv7s) `CGFloat` is `float`.
+#[cfg(target_pointer_width = "32")]
+pub unsafe fn msg2cv(obj: *mut std::os::raw::c_void, selname: &str, a: f64, b: f64) {
+    let f: unsafe extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void, f32, f32) =
+        unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel(selname), a as f32, b as f32) }
+}
+
 /// `void (*)(id, SEL, CGFloat, CGFloat, CGFloat, CGFloat)`. `CGFloat` is
 /// `float` on 32-bit and `double` on 64-bit — the single most important
 /// ABI difference between the arm64 and armv7s builds, so it is selected

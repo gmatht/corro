@@ -381,7 +381,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
                         ) {
                             let c = std::ffi::CString::new("test-fuzz").unwrap();
                             let ctx = get_ctx(ptr);
-                            if !ctx.is_null() { add_cls(ctx, c.as_ptr()); }
+                            if !ctx.is_null() { add_cls(ctx, c.as_ptr() as *const u8); }
                         }
                     }
                 }

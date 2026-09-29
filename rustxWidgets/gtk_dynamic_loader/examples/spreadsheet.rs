@@ -168,21 +168,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let syms_ref = syms_arc.as_ref();
                     let syms_for_closure = syms_arc.clone();
                     let left_k = syms_for_closure.gdk_keyval_from_name.map(|f| unsafe { 
-                        let n = std::ffi::CString::new("Left").unwrap(); f(n.as_ptr())
+                        let n = std::ffi::CString::new("Left").unwrap(); f(n.as_ptr() as *const u8)
                     }).unwrap_or(65361);
                     let right_k = syms_for_closure.gdk_keyval_from_name.map(|f| unsafe { 
-                        let n = std::ffi::CString::new("Right").unwrap(); f(n.as_ptr())
+                        let n = std::ffi::CString::new("Right").unwrap(); f(n.as_ptr() as *const u8)
                     }).unwrap_or(65363);
                     let up_k = syms_for_closure.gdk_keyval_from_name.map(|f| unsafe { 
-                        let n = std::ffi::CString::new("Up").unwrap(); f(n.as_ptr())
+                        let n = std::ffi::CString::new("Up").unwrap(); f(n.as_ptr() as *const u8)
                     }).unwrap_or(65362);
                     let down_k = syms_for_closure.gdk_keyval_from_name.map(|f| unsafe { 
-                        let n = std::ffi::CString::new("Down").unwrap(); f(n.as_ptr())
+                        let n = std::ffi::CString::new("Down").unwrap(); f(n.as_ptr() as *const u8)
                     }).unwrap_or(65364);
                     let _ = unsafe { connect_signal_bool(syms_ref, instance, "key-press-event", Box::new(move |ev: *mut std::os::raw::c_void| -> i32 {
                         if let Some(get_keyval) = syms_for_closure.gdk_event_get_keyval {
                             let mut kv = 0u32;
-                            unsafe { get_keyval(ev, &mut kv); }
+                            get_keyval(ev, &mut kv);
                             match kv {
                                 k if k == left_k => { if c_idx > 0 { grid_for_key[r_idx][c_idx-1].grab_focus(); return 1; } }
                                 k if k == right_k => { if c_idx + 1 < grid_for_key[r_idx].len() { grid_for_key[r_idx][c_idx+1].grab_focus(); return 1; } }
@@ -215,7 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unsafe {
                 let provider = provider_ctor();
                 let css = b"\n.entry { padding: 4px; }\n.cell-divider { border: 0.5px solid #e0e0e0; }\n.row-divider { border-bottom: 0.5px solid #e0e0e0; }\n.negative { color: #cc0000; }\n.trueval { font-weight: bold; }\n.header { font-weight: bold; }\n.row-marker { color: #666666; }\n";
-                let _ = load_from_data(provider, css.as_ptr() as *const i8, css.len() as isize, std::ptr::null_mut());
+                let _ = load_from_data(provider, css.as_ptr() as *const u8, css.len() as isize, std::ptr::null_mut());
                 for r in 0..grid_cells.len() {
                     for c in 0..grid_cells[r].len() {
                         let e = &grid_cells[r][c];
@@ -269,7 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let title = std::ffi::CString::new("Open TSV").unwrap();
                     let accept = std::ffi::CString::new("Open").unwrap();
                     let cancel = std::ffi::CString::new("Cancel").unwrap();
-                    let native = chooser_new(title.as_ptr(), std::ptr::null_mut(), 0, accept.as_ptr(), cancel.as_ptr());
+                    let native = chooser_new(title.as_ptr() as *const u8, std::ptr::null_mut(), 0, accept.as_ptr() as *const u8, cancel.as_ptr() as *const u8);
                     if native.is_null() { return; }
                     let res = native_run(native);
                     if res == 0 {
@@ -277,7 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         let fname = get_filename(native);
                         if !fname.is_null() {
-                            let c = std::ffi::CStr::from_ptr(fname);
+                            let c = std::ffi::CStr::from_ptr(fname as *const std::os::raw::c_char);
                             let path = c.to_string_lossy().into_owned();
                             gfree(fname as *mut std::os::raw::c_void);
                             destroy_widget(native);
@@ -329,7 +329,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let title = std::ffi::CString::new("Save TSV").unwrap();
                     let accept = std::ffi::CString::new("Save").unwrap();
                     let cancel = std::ffi::CString::new("Cancel").unwrap();
-                    let native = chooser_new(title.as_ptr(), std::ptr::null_mut(), 0, accept.as_ptr(), cancel.as_ptr());
+                    let native = chooser_new(title.as_ptr() as *const u8, std::ptr::null_mut(), 0, accept.as_ptr() as *const u8, cancel.as_ptr() as *const u8);
                     if native.is_null() { return; }
                     let res = native_run(native);
                     if res == 0 {
@@ -337,7 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         let fname = get_filename(native);
                         if !fname.is_null() {
-                            let c = std::ffi::CStr::from_ptr(fname);
+                            let c = std::ffi::CStr::from_ptr(fname as *const std::os::raw::c_char);
                             let path = c.to_string_lossy().into_owned();
                             gfree(fname as *mut std::os::raw::c_void);
                             destroy_widget(native);
@@ -386,18 +386,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             let id_c = std::ffi::CString::new("org.example.SpreadsheetDemo").unwrap();
             unsafe {
-                let app_ptr2 = gtk_application_new(id_c.as_ptr(), 0);
+                let app_ptr2 = gtk_application_new(id_c.as_ptr() as *const u8, 0);
                 if !app_ptr2.is_null() {
                     let menu = g_menu_new();
-                    let act_open = g_simple_action_new(std::ffi::CString::new("open").unwrap().as_ptr(), std::ptr::null_mut());
+                    let act_open = g_simple_action_new(std::ffi::CString::new("open").unwrap().as_ptr() as *const u8, std::ptr::null_mut());
                     g_action_map_add_action(app_ptr2, act_open);
-                    g_menu_append(menu, std::ffi::CString::new("Open").unwrap().as_ptr(), std::ffi::CString::new("app.open").unwrap().as_ptr());
-                    let act_save = g_simple_action_new(std::ffi::CString::new("save").unwrap().as_ptr(), std::ptr::null_mut());
+                    g_menu_append(menu, std::ffi::CString::new("Open").unwrap().as_ptr() as *const u8, std::ffi::CString::new("app.open").unwrap().as_ptr() as *const u8);
+                    let act_save = g_simple_action_new(std::ffi::CString::new("save").unwrap().as_ptr() as *const u8, std::ptr::null_mut());
                     g_action_map_add_action(app_ptr2, act_save);
-                    g_menu_append(menu, std::ffi::CString::new("Save").unwrap().as_ptr(), std::ffi::CString::new("app.save").unwrap().as_ptr());
-                    let act_quit = g_simple_action_new(std::ffi::CString::new("quit").unwrap().as_ptr(), std::ptr::null_mut());
+                    g_menu_append(menu, std::ffi::CString::new("Save").unwrap().as_ptr() as *const u8, std::ffi::CString::new("app.save").unwrap().as_ptr() as *const u8);
+                    let act_quit = g_simple_action_new(std::ffi::CString::new("quit").unwrap().as_ptr() as *const u8, std::ptr::null_mut());
                     g_action_map_add_action(app_ptr2, act_quit);
-                    g_menu_append(menu, std::ffi::CString::new("Quit").unwrap().as_ptr(), std::ffi::CString::new("app.quit").unwrap().as_ptr());
+                    g_menu_append(menu, std::ffi::CString::new("Quit").unwrap().as_ptr() as *const u8, std::ffi::CString::new("app.quit").unwrap().as_ptr() as *const u8);
                     g_application_set_app_menu(app_ptr2, menu);
 
                     if !act_open.is_null() {
@@ -415,35 +415,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 syms.gtk_widget_destroy,
                                 syms.g_free,
                             ) {
-                                unsafe {
-                                    let title = std::ffi::CString::new("Open TSV").unwrap();
-                                    let accept = std::ffi::CString::new("Open").unwrap();
-                                    let cancel = std::ffi::CString::new("Cancel").unwrap();
-                                    let native = chooser_new(title.as_ptr(), std::ptr::null_mut(), 0, accept.as_ptr(), cancel.as_ptr());
-                                    if native.is_null() { return; }
-                                    let res = native_run(native);
-                                    if res == 0 { destroy_widget(native); }
-                                    else {
-                                        let fname = get_filename(native);
-                                        if !fname.is_null() {
-                                            let c = std::ffi::CStr::from_ptr(fname);
-                                            let path = c.to_string_lossy().into_owned();
-                                            gfree(fname as *mut std::os::raw::c_void);
-                                            destroy_widget(native);
-                                            if let Ok(mut f) = File::open(path) {
-                                                let mut s = String::new();
-                                                if f.read_to_string(&mut s).is_ok() {
-                                                    for (r, line) in s.lines().enumerate() {
-                                                        for (c, cell) in line.split('\t').enumerate() {
-                                                            if r < grid_for_act.len() && c < grid_for_act[r].len() {
-                                                                grid_for_act[r][c].set_text(cell);
-                                                            }
+                                let title = std::ffi::CString::new("Open TSV").unwrap();
+                                let accept = std::ffi::CString::new("Open").unwrap();
+                                let cancel = std::ffi::CString::new("Cancel").unwrap();
+                                let native = chooser_new(title.as_ptr() as *const u8, std::ptr::null_mut(), 0, accept.as_ptr() as *const u8, cancel.as_ptr() as *const u8);
+                                if native.is_null() { return; }
+                                let res = native_run(native);
+                                if res == 0 { destroy_widget(native); }
+                                else {
+                                    let fname = get_filename(native);
+                                    if !fname.is_null() {
+                                        let c = std::ffi::CStr::from_ptr(fname as *const std::os::raw::c_char);
+                                        let path = c.to_string_lossy().into_owned();
+                                        gfree(fname as *mut std::os::raw::c_void);
+                                        destroy_widget(native);
+                                        if let Ok(mut f) = File::open(path) {
+                                            let mut s = String::new();
+                                            if f.read_to_string(&mut s).is_ok() {
+                                                for (r, line) in s.lines().enumerate() {
+                                                    for (c, cell) in line.split('\t').enumerate() {
+                                                        if r < grid_for_act.len() && c < grid_for_act[r].len() {
+                                                            grid_for_act[r][c].set_text(cell);
                                                         }
                                                     }
                                                 }
                                             }
-                                        } else { destroy_widget(native); }
-                                    }
+                                        }
+                                    } else { destroy_widget(native); }
                                 }
                             } else {
                                 if let Ok(mut f) = File::open("sample.tsv") {

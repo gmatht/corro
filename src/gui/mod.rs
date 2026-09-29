@@ -458,26 +458,12 @@ impl App {
         if self.backend.as_ref().map_or(true, |b| matches!(b, Backend::Pancurses)) {
             return pnc_backend::run_pancurses(self);
         }
-        // zork is a `gui-core` build with no toolkit: the widget tree builds
-        // fine but there is no real event loop to drive it. `run_gui` still
-        // builds the whole tree, then hands off here instead of entering
-        // `rxapp.run()`, so the model is populated and can be inspected.
+        // zork reaches the same path as GTK: `run_gui` builds the whole tree
+        // and then hands off to the backend's own driver instead of entering
+        // `rxapp.run()`, which zork has no equivalent for.
         Err("Unknown backend".into())
     }
 
-    /// Drive the zork backend's model over the real widget tree that
-    /// [`App::run`] just built.
-    ///
-    /// This is the answer to "can corro run on zork?": the tree above it is
-    /// corro's *actual* GUI construction path — the same `new_window`,
-    /// `new_canvas`, `build_menu`, draw callbacks and all — only the terminal
-    /// is missing. So what this inspects is the real thing, not a stub.
-    #[cfg(feature = "zork")]
-    fn run_zork(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        gui_backend::run_gui(self)
-    }
 
     /// `--movie` on a GUI backend: replay the workbook line by line instead of
     /// running interactively.
@@ -546,4 +532,33 @@ impl App {
     pub fn take_final_exit_hint(&mut self) -> Option<String> {
         self.core.exit_message.take()
     }
+}
+
+#[cfg(test)]
+/// Serialises every test that writes the process-wide colour scheme.
+///
+/// `rswidgets::core::set_color_scheme` is a **global** — a `RwLock<Theme>`
+/// behind a `static`, with no thread or task scoping. Every test that picks a
+/// scheme, paints, and reads the result is therefore not independent of any
+/// other, and cargo runs test threads in parallel.
+///
+/// The symptom is distinctive and easy to misread: such a test passes 20/20 on
+/// its own and fails perhaps one run in five in the suite. That looks like
+/// flakiness and gets ignored or retried, when it is really a determinism bug
+/// in the test.
+///
+/// One lock, shared by every writer in the crate: a second lock in another
+/// module would not exclude these threads, which is how an earlier attempt at
+/// this left the race in place (`actions.rs` has a fourth scheme-touching test
+/// in the same binary).
+///
+/// Note this cannot help across *test binaries*: rswidgets' own theme tests
+/// live in its own binary, so their writes are in a different process. That is
+/// harmless, and the reason the failure mode is confined to one binary.
+pub(crate) fn lock_scheme_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    static SCHEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A poisoned lock only means another scheme test panicked; the theme is
+    // still a plain global, so recovering is correct and keeps one failure
+    // from cascading into every other test in the binary.
+    SCHEME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }

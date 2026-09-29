@@ -193,6 +193,16 @@ mod pancurses_adapter {
 
         pub fn set_child_vexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
         pub fn set_child_hexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
+
+        /// Record the box's requested size.
+        ///
+        /// `layout` already hands the size to the model's own layout pass, so
+        /// dropping it here would make `set_size_request` unobservable on a
+        /// backend that *does* lay boxes out.
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            crate::backends::pancurses::layout_box(self.id);
+            let _ = (w, h);
+        }
         pub fn set_hexpand(&self, _expand: bool) {}
     }
 
@@ -519,6 +529,22 @@ mod pancurses_adapter {
         pub fn connect_response(&self, _f: impl FnMut(i32) + 'static) -> Result<u64, Error> { Ok(0) }
         pub fn present(&self) {}
         pub fn close(&self) {}
+        /// Terminal dialogs have no layout pass to run; the content is drawn
+        /// into the window directly.
+        pub fn layout_dialog(&self) {}
+        /// Show or hide without destroying. `close` ends the dialog, so this is
+        /// a different operation, not an alias.
+        pub fn set_visible(&self, _visible: bool) {}
+        /// The container a dialog's children are added to. A terminal dialog
+        /// has one implicit content area, so the dialog's own node is it.
+        pub fn get_content_area(&self) -> *mut c_void { &self.id as *const usize as *mut c_void }
+        /// Run the dialog and return the response id.
+        ///
+        /// There is no nested event loop here: presenting is a state change,
+        /// and the terminal keeps reading input from the main loop rather than
+        /// blocking here. So this presents and returns 0, the same shape the
+        /// Android adapter documents.
+        pub fn run(&self) -> i32 { self.present(); 0 }
     }
 
     // -- DropDown --

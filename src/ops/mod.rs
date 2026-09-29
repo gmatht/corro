@@ -2853,6 +2853,10 @@ pub fn append_op(path: &Path, op: &Op, main_cols: usize) -> std::io::Result<()> 
 
 /// Append a plain-text log line.
 pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    // The wasm branch below keeps the line in a JS global instead of a file,
+    // so the path is unused there.
+    #[cfg(target_arch = "wasm32")]
+    let _ = &path;
     #[cfg(target_arch = "wasm32")]
     {
         // On WASM there is no real filesystem. Store the line in a JS global

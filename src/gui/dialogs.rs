@@ -110,6 +110,7 @@ pub fn file_save_dialog() -> Option<PathBuf> {
 ///
 /// [`file_save_dialog_named`] keeps the `PathBuf` signature for the desktop
 /// callers that genuinely have a path, and delegates here.
+#[cfg(any(feature = "gui", feature = "gui-core"))]
 #[allow(unused_variables)]
 pub(crate) fn file_save_target(suggested: &str) -> Option<SaveTarget> {
     // `gui-core` alongside `gui`, for the reason the rest of this file now
@@ -175,8 +176,14 @@ fn save_target(picked: &str) -> SaveTarget {
 }
 
 /// Where a save goes: a real file, or a Storage Access Framework document.
-#[cfg(any(feature = "gui", feature = "gui-core"))]
+///
+/// Plain data with no backend behind it, and `file_save_dialog_named` matches
+/// on it unconditionally — so a `pancurses` build (which has dialogs but no GUI
+/// backend) needs the type to exist even though it never constructs a
+/// `Document`. The `dead_code` allow covers that build: nothing there reaches
+/// it, but the match in the public entry point must still typecheck.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum SaveTarget {
     Path(PathBuf),
     /// A `content://` URI. Written through the content resolver.
@@ -186,6 +193,7 @@ pub(crate) enum SaveTarget {
 impl SaveTarget {
     /// The name to show in a status line. A URI is a long opaque string, so
     /// only its last segment is shown — which is the document's own name.
+    #[allow(dead_code)]
     pub(crate) fn display(&self) -> String {
         match self {
             SaveTarget::Path(p) => p.display().to_string(),

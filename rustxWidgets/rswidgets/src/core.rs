@@ -2034,6 +2034,71 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     crate::backends_android_adapter::create_textview()
 }
 
+// -- iOS / macOS low-level construction and file dialogs --
+//
+// The Apple adapters already implement these widgets; what was missing was the
+// `App`-level arm for them, so a `gui-mobile` / `gui-macos` build could not
+// name them at all. Without these the shared dialog code (src/gui/dialogs.rs)
+// does not compile on either platform, which is why the iOS host crate — a
+// real consumer of `gui-mobile` — could not build.
+//
+// A file dialog is a document picker, which is a host responsibility on both
+// platforms (UIDocumentPickerViewController / NSOpenPanel): the Rust side has
+// no picker to open, so these report "cancelled" and the host shim intercepts
+// the menu action instead. See `resolve_picked_document` in src/gui/dialogs.rs
+// for the URI half of that contract.
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub fn create_textview(&self) -> Result<crate::backends_ios_adapter::TextView, Error> {
+    crate::backends_ios_adapter::create_textview()
+}
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_ios_adapter::DropDown, Error> {
+    crate::backends_ios_adapter::create_dropdown(items)
+}
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_ios_adapter::CheckButton, Error> {
+    crate::backends_ios_adapter::create_checkbutton(label)
+}
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub fn create_radiobutton(&self, group: Option<&crate::backends_ios_adapter::RadioButton>, label: &str) -> Result<crate::backends_ios_adapter::RadioButton, Error> {
+    let _ = group;
+    crate::backends_ios_adapter::create_radiobutton(None, label)
+}
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> { Ok(None) }
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub fn open_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> { Ok(None) }
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub fn save_file(&self, _title: &str) -> Result<Option<String>, Error> { Ok(None) }
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub fn save_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])], _current_name: &str) -> Result<Option<String>, Error> { Ok(None) }
+
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+pub fn create_textview(&self) -> Result<crate::backends_macos_adapter::TextView, Error> {
+    crate::backends_macos_adapter::create_textview()
+}
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_macos_adapter::DropDown, Error> {
+    crate::backends_macos_adapter::create_dropdown(items)
+}
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_macos_adapter::CheckButton, Error> {
+    crate::backends_macos_adapter::create_checkbutton(label)
+}
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+pub fn create_radiobutton(&self, group: Option<&crate::backends_macos_adapter::RadioButton>, label: &str) -> Result<crate::backends_macos_adapter::RadioButton, Error> {
+    let _ = group;
+    crate::backends_macos_adapter::create_radiobutton(None, label)
+}
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> { Ok(None) }
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+pub fn open_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> { Ok(None) }
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+pub fn save_file(&self, _title: &str) -> Result<Option<String>, Error> { Ok(None) }
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+pub fn save_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])], _current_name: &str) -> Result<Option<String>, Error> { Ok(None) }
+
 // ---------------------------------------------------------------------------
 // High-level wrapper creation methods (return common types)
 // ---------------------------------------------------------------------------

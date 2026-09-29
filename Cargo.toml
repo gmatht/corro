@@ -83,7 +83,7 @@ gui = ["gui-core", "rswidgets/gtk", "dep:gtk_dynamic_loader"]
 # `--example ios-ui`) a non-mobile backend is still needed, or rswidgets has
 # no `backends::init` at all. Those live in the target-gated table below, so
 # a real iOS/Android build never sees them.
-gui-mobile = ["dep:rswidgets", "rswidgets/ios", "rswidgets/headless"]
+gui-mobile = ["gui-core", "rswidgets/ios", "rswidgets/headless"]
 # macOS: the shared GUI pipeline against the *AppKit* adapter, with no GTK
 # half. This is the desktop-native counterpart of `gui-mobile`, and it is what
 # a macOS host crate (or `scripts/check_corro_macos.sh`) depends on.
@@ -100,7 +100,7 @@ gui-mobile = ["dep:rswidgets", "rswidgets/ios", "rswidgets/headless"]
 # is named here so a host can write the same explicit `features = [...]` line
 # it uses on the other Apple platforms. `rswidgets/headless` supplies the
 # headless `backends::init` the shared GUI code expects.
-gui-macos = ["dep:rswidgets", "rswidgets/macos", "rswidgets/headless"]
+gui-macos = ["gui-core", "rswidgets/macos", "rswidgets/headless"]
 # Desktop stand-in for the mobile GUI: `gui-mobile` plus the Linux/Windows
 # backend, so `--example ios-ui` / `--example android-ui` build and run on a
 # workstation. Never used by the app bundles.
@@ -110,7 +110,7 @@ gui-mobile-host = ["gui-mobile", "gui"]
 # inspected on a workstation (and, crucially, tested headlessly on Linux CI).
 # Never used by a real .app bundle, which depends on `gui-macos` alone.
 gui-macos-host = ["gui-macos", "gui"]
-wasm = ["dep:rswidgets"]
+wasm = ["gui-core"]
 pancurses = ["rswidgets/pancurses"]
 # Headless zork backend (experiment): the in-memory model + text REPL in
 # rustxWidgets, selected here so `cargo check --features zork` can ask whether

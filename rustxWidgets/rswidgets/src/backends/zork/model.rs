@@ -1567,6 +1567,31 @@ impl ZorkState {
         }
     }
 
+    /// The content extent of a dialog: the union of its children's size
+    /// requests, so a caller laying the dialog out itself has something real to
+    /// read. `None` when the dialog has no children.
+    pub fn measure_dialog(&self, id: usize) -> Option<(i32, i32)> {
+        let n = self.node(id)?;
+        let mut any = false;
+        let (mut w, mut h) = (0i32, 0i32);
+        for c in &n.children {
+            let Some(c) = self.node(*c) else { continue };
+            if !c.props.visible {
+                continue;
+            }
+            any = true;
+            w = w.max(c.props.width.unwrap_or(0) + c.props.margin_start);
+            h = h.max(c.props.height.unwrap_or(0) + c.props.margin_top);
+        }
+        any.then_some((w, h))
+    }
+
+    /// The default response id, used by `Dialog::run` when there is no nested
+    /// loop to wait on.
+    pub fn dialog_default_response(&self, id: usize) -> Option<i32> {
+        self.node(id).and_then(|n| n.dialog_default_response)
+    }
+
     pub fn dialog_transient_for(&self, id: usize) -> Option<usize> {
         self.node(id).and_then(|n| n.dialog_transient_for)
     }

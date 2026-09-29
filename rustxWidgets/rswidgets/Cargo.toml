@@ -50,6 +50,7 @@ web-sys = { version = "0.3", features = [
   "HtmlOptionElement", "HtmlFormElement",   "HtmlHeadingElement", "HtmlBrElement",
   "MouseEvent", "KeyboardEvent", "Event", "FocusEvent",
   "CanvasRenderingContext2d", "CssStyleDeclaration", "DomTokenList",
+  "HtmlCanvasElement", "TextMetrics",
   "HtmlCollection", "Window",
   "Text",
   # B5/B15: Canvas::text_extents_styled needs measure_text (TextMetrics), and

@@ -1,4 +1,10 @@
 #![allow(non_camel_case_types, non_snake_case)]
+// `rust9x` is a custom target family introduced by the vendored Win95/9x
+// patch (see the `target_family` conditions below). rustc warns about any
+// `cfg` value it does not recognise, so declare it here; the condition can
+// never hold for a stock target, which is exactly what "not a real family"
+// means.
+#![cfg_attr(not(rust9x), allow(unexpected_cfgs))]
 
 #[macro_use]
 extern crate log;

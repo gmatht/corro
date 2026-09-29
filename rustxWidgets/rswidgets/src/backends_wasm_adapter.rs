@@ -2109,6 +2109,37 @@ impl SimpleAction {
             }
         }
 
+        /// Settle the dialog's layout before it is shown.
+        ///
+        /// GTK and NWG both have to do real work here: they position the
+        /// content and the button row in window coordinates, and a caller
+        /// attaching a custom view needs the size settled before the window
+        /// opens. A `<dialog>`'s layout is done by the browser's own box model
+        /// and reflows on every frame, so there is nothing to compute and
+        /// nothing to cache -- this exists so `common::Dialog::layout_dialog`
+        /// resolves and the shared GUI's call is a documented no-op rather
+        /// than a missing method.
+        pub fn layout_dialog(&self) {}
+
+        /// Present the dialog and return the response id.
+        ///
+        /// This is the one place a browser genuinely cannot supply what the
+        /// signature wants, and the fallback is stated rather than faked.
+        /// `gtk_dialog_run` blocks in a *nested* main loop until the user
+        /// answers, so the caller gets a response id synchronously. A page has
+        /// one event loop and cannot nest: `present()` returns immediately and
+        /// the answer, if any, arrives later through `connect_response`.
+        ///
+        /// So the honest answer is the same one `backends_nwg_adapter.rs` gives
+        /// (`pub fn run(&self) -> i32 { 0 }`) — present, and report "no response
+        /// id". 0 is not a valid GTK response id (those are 1, 2, ...), so a
+        /// caller comparing against it gets an unambiguous "none", and the
+        /// `connect_response` path remains the one that carries the real id.
+        pub fn run(&self) -> i32 {
+            self.present();
+            0
+        }
+
         /// Mark a button as the one a dismiss acts on, GTK's
         /// `set_default_response`.
         ///
@@ -2160,6 +2191,26 @@ impl SimpleAction {
     impl AsElement for DropDown {
         fn as_element(&self) -> &Element {
             self.elem.as_ref()
+        }
+    }
+
+    /// The `&*mut c_void` escape hatch `common_types_mod!` requires for
+    /// every widget, used where the shared layer takes a raw handle.
+    ///
+    /// Routed through [`Widget::raw_handle`] like every other `AsRef` in this
+    /// module, rather than casting the field directly: the `Widget` impl is
+    /// the single place that says what this widget's handle is, so a change
+    /// to it cannot silently desynchronise the two.
+    ///
+    /// This and the three below are not in §6 of `WASM_MISSING.md` — the
+    /// static diff reported them as present (they were, on the pre-merge
+    /// working tree) while the committed adapter had dropped them, so the
+    /// merge surfaced them as `E0277: the trait bound `DropDown:
+    /// AsRef<*mut c_void>` is not satisfied`. A widget missing `AsRef` fails
+    /// the build, so this is a real gap rather than a cosmetic one.
+    impl AsRef<*mut c_void> for DropDown {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
         }
     }
 
@@ -2310,6 +2361,17 @@ impl SimpleAction {
         }
     }
 
+    /// See [`DropDown`]'s `AsRef` for why these four exist.
+    ///
+    /// This one hands back the `<input>`, not the wrapper `elem`, because the
+    /// input is the element the shared layer wants to reparent when it packs
+    /// a check button into a box.
+    impl AsRef<*mut c_void> for CheckButton {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.input as *const HtmlInputElement as *const *mut c_void) }
+        }
+    }
+
     impl Widget for CheckButton {
         fn raw_handle(&self) -> *mut c_void {
             &self.elem as *const Element as *mut c_void
@@ -2427,6 +2489,13 @@ impl SimpleAction {
     impl AsElement for RadioButton {
         fn as_element(&self) -> &Element {
             &self.elem
+        }
+    }
+
+    /// See [`DropDown`]'s `AsRef` for why these four exist.
+    impl AsRef<*mut c_void> for RadioButton {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.input as *const HtmlInputElement as *const *mut c_void) }
         }
     }
 
@@ -2553,6 +2622,13 @@ impl SimpleAction {
     impl AsElement for TextView {
         fn as_element(&self) -> &Element {
             self.elem.as_ref()
+        }
+    }
+
+    /// See [`DropDown`]'s `AsRef` for why these four exist.
+    impl AsRef<*mut c_void> for TextView {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
         }
     }
 

@@ -531,6 +531,15 @@ pub fn dialog_set_default_response(id: usize, response_id: i32) {
 pub fn dialog_buttons(id: usize) -> Vec<(String, i32)> {
     with_state(|s| s.dialog_buttons(id))
 }
+/// The dialog's content extent: the union of its children's size requests.
+/// `None` when the dialog has no children.
+pub fn measure_dialog(id: usize) -> Option<(i32, i32)> {
+    with_state(|s| s.measure_dialog(id))
+}
+/// The response id `Dialog::run` returns: the default response, or `None`.
+pub fn dialog_default_response(id: usize) -> Option<i32> {
+    with_state(|s| s.dialog_default_response(id))
+}
 pub fn dialog_set_transient_for(id: usize, parent: Option<usize>) {
     with_state(|s| s.dialog_set_transient_for(id, parent));
 }

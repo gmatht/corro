@@ -1563,7 +1563,6 @@ mod android_backend {
         pub const DPAD_LEFT: i32 = 21;
         pub const DPAD_RIGHT: i32 = 22;
         pub const TAB: i32 = 61;
-        pub const SPACE: i32 = 62;
         pub const ENTER: i32 = 66;
         pub const DEL: i32 = 67;
         pub const FORWARD_DEL: i32 = 112;

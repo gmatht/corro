@@ -26,5 +26,10 @@ pub use rswidgets::backends_nwg_adapter::{CheckButton, DropDown, RadioButton};
 // (which is what `zork` selects) — takes the prelude, i.e. whichever backend
 // `backends::init` will pick. This must not overlap the two arms above, or the
 // names are imported twice.
+// Re-exported for `dialogs.rs`, which uses them from any GUI-capable build.
+// A `pancurses`-only build compiles that module but constructs none of these
+// (it has its own terminal dialog path), so the import is legitimately unused
+// there — hence the allow rather than a cfg that would fork the caller too.
 #[cfg(not(all(feature = "gui", any(target_os = "linux", windows))))]
+#[allow(unused_imports)]
 pub use rswidgets::prelude::{CheckButton, DropDown, RadioButton};
