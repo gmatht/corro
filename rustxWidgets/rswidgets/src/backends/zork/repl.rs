@@ -134,8 +134,11 @@ fn short_desc(_state: &ZorkState, node: &ZorkNode) -> String {
             Some(label) => format!("{} Menu", menu_label_plain(label)),
             None => "Menu".into(),
         },
+        // The bar is not a submenu of anything, so it is not "X Menu" -- the
+        // label already says what it is. Appending "Menu" here produced
+        // "Menu Bar Menu".
         ZorkKind::MenuBar => match &node.menu_label {
-            Some(label) => format!("{} Menu", menu_label_plain(label)),
+            Some(label) => menu_label_plain(label),
             None => "MenuBar".into(),
         },
         ZorkKind::SimpleAction => "SimpleAction".into(),

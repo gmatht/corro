@@ -526,27 +526,109 @@ impl ZorkState {
     }
 
     pub fn create_menubar(&mut self, model_id: usize, _action_group: *mut std::os::raw::c_void) -> usize {
-        let bar_id = self.add_node(ZorkKind::MenuBar, self.find_window_id());
+        // `model_id` is the `Menu` corro built the items into, and it is the
+        // real bar: it already holds the six top-level items. Re-use that node
+        // rather than minting a second one, which used to leave the tree with
+        // a `Menu` (id 12) and a `MenuBar` (id 92) carrying identical items --
+        // so the window's "north" led to an unnamed copy while the REPL's
+        // `go 1` numbering started from the real one.
+        let bar_id = model_id;
+        if let Some(n) = self.node_mut(bar_id) {
+            n.kind = ZorkKind::MenuBar;
+            n.menu_label = Some("Menu Bar".to_string());
+        }
         let items = self.menu_items.get(&model_id).cloned().unwrap_or_default();
         self.menu_items.insert(bar_id, items);
-        // Re-materialise one `Menu` node per submenu so the bar has navigable
-        // children (the REPL walks the tree).
-        let nested: Vec<(String, Vec<MenuItemData>)> = self
-            .menu_items
-            .get(&bar_id)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|i| i.submenu.map(|s| (i.label, s)))
-            .collect();
-        for (label, sub_items) in nested {
-            let sub_id = self.add_node(ZorkKind::Menu, Some(bar_id));
+        // Re-use the `Menu` nodes `create_menu` already made, rather than
+        // minting a second set. `build_common_menu` builds the tree
+        // recursively, so every submenu already has a node -- parented under
+        // the window, because that was the only parent available when it was
+        // created. Minting new ones left the originals in the tree holding
+        // the same items, so the REPL's direction list showed the File menu
+        // twice (both lines reading a bare "Menu" until `menu_label` gave
+        // them names). Re-parent each one onto the bar and drop the stale
+        // window link.
+        //
+        // Paired by LABEL, not by index. corro builds recursively, so the Nth
+        // node created is not the Nth submenu item: `build_common_menu` calls
+        // `new_menu` for a submenu before returning to its parent. An
+        // index-based pairing silently mis-assigned 53 of the 132 items.
+        // `menu_append_submenu` already stored each node's label, and a
+        // label is unique among one menu's items, so the match is exact.
+        //
+        // Walk the whole tree, not just the bar's immediate items: Export sits
+        // under File and Scope under Format, so a single level left 6 of the
+        // 13 submenu nodes still parented under the window and still holding
+        // their items in a second place. Recursion is what pairs all 13.
+        // Collected as (label, items, owning node id) so a grandchild can be
+        // re-parented onto its own parent rather than flattened onto the bar.
+        let mut nested: Vec<(String, Vec<MenuItemData>, Option<usize>)> = Vec::new();
+        self.collect_submenus(bar_id, &mut nested);
+        for (label, sub_items, owner) in nested {
+            let Some(sub_id) = self
+                .nodes
+                .iter()
+                .find(|n| {
+                    matches!(n.kind, ZorkKind::Menu)
+                        && n.menu_label.as_deref() == Some(label.as_str())
+                        && n.id != bar_id
+                })
+                .map(|n| n.id)
+            else {
+                continue;
+            };
             self.menu_items.insert(sub_id, sub_items);
             if let Some(n) = self.node_mut(sub_id) {
+                n.parent = Some(owner.unwrap_or(bar_id));
                 n.menu_label = Some(label);
             }
+            if let Some(win) = self.find_window_id() {
+                if let Some(w) = self.node_mut(win) {
+                    w.children.retain(|c| *c != sub_id);
+                }
+            }
         }
+        // The submenus have all been moved onto the bar. The bar itself stays
+        // where `create_menu` put it -- `add_node` parents it under whatever
+        // the window contained at the time, which for corro is the outer
+        // layout Box, not the window directly. Forcing it into the window's
+        // children would detach it from that Box and leave the window's
+        // "north" pointing at a SimpleAction instead.
         bar_id
+    }
+
+    /// Collect `(label, items)` for every submenu at or below `menu_id`,
+    /// depth-first.
+    ///
+    /// Deeper than one level on purpose: corro nests File > Export > TSV and
+    /// Format > Scope > All, and a submenu's own submenus are themselves
+    /// submenus that need re-parenting onto the bar.
+    fn collect_submenus(
+        &self,
+        menu_id: usize,
+        out: &mut Vec<(String, Vec<MenuItemData>, Option<usize>)>,
+    ) {
+        let Some(items) = self.menu_items.get(&menu_id) else { return };
+        for item in items {
+            let Some(sub) = item.submenu.clone() else { continue };
+            // `owner` is the node holding this submenu, so `Expor_t` stays
+            // under `_File` rather than being flattened onto the bar beside
+            // it. The first level's owner *is* the bar.
+            out.push((item.label.clone(), sub, Some(menu_id)));
+            // Recurse into the copy we just took: it is the authoritative
+            // item list for that submenu.
+            if let Some(nested_id) = self
+                .nodes
+                .iter()
+                .find(|n| {
+                    matches!(n.kind, ZorkKind::Menu)
+                        && n.menu_label.as_deref() == Some(item.label.as_str())
+                })
+                .map(|n| n.id)
+            {
+                self.collect_submenus(nested_id, out);
+            }
+        }
     }
 
     pub fn create_dialog(&mut self) -> usize {
@@ -2740,5 +2822,110 @@ mod tests {
         s.toggle(b);
         assert!(s.get_radiobutton_checked(b));
         assert!(!s.get_radiobutton_checked(a));
+    }
+}
+
+#[cfg(test)]
+mod menubar_dedup_tests {
+    use super::*;
+
+    /// `create_menubar` used to mint a *new* `Menu` node for every submenu
+    /// instead of re-using the ones `create_menu` made, so the tree held two
+    /// nodes with the File items and the REPL's direction list showed the File
+    /// menu twice. Invisible until `menu_label` gave the nodes names.
+    #[test]
+    fn submenu_nodes_are_not_duplicated() {
+        let mut s = ZorkState::new();
+        s.create_window();
+        let bar_model = s.create_menu();
+        // File > (New, Export > (TSV)), Edit > (Cut)
+        let file = s.create_menu();
+        s.menu_append(file, "New", "app.new_file");
+        let export = s.create_menu();
+        s.menu_append(export, "TSV", "app.export_tsv");
+        s.menu_append_submenu(bar_model, "_File", file);
+        s.menu_append_submenu(file, "Expor_t", export);
+        let edit = s.create_menu();
+        s.menu_append(edit, "_Cut", "app.cut");
+        s.menu_append_submenu(bar_model, "_Edit", edit);
+
+        let bar = s.create_menubar(bar_model, std::ptr::null_mut());
+
+        // One node per submenu, plus the bar itself.
+        let menu_nodes = s
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, ZorkKind::Menu))
+            .count();
+        assert_eq!(
+            menu_nodes,
+            3,
+            "expected File, Export, Edit and no duplicates, found {menu_nodes} Menu nodes"
+        );
+
+        // Every submenu hangs off the right parent: Export under File, not
+        // flattened onto the bar.
+        let by_label = |label: &str| {
+            s.nodes
+                .iter()
+                .find(|n| n.menu_label.as_deref() == Some(label))
+                .map(|n| n.id)
+        };
+        let file_id = by_label("_File").expect("File menu");
+        let export_id = by_label("Expor_t").expect("Export menu");
+        let edit_id = by_label("_Edit").expect("Edit menu");
+        assert_eq!(s.node(export_id).unwrap().parent, Some(file_id));
+        assert_eq!(s.node(file_id).unwrap().parent, Some(bar));
+        assert_eq!(s.node(edit_id).unwrap().parent, Some(bar));
+
+        // And the window is not left listing the submenus it gave them to.
+        let win = s.find_window_id().unwrap();
+        for id in [file_id, export_id, edit_id] {
+            assert!(
+                !s.node(win).unwrap().children.contains(&id),
+                "node {id} is still a child of the window after the bar adopted it"
+            );
+        }
+    }
+
+    /// The item *count* corro reports is the sum over distinct nodes, and each
+    /// node is counted once. It used to read 132 because the six top-level
+    /// submenus existed as two nodes apiece, so their items were summed
+    /// twice; 79 is the number of distinct items.
+    ///
+    /// The invariant is per-node, not a magic total: every node's list is
+    /// stored once, and no two nodes share one.
+    #[test]
+    fn each_menu_node_stores_its_items_once() {
+        let mut s = ZorkState::new();
+        s.create_window();
+        let bar_model = s.create_menu();
+        for (label, action) in [("_File", "a"), ("_Edit", "b")] {
+            let sub = s.create_menu();
+            s.menu_append(sub, "One", action);
+            s.menu_append(sub, "Two", action);
+            s.menu_append_submenu(bar_model, label, sub);
+        }
+        let bar = s.create_menubar(bar_model, std::ptr::null_mut());
+
+        // Three distinct menus: the bar plus two submenus.
+        let mut nodes: Vec<usize> = s.nodes.iter().filter(|n| matches!(n.kind, ZorkKind::Menu | ZorkKind::MenuBar)).map(|n| n.id).collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        assert_eq!(nodes.len(), 3, "bar plus two submenus, no duplicates");
+
+        // The bar keeps its own two items; each submenu keeps its own two.
+        // Nothing is stored twice on one node.
+        for id in nodes {
+            let items = s.menu_items.get(&id).expect("every menu node has an item list");
+            assert!(
+                items.len() == 2,
+                "node {id} stores {} items, expected 2", items.len()
+            );
+        }
+        assert!(
+            matches!(s.node(bar).map(|n| &n.kind), Some(ZorkKind::MenuBar)),
+            "the reused node became the bar"
+        );
     }
 }

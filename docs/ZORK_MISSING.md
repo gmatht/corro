@@ -202,7 +202,7 @@ adapter method can be more than a no-op until the model grows.
 | S23 | Snapshot is too thin | `SnapshotNode` has no geometry/visibility/classes/focus/size-request/caret, so a snapshot regression test cannot detect a regression in any of §3's properties. `Snapshot` also omits `prev_location` and any scroll/expansion state. |
 | S24 | `set_child` is destructive-but-buggy | `set_child` removes the child from *all* parents' `children` lists but only fixes up the **new** parent's link; the old parent's list is cleaned, but `add_node` also pushes to the parent, so a node can end up duplicated. And `append_child` is an alias of `set_child` — it *replaces* rather than appends, despite the name. |
 | S25 | No `Fixed`/`Overlay` pass-through | `Overlay::add_overlay` and `set_child` are the same code path; pass-through is a no-op. |
-| S27 | Submenu nodes are duplicated | See below. |
+| S27 | Submenu nodes were duplicated | Fixed. See below. |
 
 ### S27 — every submenu exists twice in the tree
 
@@ -233,17 +233,35 @@ Before commit `7a2d7e47` both of those lines read "Menu", so the duplication
 was invisible. `ZorkNode::menu_label` (added in the same commit, purely for
 display) made it visible; the duplication is pre-existing and unrelated.
 
-**Not fixed, deliberately.** An attempt to re-parent the existing nodes
-instead of minting new ones cost 53 menu items — 132 → 79, and 98 nodes → 91
-— because the pairing is not by index: corro builds the tree recursively
-(`build_common_menu` calls `new_menu` for a submenu before returning to its
-parent), so the Nth node created is not the Nth submenu item. Pairing by
-label is the way out, and `create_menubar` has the labels to do it with.
+**Fixed** in the commit that follows `a2136a5f`, pairing by label. The
+earlier attempt cost 53 menu items (132 → 79, 98 nodes → 91) because it paired
+by index: corro builds the tree recursively (`build_common_menu` calls
+`new_menu` for a submenu before returning to its parent), so the Nth node
+created is not the Nth submenu item. `create_menubar` already had every
+label, so the match is exact.
 
-This is recorded rather than half-fixed: it is a change to how the adapter
-re-parents menu nodes, which is a different and more careful change than
-naming them, and doing both at once is how the menu count broke the first
-time.
+Two things the first attempt got wrong, both found by dumping the live model:
+
+* It only walked **one level**, so six of the thirteen submenu nodes
+  (Export, Width, Scope, Number, Align, Freeze — all nested) were still
+  parented under the window. `collect_submenus` recurses.
+* It re-parented everything onto the **bar**, flattening grandchildren, so
+  `Expor_t` ended up a sibling of `_File` rather than its child. The
+  collection carries the owning node, so a submenu keeps its real parent.
+
+A third point is easy to get wrong: the 79-item figure that the failed attempt
+produced was not a regression. It is the **true** count. 132 had been counting
+the six top-level submenus twice, and 79 is how many distinct items corro
+builds.
+
+Two tests cover it (`menubar_dedup_tests`), both verified to fail when the
+duplication is reintroduced:
+`submenu_nodes_are_not_duplicated` and
+`each_menu_node_stores_its_items_once`.
+
+Also corrected there: `create_menubar` now re-uses `model_id` as the bar rather
+than creating a second node, so the tree no longer holds a `Menu` and a
+`MenuBar` with identical contents.
 | S26 | No `draw_rgba_image` on the draw context | See below. |
 
 ### S26 — `DrawContext::draw_rgba_image` is not implemented on zork

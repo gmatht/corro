@@ -425,9 +425,19 @@ fn menu_actions_are_registered_as_actions_not_labels() {
         .expect("expected a count leading the detail");
     assert!(n >= 50, "only {n} SimpleAction nodes; expected the full action set");
     let items = assert_pass(text, "menu item model");
+    // 79 unique items, across 12 submenus plus the bar. This was 132 before
+    // `create_menubar` stopped re-materialising each submenu: the count had
+    // been double-counting the six top-level submenus, which existed twice
+    // (see S27 in docs/ZORK_MISSING.md). Asserted as a floor rather than an
+    // exact number, so a backend that genuinely grows a menu still passes.
+    let n_items: usize = items
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .expect("expected a count leading the detail");
     assert!(
-        items.contains("132") || items.split_whitespace().next().unwrap_or("").parse::<usize>().unwrap_or(0) > 100,
-        "menu item model looks thin: {items:?}"
+        n_items >= 70,
+        "menu item model looks thin: {items:?} (expected >= 70 unique items)"
     );
 }
 
