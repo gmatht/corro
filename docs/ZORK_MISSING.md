@@ -202,6 +202,48 @@ adapter method can be more than a no-op until the model grows.
 | S23 | Snapshot is too thin | `SnapshotNode` has no geometry/visibility/classes/focus/size-request/caret, so a snapshot regression test cannot detect a regression in any of §3's properties. `Snapshot` also omits `prev_location` and any scroll/expansion state. |
 | S24 | `set_child` is destructive-but-buggy | `set_child` removes the child from *all* parents' `children` lists but only fixes up the **new** parent's link; the old parent's list is cleaned, but `add_node` also pushes to the parent, so a node can end up duplicated. And `append_child` is an alias of `set_child` — it *replaces* rather than appends, despite the name. |
 | S25 | No `Fixed`/`Overlay` pass-through | `Overlay::add_overlay` and `set_child` are the same code path; pass-through is a no-op. |
+| S27 | Submenu nodes are duplicated | See below. |
+
+### S27 — every submenu exists twice in the tree
+
+`create_menubar` re-materialises one `Menu` node per submenu so the bar has
+navigable children, but it does not reuse the `Menu` nodes `create_menu`
+already made. The originals stay parented under the window, so the File
+items exist on two nodes and the REPL's direction list names the same place
+twice:
+
+```
+$ printf 'light\nnorth\n' | ./target/debug/corro
+    You are at a Menu.
+    Items:
+      1. _File
+      ...
+    To the east: File Menu
+    To the north: File Menu
+    To the south: Window "corro 0.7.0"
+
+    You see:
+      0. (yourself) Menu
+      1. File Menu (east)
+      2. File Menu (east)          <-- the same submenu, twice
+      3. Window "corro 0.7.0" (south)
+```
+
+Before commit `7a2d7e47` both of those lines read "Menu", so the duplication
+was invisible. `ZorkNode::menu_label` (added in the same commit, purely for
+display) made it visible; the duplication is pre-existing and unrelated.
+
+**Not fixed, deliberately.** An attempt to re-parent the existing nodes
+instead of minting new ones cost 53 menu items — 132 → 79, and 98 nodes → 91
+— because the pairing is not by index: corro builds the tree recursively
+(`build_common_menu` calls `new_menu` for a submenu before returning to its
+parent), so the Nth node created is not the Nth submenu item. Pairing by
+label is the way out, and `create_menubar` has the labels to do it with.
+
+This is recorded rather than half-fixed: it is a change to how the adapter
+re-parents menu nodes, which is a different and more careful change than
+naming them, and doing both at once is how the menu count broke the first
+time.
 | S26 | No `draw_rgba_image` on the draw context | See below. |
 
 ### S26 — `DrawContext::draw_rgba_image` is not implemented on zork
