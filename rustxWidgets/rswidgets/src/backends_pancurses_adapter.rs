@@ -193,17 +193,15 @@ mod pancurses_adapter {
 
         pub fn set_child_vexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
         pub fn set_child_hexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
-
-        /// Record the box's requested size.
-        ///
-        /// `layout` already hands the size to the model's own layout pass, so
-        /// dropping it here would make `set_size_request` unobservable on a
-        /// backend that *does* lay boxes out.
-        pub fn set_size_request(&self, w: i32, h: i32) {
-            crate::backends::pancurses::layout_box(self.id);
-            let _ = (w, h);
-        }
         pub fn set_hexpand(&self, _expand: bool) {}
+
+        /// See `backends::pancurses::set_size_request`: a real size on the
+        /// node, not a discarded argument.
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            crate::backends::pancurses::set_size_request(self.id, w, h);
+        }
+
+        pub fn set_vexpand(&self, _expand: bool) {}
     }
 
     // -- Grid --
@@ -529,22 +527,57 @@ mod pancurses_adapter {
         pub fn connect_response(&self, _f: impl FnMut(i32) + 'static) -> Result<u64, Error> { Ok(0) }
         pub fn present(&self) {}
         pub fn close(&self) {}
-        /// Terminal dialogs have no layout pass to run; the content is drawn
-        /// into the window directly.
-        pub fn layout_dialog(&self) {}
-        /// Show or hide without destroying. `close` ends the dialog, so this is
-        /// a different operation, not an alias.
-        pub fn set_visible(&self, _visible: bool) {}
-        /// The container a dialog's children are added to. A terminal dialog
-        /// has one implicit content area, so the dialog's own node is it.
-        pub fn get_content_area(&self) -> *mut c_void { &self.id as *const usize as *mut c_void }
-        /// Run the dialog and return the response id.
+
+        /// The dialog's content area. A terminal dialog has no separate
+        /// content widget -- `append_content_area` hands its child straight to
+        /// `set_child`, so the content *is* the first child. Returns null when
+        /// nothing has been appended, which is the honest "no content area
+        /// yet" rather than a dangling id.
+        pub fn get_content_area(&self) -> *mut c_void {
+            match crate::backends::pancurses::first_child(self.id) {
+                Some(c) => c as *mut c_void,
+                None => std::ptr::null_mut(),
+            }
+        }
+
+        /// Lay out the dialog's content and button row.
         ///
-        /// There is no nested event loop here: presenting is a state change,
-        /// and the terminal keeps reading input from the main loop rather than
-        /// blocking here. So this presents and returns 0, the same shape the
-        /// Android adapter documents.
-        pub fn run(&self) -> i32 { self.present(); 0 }
+        /// A no-op for the same reason `set_transient_for` above is: a
+        /// terminal has no window to measure, and the shared GUI calls this to
+        /// settle a size before showing. `set_default_size` is likewise inert
+        /// here. Stated rather than silently missing so the call site compiles
+        /// and the reason is on the record.
+        pub fn layout_dialog(&self) {}
+
+        /// Show or hide without destroying.
+        ///
+        /// Distinct from `close`, which is GTK's "destroy the window" and
+        /// cannot be undone. See
+        /// `backends::pancurses::set_visible` for what this actually changes.
+        pub fn set_visible(&self, visible: bool) {
+            crate::backends::pancurses::set_visible(self.id, visible);
+        }
+
+        /// The response id a dismiss reports when no button was chosen.
+        ///
+        /// The dialog code calls this to mark which button a plain dismissal
+        /// (no button click) should answer as. GTK's equivalent is
+        /// `GTK_RESPONSE_CANCEL`; recorded on the node so it is not simply
+        /// discarded, which is what a bare no-op would mean for a value the
+        /// caller has already computed.
+        pub fn set_default_response(&self, response_id: i32) {
+            crate::backends::pancurses::set_dialog_default_response(self.id, response_id);
+        }
+
+        /// Run the dialog's nested loop and return the response id.
+        ///
+        /// The terminal backend's `Dialog` is not a modal loop: `present` and
+        /// `connect_response` are both inert, so there is no response to wait
+        /// for. Returns 0, which is not a valid GTK response id (those start
+        /// at 1), so a caller gets an unambiguous "none" rather than a
+        /// plausible-looking wrong answer. Same as
+        /// `backends_nwg_adapter.rs`.
+        pub fn run(&self) -> i32 { 0 }
     }
 
     // -- DropDown --
@@ -574,11 +607,26 @@ mod pancurses_adapter {
         pub fn grab_focus(&self) {}
         /// Terminal dropdowns are not pixel-positioned; no-op.
         pub fn set_offset(&self, _x: i32, _y: i32) {}
+        /// Terminal dropdowns take no GTK-style flex expansion; no-op.
+        ///
+        /// The dialog code sets this on the in-dialog dropdown so it fills the
+        /// dialog's width on GTK. A terminal dialog is drawn as text, so there
+        /// is no width to expand into.
+        pub fn set_hexpand(&self, _expand: bool) {}
         pub fn set_items(&self, items: &[&str]) {
             crate::backends::pancurses::set_dropdown_items(self.id, items);
         }
-        pub fn set_active(&self, idx: i32) {
-            crate::backends::pancurses::set_dropdown_selected(self.id, idx);
+        /// `Option<u32>`, as on every other backend: `None` is "nothing
+        /// selected", which this backend's own `set_dropdown_selected` already
+        /// represents as a `None` on the node. The signature was `i32` here
+        /// and nowhere else, so a caller passing `Some(i)` -- what GTK, NWG,
+        /// zork and wasm all take -- did not compile against the terminal
+        /// backend at all.
+        pub fn set_active(&self, index: Option<u32>) {
+            crate::backends::pancurses::set_dropdown_selected(
+                self.id,
+                index.map(|i| i as i32).unwrap_or(-1),
+            );
         }
         pub fn get_active(&self) -> i32 {
             crate::backends::pancurses::get_dropdown_selected(self.id)

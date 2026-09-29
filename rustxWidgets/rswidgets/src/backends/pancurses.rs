@@ -505,7 +505,13 @@ mod pancurses_backend {
         Entry { buffer: String, cursor: usize },
         CheckButton { label: String, checked: bool },
         RadioButton { label: String, checked: bool, group_id: usize },
-        Dialog { title: String },
+        Dialog {
+            title: String,
+            /// The response id a dismissal reports when no button was
+            /// chosen. `None` means "not set", which is distinct from
+            /// "set to 0": 0 is a real response id a caller may register.
+            default_response: Option<i32>,
+        },
         Menu,
         MenuBar { labels: Vec<crate::Label>, submenu_items: Vec<(crate::Label, Vec<crate::MenuItem>)> },
         SimpleAction,
@@ -3203,7 +3209,7 @@ mod pancurses_backend {
                 }
             }
             PcWidgetKind::BoxWidget { .. } | PcWidgetKind::Grid { .. } | PcWidgetKind::Sizer(_) => {}
-            PcWidgetKind::Dialog { title } => {
+            PcWidgetKind::Dialog { title, .. } => {
                 if has_colors() {
                     root.attron(COLOR_PAIR(7));
                 }
@@ -5306,6 +5312,83 @@ mod pancurses_backend {
         });
     }
 
+    /// Request a size for a widget, preserving its position.
+    ///
+    /// GTK's `gtk_widget_set_size_request` sets a *minimum*, not a size: a box
+    /// still grows with its content. The terminal layout has no such
+    /// negotiation, so the request is applied as the rect's size directly and
+    /// the existing x/y is kept -- changing position would be a side effect a
+    /// caller asking only for a size did not ask for. A zero or negative
+    /// dimension means "no request" and is ignored, which is what GTK treats
+    /// it as too.
+    pub fn set_size_request(id: usize, w: i32, h: i32) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if w > 0 {
+                    n.rect.w = w;
+                }
+                if h > 0 {
+                    n.rect.h = h;
+                }
+            }
+        });
+    }
+
+    /// Show or hide a widget.
+    ///
+    /// The renderer already skips nodes with `visible == false` (see the draw
+    /// loop, which filters on `n.visible`), so this is a real state change
+    /// rather than a no-op: a hidden widget stops being drawn and stops being
+    /// reachable by hit-testing.
+    pub fn set_visible(id: usize, visible: bool) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                n.visible = visible;
+            }
+        });
+    }
+
+    /// Whether a widget is currently shown. See [`Self::set_visible`].
+    pub fn is_visible(id: usize) -> bool {
+        with_state(|s| s.node(id).map(|n| n.visible).unwrap_or(false))
+    }
+
+    /// Record the response id a dialog reports when it is dismissed without
+    /// a button. See `Dialog::set_default_response`.
+    pub fn set_dialog_default_response(id: usize, response_id: i32) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Dialog {
+                    ref mut default_response,
+                    ..
+                } = n.kind
+                {
+                    *default_response = Some(response_id);
+                }
+            }
+        });
+    }
+
+    /// The recorded default response for a dialog, if any.
+    pub fn dialog_default_response(id: usize) -> Option<i32> {
+        with_state(|s| match s.node(id) {
+            Some(n) => match n.kind {
+                PcWidgetKind::Dialog { default_response, .. } => default_response,
+                _ => None,
+            },
+            None => None,
+        })
+    }
+
+    /// A widget's first child, or `None` when it has none.
+    ///
+    /// `Dialog::get_content_area` needs this because a terminal dialog has no
+    /// separate content widget: `append_content_area` hands the child straight
+    /// to `set_child`, so the content area *is* the first child.
+    pub fn first_child(id: usize) -> Option<usize> {
+        with_state(|s| s.node(id).and_then(|n| n.children.first().copied()))
+    }
+
     pub fn create_sizer(sizer: crate::Sizer) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         Ok(with_state(|s| s.add_node(PcWidgetKind::Sizer(sizer), find_window_id(s))))
     }
@@ -5347,7 +5430,7 @@ mod pancurses_backend {
 
     pub fn create_dialog() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         Ok(with_state(|s| {
-            let id = s.add_node(PcWidgetKind::Dialog { title: String::new() }, find_window_id(s));
+            let id = s.add_node(PcWidgetKind::Dialog { title: String::new(), default_response: None }, find_window_id(s));
             // Dialogs created at runtime otherwise keep a zero-size default rect and
             // never render.  Give them a centered box sized to the window.
             if let Some(win_id) = find_window_id(s) {
@@ -5853,7 +5936,7 @@ mod pancurses_backend {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
                 match &mut n.kind {
-                    PcWidgetKind::Window { title: ref mut t } | PcWidgetKind::Dialog { title: ref mut t } => {
+                    PcWidgetKind::Window { title: ref mut t } | PcWidgetKind::Dialog { title: ref mut t, .. } => {
                         *t = title.to_string();
                     }
                     _ => {}
