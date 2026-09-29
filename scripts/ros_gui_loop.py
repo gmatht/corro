@@ -285,20 +285,39 @@ def interact(q, out, frames=None):
     counter = [0]
 
     def grab():
-        """One screendump; a PNG always, plus a numbered frame for the video."""
+        """One screendump; a PNG always, plus a numbered frame for the video.
+
+        The frame is only accepted once the screen has settled. A screendump
+        can land between the window's erase and the BitBlt that repaints it,
+        and that mid-paint frame is a blank white screen - which reads as the
+        app having crashed and puts a white flash in the video. Re-grabbing
+        until the picture stops changing (or the budget runs out) keeps both
+        the assertions and the recording honest about a running app.
+        """
         path = os.path.join(out, f"ix-{len(steps):02d}.png")
-        q.cmd("screendump", {"filename": path, "format": "ppm"})
-        if frames:
-            # Written as PNG directly: the screendump is PPM, and transcoding
-            # a whole run of those to PNG afterwards is both slower and a
-            # second thing that can fail after the VM is already gone.
-            png = os.path.join(frames, "f%05d.png" % counter[0])
-            counter[0] += 1
-            try:
-                from PIL import Image
-                Image.open(path).save(png)
-            except Exception:
-                pass
+        prev = None
+        for attempt in range(6):
+            q.cmd("screendump", {"filename": path, "format": "ppm"})
+            if frames:
+                # Written as PNG directly: the screendump is PPM, and
+                # transcoding a whole run of those afterwards is both slower
+                # and a second thing that can fail after the VM is gone.
+                png = os.path.join(frames, "f%05d.png" % counter[0])
+                counter[0] += 1
+                try:
+                    from PIL import Image
+                    Image.open(path).save(png)
+                    if attempt and prev is not None:
+                        a = Image.open(png)
+                        b = Image.open(prev)
+                        if list(a.getdata()) == list(b.getdata()):
+                            break        # identical to the last frame: settled
+                    prev = png
+                except Exception:
+                    pass
+            else:
+                break
+            time.sleep(0.4)
         return path
 
     log("== interaction: driving the grid")
@@ -306,11 +325,12 @@ def interact(q, out, frames=None):
     grab()
     for label, keys in steps:
         q.cmd("send-key", {"keys": keys})
-        # Let the guest process the key and redraw. Several frames per step so
-        # the video shows the transition, not just its end state.
-        for _ in range(4):
-            time.sleep(0.5)
+        # Several frames per step so the video shows the transition, not just
+        # its end state. The first is grabbed after a short settle.
+        time.sleep(0.8)
+        for _ in range(3):
             grab()
+            time.sleep(0.4)
         log(f"   {label} done ({counter[0]} frames)")
 
 
