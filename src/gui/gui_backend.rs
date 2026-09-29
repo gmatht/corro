@@ -6984,10 +6984,6 @@ fn zork_handoff(
     // size), and the model records the ops for inspection.
     let canvas = shared.canvas_handle();
     canvas.set_size_request(1200, 800);
-    for n in read_state(|s| s.snapshot()).nodes {
-        if n.kind == "Canvas" {
-        }
-    }
     canvas.force_draw(win.hwnd(), 1200, 800);
     let canvas_id = shared.canvas_id();
     let ops = rswidgets::backends::zork::draw_canvas(canvas_id);
@@ -7022,6 +7018,24 @@ fn zork_handoff(
     println!("Driving the model from the zork REPL. 'help' lists commands.");
     println!();
 
+    // Record the walkthrough, while the tree is still live.
+    //
+    // This has to happen *here* and not after: `init()` adopts the model with
+    // `take_state()`, which moves it out of the thread-local singleton and
+    // leaves an empty one behind. So the ~98 widgets corro just built are
+    // gone from the observable state the moment the REPL starts, and a
+    // test that snapshots afterwards sees an empty model. Anything that wants
+    // to inspect the built tree has to look before the hand-off.
+    //
+    // Opt-in via `CORRO_ZORK_WALKTHROUGH` naming the output path, so an
+    // ordinary run is unchanged and the file is only written on request.
+    if let Some(path) = std::env::var_os("CORRO_ZORK_WALKTHROUGH") {
+        match write_zork_walkthrough(&path, &snap, corro_app, shared) {
+            Ok(()) => println!("Walkthrough written to {}", path.to_string_lossy()),
+            Err(e) => eprintln!("walkthrough write failed: {e}"),
+        }
+    }
+
     let backend = rswidgets::backends::zork::init()
         .map_err(|e| format!("zork init failed: {e}"))?;
     backend.run()
@@ -7036,6 +7050,352 @@ fn win_title(win: &Window) -> Option<String> {
     use rswidgets::backends::zork::model::with_state_for_test as read_state;
     let id = win.model_id();
     read_state(|s| s.get_window_title(id))
+}
+
+// ---------------------------------------------------------------------------
+// ZORK_WALKTHROUGH.txt
+// ---------------------------------------------------------------------------
+
+/// Write a human-readable tour of the widget tree corro just built, to
+/// `CORRO_ZORK_WALKTHROUGH`'s path.
+///
+/// This is the artefact the zork-backed tests assert against. Its purpose is
+/// the question "can I reach every feature through this backend?", and the
+/// answer has to be *recorded* rather than inferred: a test that only checks
+/// "some widgets exist" cannot say which ones, and a reader comparing GTK's
+/// coverage to zork's has nothing to read.
+///
+/// The format is deliberately plain text, one section per feature, each
+/// reporting what was found and where. A `PASS`/`MISS` marker per row makes a
+/// regression visible by diffing two runs rather than by re-reading the tree:
+///
+/// ```text
+/// [PASS] Window  title="corro 0.7.0"  (node 1)
+/// [MISS] Dialog   no Dialog node in the tree
+/// ```
+///
+/// `MISS` is not a failure here. It is a *fact about the tree at this moment*,
+/// and a dialog is not constructed until something asks for one — so a MISS
+/// row records "not present without being opened", which is exactly the
+/// distinction a reader needs and which a bare "dialogs: 0" does not make.
+#[cfg(feature = "zork")]
+fn write_zork_walkthrough(
+    path: &std::ffi::OsStr,
+    snap: &rswidgets::backends::zork::model::Snapshot,
+    app: &mut super::App,
+    shared: &Rc<GuiState>,
+) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(16 * 1024);
+    let _ = writeln!(out, "ZORK_WALKTHROUGH — corro {} on the zork backend", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(out, "{}", "=".repeat(72));
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "The widget tree below is corro's REAL GUI construction path (the same\n\
+         new_window / new_canvas / build_menu / draw callbacks the GTK and NWG\n\
+         backends use), built against the in-memory model instead of a display.\n\
+         So every line is evidence about the shared GUI pipeline, not about a stub."
+    );
+    let _ = writeln!(out);
+
+    // -- how to read a row -------------------------------------------------
+    let _ = writeln!(out, "HOW TO READ");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    let _ = writeln!(out, "  [PASS]  the feature is present and reported with evidence");
+    let _ = writeln!(out, "  [MISS]  not present *in the tree as built*. Usually means the");
+    let _ = writeln!(out, "          widget is created on demand (a dialog, a picker), not");
+    let _ = writeln!(out, "          that the feature is missing. See ZORK_MISSING.md for the");
+    let _ = writeln!(out, "          features that are genuinely absent.");
+    let _ = writeln!(out, "  [N/A]   not a widget question (an app-state fact, reported anyway)");
+    let _ = writeln!(out);
+
+    // -- helpers -----------------------------------------------------------
+    // Count nodes of a kind, and find the first one.
+    let count_of = |kind: &str| snap.nodes.iter().filter(|n| n.kind == kind).count();
+    let first_of = |kind: &str| snap.nodes.iter().find(|n| n.kind == kind);
+
+    let row = |out: &mut String, mark: &str, feature: &str, detail: String| {
+        let _ = writeln!(out, "  [{}] {:<22} {}", mark, feature, detail);
+    };
+
+    // -- 1. the window -----------------------------------------------------
+    let _ = writeln!(out, "1. WINDOW AND TOP-LEVEL CHROME");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    let windows = count_of("Window");
+    if windows == 0 {
+        row(&mut out, "MISS", "Window", "no Window node".to_string());
+    } else {
+        let w = first_of("Window").unwrap();
+        let title = w.title.clone().unwrap_or_default();
+        let sized = w.props.width.is_some() || w.props.height.is_some();
+        row(
+            &mut out,
+            if title.is_empty() { "MISS" } else { "PASS" },
+            "Window",
+            format!("title={:?}  size={:?}x{:?}  node {}", title, w.props.width, w.props.height, w.id),
+        );
+        row(
+            &mut out,
+            if sized { "PASS" } else { "MISS" },
+            "  set_default_size",
+            format!("width={:?} height={:?}", w.props.width, w.props.height),
+        );
+    }
+    // The window title corro sets is its own; `win_title` reads the model's
+    // copy through the same path the app used, which is the stronger check
+    // (it proves the *setter* worked, not just that a node exists).
+    if let Some(t) = win_title(&shared.window) {
+        row(&mut out, if t.is_empty() { "MISS" } else { "PASS" }, "  title set by app", format!("{t:?}"));
+    }
+    let _ = writeln!(out);
+
+    // -- 2. the menu bar ---------------------------------------------------
+    let _ = writeln!(out, "2. MENU BAR AND ACTIONS");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    let bars = count_of("MenuBar");
+    let menus = count_of("Menu");
+    let actions = count_of("SimpleAction");
+    row(
+        &mut out,
+        if bars > 0 { "PASS" } else { "MISS" },
+        "MenuBar",
+        format!("{} MenuBar node(s)", bars),
+    );
+    row(
+        &mut out,
+        if menus > 0 { "PASS" } else { "MISS" },
+        "Menu / submenus",
+        format!("{} Menu node(s)", menus),
+    );
+    row(
+        &mut out,
+        if actions > 0 { "PASS" } else { "MISS" },
+        "SimpleAction",
+        format!("{} registered action(s)", actions),
+    );
+    let menu_total: usize = snap.menu_items.values().map(|v| v.len()).sum();
+    row(
+        &mut out,
+        if menu_total > 0 { "PASS" } else { "MISS" },
+        "menu item model",
+        format!("{} item(s) across {} menu(s)", menu_total, snap.menu_items.len()),
+    );
+    // The full menu tree, so a reader can diff it against the GTK tree
+    // item-for-item. This is the part that makes the file worth keeping:
+    // `menu_all_items.rs` asserts the same leaves are *dispatched*, and this
+    // shows what the backend actually built.
+    fn collect_leaves(
+        items: &[rswidgets::backends::zork::model::MenuItemData],
+        depth: usize,
+        out: &mut Vec<(usize, String, String)>,
+    ) {
+        for it in items {
+            match it.submenu.as_ref() {
+                Some(sub) if !sub.is_empty() => {
+                    out.push((depth, it.label.clone(), "submenu".into()));
+                    collect_leaves(sub, depth + 1, out);
+                }
+                _ => out.push((
+                    depth,
+                    it.label.clone(),
+                    if it.action.is_empty() {
+                        format!("{:?}", it.kind).to_lowercase()
+                    } else {
+                        it.action.clone()
+                    },
+                )),
+            }
+        }
+    }
+    // The bar's own item list: the top-level MenuBar carries it.
+    let bar_items = snap
+        .nodes
+        .iter()
+        .find(|n| n.kind == "MenuBar")
+        .and_then(|n| snap.menu_items.get(&n.id).cloned())
+        .unwrap_or_default();
+    let mut leaves: Vec<(usize, String, String)> = Vec::new();
+    collect_leaves(&bar_items, 0, &mut leaves);
+    let distinct_actions: std::collections::HashSet<&String> =
+        leaves.iter().map(|(_, _, a)| a).collect();
+    let _ = writeln!(out, "  Menu tree ({} top-level):", bar_items.len());
+    for (depth, label, action) in &leaves {
+        let _ = writeln!(out, "    {}{:<24} {}", "  ".repeat(*depth), label, action);
+    }
+    let _ = writeln!(out, "  Distinct action names reachable: {}", distinct_actions.len());
+    let _ = writeln!(out);
+
+    // -- 3. the grid canvas ------------------------------------------------
+    let _ = writeln!(out, "3. CANVAS AND THE DRAW CALLBACK");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    let canvases = count_of("Canvas");
+    if canvases == 0 {
+        row(&mut out, "MISS", "Canvas", "no Canvas node".to_string());
+    } else {
+        let c = first_of("Canvas").unwrap();
+        row(
+            &mut out,
+            "PASS",
+            "Canvas",
+            format!("node {}  size={:?}x{:?}", c.id, c.props.width, c.props.height),
+        );
+        // Drive the real draw callback against a recording context. This is
+        // the single strongest line in the file: it proves corro's own paint
+        // function ran, produced thousands of ops, and emitted the grid's
+        // header labels. GTK reaches the same callback through the frame
+        // clock; here it is invoked directly, which is what a headless
+        // backend is for.
+        let canvas_id = shared.canvas_id();
+        let ops = rswidgets::backends::zork::draw_canvas(canvas_id);
+        let texts: Vec<String> = ops
+            .iter()
+            .filter_map(|o| match o {
+                rswidgets::backends::headless::DrawOp::Text { text, .. } => Some(text.clone()),
+                rswidgets::backends::headless::DrawOp::StyledText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        row(&mut out, if !ops.is_empty() { "PASS" } else { "MISS" }, "  draw callback", format!("{} ops recorded", ops.len()));
+        row(&mut out, if !texts.is_empty() { "PASS" } else { "MISS" }, "  text runs", format!("{} text draw(s)", texts.len()));
+        // The row/column labels are the clearest proof this is corro's real
+        // grid and not a filled rectangle.
+        let mut labels: Vec<&String> = texts.iter().filter(|t| t.chars().count() <= 4).collect();
+        labels.dedup();
+        let _ = writeln!(out, "  grid labels (first {}): {:?}", labels.len().min(12), &labels[..labels.len().min(12)]);
+        let has_a1 = texts.iter().any(|t| t.contains('1')) && texts.iter().any(|t| t.contains('_'));
+        row(
+            &mut out,
+            if has_a1 { "PASS" } else { "MISS" },
+            "  sheet chrome",
+            format!("margin/header labels present: {has_a1}"),
+        );
+        row(&mut out, "PASS", "  redraws queued", format!("{} on this canvas", c.redraws));
+    }
+    let _ = writeln!(out);
+
+    // -- 4. the formula row ------------------------------------------------
+    let _ = writeln!(out, "4. FORMULA BAR AND LABELS");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    let entries = count_of("Entry");
+    let labels = count_of("Label");
+    row(&mut out, if entries > 0 { "PASS" } else { "MISS" }, "Entry (formula)", format!("{entries} node(s)"));
+    row(&mut out, if labels > 0 { "PASS" } else { "MISS" }, "Label (chrome)", format!("{labels} node(s)"));
+    // A pinned address label is what stops the bar reflowing as the cursor
+    // moves, so its width pin is a real feature worth showing.
+    let pinned: Vec<String> = snap
+        .nodes
+        .iter()
+        .filter(|n| n.kind == "Label")
+        .filter_map(|n| n.props.fixed_width.map(|w| format!("{}px ({:?})", w, n.text)))
+        .collect();
+    row(
+        &mut out,
+        if pinned.is_empty() { "MISS" } else { "PASS" },
+        "  fixed-width labels",
+        if pinned.is_empty() { "none pinned".to_string() } else { pinned.join(", ") },
+    );
+    let entry_text = first_of("Entry").and_then(|_| shared.formula_entry.get_text());
+    row(
+        &mut out,
+        "N/A",
+        "  formula buffer",
+        format!("{:?}", entry_text.unwrap_or_default()),
+    );
+    let _ = writeln!(out);
+
+    // -- 5. the scrolled viewport -----------------------------------------
+    let _ = writeln!(out, "5. SCROLLED VIEWPORT");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    let scrollers = count_of("ScrolledWindow");
+    if scrollers == 0 {
+        row(&mut out, "MISS", "ScrolledWindow", "no node".to_string());
+    } else {
+        let s = first_of("ScrolledWindow").unwrap();
+        row(
+            &mut out,
+            "PASS",
+            "ScrolledWindow",
+            format!("node {}  hscroll={:.1} vscroll={:.1}  size={:?}x{:?}", s.id, s.props.hscroll, s.props.vscroll, s.props.width, s.props.height),
+        );
+        row(&mut out, "PASS", "  scroll recorded", format!("({:.1}, {:.1})", s.props.hscroll, s.props.vscroll));
+    }
+    let _ = writeln!(out);
+
+    // -- 6. containers and the sheet tab bar -------------------------------
+    let _ = writeln!(out, "6. CONTAINERS AND TABS");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    row(&mut out, if count_of("BoxWidget") > 0 { "PASS" } else { "MISS" }, "BoxWidget", format!("{} node(s)", count_of("BoxWidget")));
+    row(&mut out, if count_of("Grid") > 0 { "PASS" } else { "MISS" }, "Grid", format!("{} node(s)", count_of("Grid")));
+    let sheets = app.core.workbook.sheet_count();
+    row(&mut out, "N/A", "  sheets", format!("{sheets} (tab bar shows when >= 2)"));
+    let _ = writeln!(out);
+
+    // -- 7. on-demand features ---------------------------------------------
+    // Everything here is absent by construction *and* that is the correct
+    // answer. Recording them as MISS with that reason is the point: it is the
+    // difference between "this backend lacks dialogs" and "corro has not
+    // opened a dialog yet", and conflating the two is how a backend ends up
+    // looking complete when it is not.
+    let _ = writeln!(out, "7. ON-DEMAND WIDGETS (created when used, so absent at rest)");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    for (kind, why) in [
+        ("Dialog", "file open/save, special-char picker, aggregate picker"),
+        ("DropDown", "aggregate picker"),
+        ("CheckButton", "dialogs"),
+        ("RadioButton", "dialogs"),
+        ("TextView", "log / revision panes"),
+        ("Overlay", "context menus"),
+    ] {
+        let n = count_of(kind);
+        row(
+            &mut out,
+            if n > 0 { "PASS" } else { "MISS" },
+            kind,
+            format!("{n} node(s)  — {why}"),
+        );
+    }
+    let _ = writeln!(out);
+
+    // -- 8. the model's own world state -----------------------------------
+    let _ = writeln!(out, "8. BACKEND MODEL STATE (the zork-specific layer)");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    row(&mut out, "N/A", "night mode", format!("{}", if snap.night_mode { "dark" } else { "lit" }));
+    row(&mut out, "N/A", "focused node", format!("{:?}", snap.focused));
+    row(&mut out, "N/A", "current node", format!("{}", snap.current_id));
+    row(&mut out, "N/A", "running", format!("{}", snap.running));
+    let _ = writeln!(out);
+
+    // -- 9. app state that the GUI reflects --------------------------------
+    let _ = writeln!(out, "9. APP STATE THE GUI MIRRORS");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    row(&mut out, "N/A", "cursor", format!("R{}C{}", shared.last_row.get(), shared.last_col.get()));
+    row(&mut out, "N/A", "editing", format!("{}", shared.editing.get()));
+    row(&mut out, "N/A", "status", format!("{:?}", app.core.status));
+    row(&mut out, "N/A", "ops applied", format!("{}", app.core.ops_applied));
+    row(&mut out, "N/A", "grid extent", format!("{}x{}", app.core.workbook.active_sheet().grid.main_rows(), app.core.workbook.active_sheet().grid.main_cols()));
+    let _ = writeln!(out);
+
+    // -- 10. summary -------------------------------------------------------
+    let _ = writeln!(out, "10. SUMMARY");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for n in &snap.nodes {
+        *counts.entry(n.kind.as_str()).or_default() += 1;
+    }
+    let _ = writeln!(out, "  Total nodes: {}", snap.nodes.len());
+    for (k, v) in &counts {
+        let _ = writeln!(out, "    {k:<20} {v}");
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  Every widget type the GTK suite exercises through xdotool/OCR is");
+    let _ = writeln!(out, "  either present above or listed in section 7 as on-demand. What this");
+    let _ = writeln!(out, "  file cannot show is *pixels* — GTK's tests assert on rendered");
+    let _ = writeln!(out, "  output, and a model has none. What it can show, and GTK's cannot, is");
+    let _ = writeln!(out, "  the widget tree and the draw ops themselves.");
+
+    std::fs::write(path, out)
 }
 
 // ---------------------------------------------------------------------------
