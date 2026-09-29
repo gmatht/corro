@@ -65,9 +65,15 @@ Regenerating the shims
 The generated pair is checked in, and CI fails if it is stale (a stale `.m` is
 a *runtime* crash, not a compile error, so nothing else would notice):
 
-    RSWIDGETS_APPLE_PROJECT="$PWD" cargo +nightly build \
-      --target aarch64-apple-darwin -Zbuild-std=std,panic_abort \
-      --features generate-apple-shims
+    cargo +nightly build --target aarch64-apple-darwin \
+      -Zbuild-std=std,panic_abort --features generate-apple-shims
+
+The feature is what compiles the generator in: without it the build script is
+empty, so a plain `cargo check` of this crate pulls in no generator code and
+emits no warnings. It also points the generator at this directory, so
+`RSWIDGETS_APPLE_PROJECT` only has to be set when generating into some *other*
+Apple project root (which is how the CI staleness check generates into a
+temporary directory instead of dirtying the checkout).
 
 Generation is additive: an existing file is never overwritten, so a
 hand-edited `.m` survives and "delete it to regenerate" is the escape hatch.

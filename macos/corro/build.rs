@@ -31,24 +31,50 @@
 //! than a crash. Both stay in `app/CorroMacShims.m`; the generated header
 //! declares their signatures so a mismatch is caught at compile time.
 
+// The generator module is included only when it will actually run.
+//
+// `#[path]`-including it unconditionally compiled a module whose every item is
+// dead in the common case: the generator is only *called* when
+// `RSWIDGETS_APPLE_PROJECT` names a project root, so an ordinary
+// `cargo check` of the host crate (the Linux CI step, and any developer
+// building the crate for its own use) produced eight `never used` warnings
+// from a file it never used. Gating the include on the same feature that
+// gates the calls makes the build script say what it does: with the feature
+// off, there is no generator and nothing to warn about.
+//
+// This is a *build-script* cfg, so it sees this crate's own features; the
+// crate's lib does not reference the generator either way.
+#[cfg(feature = "generate-apple-shims")]
 #[path = "../../rustxWidgets/rswidgets/src/apple_generator.rs"]
+#[allow(dead_code)] // vendored whole; this build script uses a subset
 mod apple_generator;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../rustxWidgets/rswidgets/src/apple_generator.rs");
+
+    // A host build enables the feature, which both supplies the project root
+    // and makes the generator exist. Without it this crate is a plain
+    // library with no build step to speak of.
+    #[cfg(feature = "generate-apple-shims")]
+    generate_shims();
+}
+
+/// Emit the Objective-C forwarding shims into the app project.
+///
+/// Split out of `main` so the module include and the calls can sit behind one
+/// `cfg` without repeating it on every line.
+#[cfg(feature = "generate-apple-shims")]
+fn generate_shims() {
     println!(
         "cargo:rerun-if-env-changed={}",
         apple_generator::PROJECT_ENV
     );
 
-    // `--features generate-apple-shims` sets the variable to this crate's
-    // project root, so build_macos.sh does not have to export it.
-    if cfg!(feature = "generate-apple-shims")
-        && std::env::var(apple_generator::PROJECT_ENV).is_err()
-    {
-        // The project root is this crate's own directory
-        // (macos/corro -> macos/corro).
+    // The feature points the generator at this crate's own directory
+    // (macos/corro -> macos/corro), so build_macos.sh does not have to
+    // export anything.
+    if std::env::var(apple_generator::PROJECT_ENV).is_err() {
         let root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
         std::env::set_var(apple_generator::PROJECT_ENV, root);
     }
