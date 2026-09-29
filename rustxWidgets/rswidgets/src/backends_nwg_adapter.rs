@@ -25,6 +25,13 @@ mod nwg_adapter {
                 hwnd as winapi::shared::windef::HWND,
                 winapi::um::winuser::SW_SHOW,
             );
+            // The scrolled window is the canvas's *parent* (see
+            // force_visible): if the frame's own WS_VISIBLE bit is never set,
+            // the canvas is invisible with it however well it paints. A bare
+            // ShowWindow does not reliably establish that bit on ReactOS for a
+            // WS_CHILD created while its parent was still being built, so
+            // assert it directly for every child this lays out.
+            force_visible(hwnd as winapi::shared::windef::HWND);
             // TEMPORARY ReactOS diagnosis: ShowWindow did not set WS_VISIBLE?
             #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
             {
@@ -75,6 +82,70 @@ mod nwg_adapter {
                 std::ptr::null_mut(), x, y, w, h,
                 winapi::um::winuser::SWP_NOZORDER,
             );
+        }
+    }
+
+    /// Force a window visible, setting the `WS_VISIBLE` style bit *directly*
+    /// and then showing it.
+    ///
+    /// `ShowWindow(SW_SHOW)` is not enough on its own. ReactOS leaves a
+    /// `WS_CHILD` window created with `WS_VISIBLE` while its parent is still
+    /// being constructed un-mapped, and does not honour a later
+    /// `ShowWindow(SW_SHOW)` for it either - the bit stays clear, so
+    /// `IsWindowVisible` reports the whole subtree as hidden, nothing in it
+    /// is ever composited, and its descendants paint into a DC whose bits are
+    /// never blitted to the screen. That is exactly the symptom: the grid
+    /// canvas ran its entire draw callback (log shows healthy paints, BitBlt
+    /// reports success) and the grid area stayed blank white.
+    ///
+    /// The scrolled window is the one widget that needs this: it is the
+    /// *parent* of the canvas, so if the frame stays hidden the canvas is
+    /// invisible with it no matter how healthy the canvas's own painting is.
+    /// Writing the style bit directly is the one operation ReactOS does not
+    /// drop; the `ShowWindow` that follows turns the bit into a real map.
+    /// Windows the app explicitly hid through this backend's `set_visible`.
+    ///
+    /// A layout pass must not infer "hidden" from a missing `WS_VISIBLE` style
+    /// bit: ReactOS strips that bit from every child at creation and does not
+    /// always restore it, so a freshly created container looks hidden forever
+    /// and the layout keeps it at zero size. Only an explicit `set_visible(
+    /// false)` is a real hide, and that is the only thing recorded here.
+    fn explicitly_hidden_windows() -> &'static std::cell::RefCell<std::collections::HashSet<usize>> {
+        thread_local! {
+            static REG: &'static std::cell::RefCell<std::collections::HashSet<usize>> =
+                Box::leak(Box::new(std::cell::RefCell::new(std::collections::HashSet::new())));
+        }
+        REG.with(|r| *r)
+    }
+
+    /// Record (or clear) an explicit hide for a window.
+    fn set_explicitly_hidden(hwnd: *mut c_void, hidden: bool) {
+        if hwnd.is_null() {
+            return;
+        }
+        let reg = explicitly_hidden_windows();
+        let mut r = reg.borrow_mut();
+        if hidden {
+            r.insert(hwnd as usize);
+        } else {
+            r.remove(&(hwnd as usize));
+        }
+    }
+
+    fn force_visible(hwnd: winapi::shared::windef::HWND) {
+        if hwnd.is_null() {
+            return;
+        }
+        unsafe {
+            let style = winapi::um::winuser::GetWindowLongW(hwnd, winapi::um::winuser::GWL_STYLE);
+            if style & winapi::um::winuser::WS_VISIBLE as i32 == 0 {
+                winapi::um::winuser::SetWindowLongW(
+                    hwnd,
+                    winapi::um::winuser::GWL_STYLE,
+                    style | winapi::um::winuser::WS_VISIBLE as i32,
+                );
+            }
+            winapi::um::winuser::ShowWindow(hwnd, winapi::um::winuser::SW_SHOW);
         }
     }
 
@@ -1052,7 +1123,10 @@ mod nwg_adapter {
             }
         }
         pub fn get_text(&self) -> Option<String> { Some(self.inner.text()) }
-        pub fn set_visible(&self, visible: bool) { self.inner.set_visible(visible); }
+        pub fn set_visible(&self, visible: bool) {
+            set_explicitly_hidden(self.hwnd, !visible);
+            self.inner.set_visible(visible);
+        }
         pub fn set_markup(&self, markup: &str) { self.inner.set_text(markup); }
         /// Set the x alignment of the label's text (0.0 left .. 1.0 right).
         /// Win32 STATIC uses SS_CENTER/SS_RIGHT rather than a float, so map
@@ -1273,6 +1347,7 @@ mod nwg_adapter {
             // A child is "deliberately hidden" only if its OWN WS_VISIBLE bit
             // is clear - see the note on the test below.
             let mut hidden_children: Vec<*mut c_void> = Vec::new();
+            let explicitly_hidden = explicitly_hidden_windows().borrow().clone();
             for i in 0..n {
                 // Hidden children take no space (e.g. the sheet tab strip
                 // with a single sheet): hiding alone would otherwise leave
@@ -1294,6 +1369,30 @@ mod nwg_adapter {
                     ) as i32;
                     style & winapi::um::winuser::WS_VISIBLE as i32 == 0
                 };
+                // (Fix-ReactOS) A child whose style bit is clear is NOT
+                // necessarily hidden on purpose.
+                //
+                // ReactOS strips WS_VISIBLE from every WS_CHILD at creation
+                // (window.c: `pWnd->style = Cs->style & ~WS_VISIBLE`) and only
+                // restores it later via the CreateWindowEx show path, which a
+                // child created while its own parent is still being constructed
+                // does not always reach. So a freshly created container - here
+                // the scrolled window that holds the grid - enters its first
+                // layout with the bit clear.
+                //
+                // Treating that as "deliberately hidden" is self-sustaining: it
+                // gets desired size 0, the `cw > 0 || ch > 0` guard below then
+                // skips set_window_pos, so nothing ever shows it, so the next
+                // pass sees the same clear bit and hides it again. The grid
+                // then stays blank for good while the canvas keeps reporting
+                // perfectly healthy paints.
+                //
+                // `set_visible(false)` is the only thing that should remove a
+                // widget, and the adapter routes it through show_/hide_ below,
+                // so an explicit hide is recorded there. A child with no record
+                // is merely un-shown-yet, not hidden: give it a real size and
+                // let set_window_pos show it.
+                let hidden = hidden && explicitly_hidden.contains(&(children[i] as usize));
                 if hidden {
                     desired_sizes.push(0);
                     hidden_children.push(children[i]);
@@ -1807,7 +1906,10 @@ mod nwg_adapter {
                 }
             }
         }
-        pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
+        pub fn set_visible(&self, v: bool) {
+            set_explicitly_hidden(self.hwnd, !v);
+            self.inner.set_visible(v);
+        }
         /// Whether this entry currently holds keyboard focus (Win32
         /// GetFocus equals its hwnd). A null hwnd reads as false.
         pub fn has_focus(&self) -> bool {
@@ -2159,6 +2261,7 @@ mod nwg_adapter {
             if hwnd.is_null() {
                 return;
             }
+            set_explicitly_hidden(hwnd as _, !visible);
             unsafe {
                 winapi::um::winuser::ShowWindow(
                     hwnd as _,
@@ -2580,8 +2683,10 @@ mod nwg_adapter {
 
     impl Dialog {
         pub fn set_visible(&self, v: bool) {
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            set_explicitly_hidden(hwnd as _, !v);
             unsafe {
-                winapi::um::winuser::ShowWindow(self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as _, if v { winapi::um::winuser::SW_SHOW } else { winapi::um::winuser::SW_HIDE });
+                winapi::um::winuser::ShowWindow(hwnd as _, if v { winapi::um::winuser::SW_SHOW } else { winapi::um::winuser::SW_HIDE });
             }
         }
     }
@@ -2841,6 +2946,7 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
 
         pub fn set_visible(&self, visible: bool) {
             if !self.hwnd.is_null() {
+                set_explicitly_hidden(self.hwnd, !visible);
                 unsafe {
                     winapi::um::winuser::ShowWindow(
                         self.hwnd as _,
@@ -3201,11 +3307,7 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                                         // would BitBlt that garbage onto the
                                         // window as a black band.
                                         {
-                                            // TEMPORARY ReactOS diagnosis: paint the
-                                            // buffer bright RED so it is obvious on
-                                            // a screenshot whether this canvas's
-                                            // pixels reach the screen at all.
-                                            let color = winapi::um::wingdi::RGB(255, 0, 0);
+                                            let color = winapi::um::wingdi::RGB(240, 240, 240);
                                             let brush = winapi::um::wingdi::CreateSolidBrush(color);
                                             if !brush.is_null() {
                                                 let mut rect = winapi::shared::windef::RECT {
@@ -3463,6 +3565,11 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
             if ptr.is_null() || self.hwnd.is_null() { return; }
             unsafe {
                 winapi::um::winuser::SetParent(ptr as _, self.hwnd as _);
+                // (Fix-ReactOS) The viewport frame must be visible before the
+                // canvas is composited into it; assert the bit directly (see
+                // force_visible) since a bare ShowWindow is dropped here.
+                #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                force_visible(self.hwnd as _);
                 winapi::um::winuser::SetWindowPos(
                     ptr as _, std::ptr::null_mut(),
                     0, 0, 0, 0,
@@ -3539,6 +3646,13 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                 .map_err(|e| Error::Backend(format!("{}", e)))?;
         }
         let hwnd = frame.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void;
+        // (Fix-ReactOS) Assert the frame's own visibility at creation. The
+        // frame is the canvas's parent, so a hidden frame hides the grid no
+        // matter how correctly the canvas paints; and ReactOS does not
+        // reliably keep the WS_VISIBLE bit a WS_CHILD is created with when the
+        // parent is still being constructed. See force_visible.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        force_visible(hwnd as winapi::shared::windef::HWND);
 
         let mut vscroll = nwg::ScrollBar::default();
         nwg::ScrollBar::builder()
@@ -3618,6 +3732,20 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                 &nwg::ControlHandle::Hwnd(hwnd as _), sid,
                 move |_h, msg, _w, _l| {
                     if msg != winapi::um::winuser::WM_SIZE { return None; }
+                    // (Fix-ReactOS) Re-assert the frame's own visibility
+                    // FIRST, before any of the early-outs below.
+                    //
+                    // Both the settle guard and the zero-size check return
+                    // before the re-layout, so a re-assert placed after them
+                    // only runs on the one pass that happens to lay this frame
+                    // out - and WS_VISIBLE can be dropped again on a *later*
+                    // pass that takes an early-out. This frame is the canvas's
+                    // parent, so while it reads hidden the whole subtree
+                    // (canvas and both scrollbars) reports hidden even though
+                    // each carries its own WS_VISIBLE bit, and none of their
+                    // pixels are composited. See force_visible.
+                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                    force_visible(c_hwnd as _);
                     // TEMPORARY ReactOS diagnosis: scrolled frame WM_SIZE entry.
                     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
                     { mark95a(b"scsz-in\n"); }
