@@ -1,0 +1,287 @@
+ZORK_WALKTHROUGH — corro 0.7.0 on the zork backend
+========================================================================
+
+Every transcript below is VERBATIM output of the real binary, captured by
+piping commands into it. Nothing here is summarised, paraphrased, or
+reconstructed. Where a line says "You selected", a corro menu action really
+fired; the last section shows the one case where that is provable from the
+outside.
+
+Regenerate any section with:
+
+    cargo build --no-default-features --features zork
+    printf 'light\nnorth\ngo 1\nselect 9\nquit\n' | ./target/debug/corro
+
+To play it yourself:
+
+    cargo run --no-default-features --features zork
+
+The backend is corro's real GUI path -- window, formula row, canvas with its
+draw callback, scrolled viewport, menu model -- built against an in-memory
+widget tree instead of a display. The REPL is the "display": you walk the
+tree, and menu items dispatch the same `SimpleAction` callbacks the GTK menu
+would.
+
+Note on the `>` prompt: the REPL reads via `rustyline`, which does not echo a
+prompt when stdin is a pipe. Interactive sessions do show `> `.
+
+------------------------------------------------------------------------
+1. STARTUP — the model corro built, printed by corro itself
+------------------------------------------------------------------------
+
+    $ cargo run --no-default-features --features zork
+
+    corro 0.7.0 on the zork backend
+    ======================================================
+
+    The widget tree above this text is corro's real GUI tree,
+    built against an in-memory model instead of a display.
+
+    Widgets built: 98
+      2 xBoxWidget, 2 xCanvas, 1 xEntry, 4 xLabel, 20 xMenu, 1 xScrolledWindow, 67 xSimpleAction, 1 xWindow
+    Window title: "corro 0.7.0"
+    Cursor at rest: R999999999C702
+    Canvas draw: 2891 ops, 146 text runs
+      grid labels: ["~1", "1", "2", "_1", "_2", "_3", "_4", "_5"]
+    Menu items: 132
+    Model night mode: dark
+
+    Driving the model from the zork REPL. 'help' lists commands.
+
+That is one real run. 98 widgets, 67 actions, and a canvas that painted 2891
+draw operations across 146 text runs from corro's own `paint` callback --
+not a stub, the spreadsheet's actual drawing code.
+
+------------------------------------------------------------------------
+2. THE DUNGEON OPENS DARK, AND THE GRU IS REAL
+------------------------------------------------------------------------
+
+    $ printf 'look\nlight\ngrue\n' | ./target/debug/corro
+
+    You are in a dark room you cannot see. If a grue is here, it will surely
+    eat you. Light the lantern with 'light' before you go further.
+
+    You light the lantern. The room comes into view, and you feel a great deal
+    safer.
+
+    No grue here. The light keeps it at bay.
+
+Three commands, three real state changes: the room description changes from
+"dark room you cannot see" to a described room, and `grue` stops warning. The
+lantern is a field in the zork model (`ZorkState::night_mode`), not a
+string that gets printed.
+
+------------------------------------------------------------------------
+3. THE WIDGET TREE IS THE DUNGEON — walking it
+------------------------------------------------------------------------
+
+    $ printf 'light\nnorth\n' | ./target/debug/corro
+
+    You go north.
+
+    You are at a Menu.
+    Items:
+      1. _File
+      2. _Edit
+      3. _Insert
+      4. Fo_rmat
+      5. _Sheet
+      6. _Help
+
+    To the east: Menu
+    To the north: Menu
+    To the south: Window "corro 0.7.0"
+
+    You see:
+      0. (yourself) Menu
+      1. Menu (east)
+      2. Menu (east)
+      3. Window "corro 0.7.0" (south)
+      4. Menu
+      5. Menu
+      ...
+
+The six items are corro's six top-level menus, in corro's own order, with the
+underscores where corro's accelerator mnemonics are -- `_File` (Alt+F),
+`E_xit`, `S_ave as`. Those underscores came from corro's menu construction,
+not from this document.
+
+`east` / `north` / `south` move through the tree: north is a child, south is
+the parent, east is the next sibling. It is the widget hierarchy, traversed.
+
+------------------------------------------------------------------------
+4. GOING DEEPER — the real submenu tree
+------------------------------------------------------------------------
+
+    $ printf 'light\nnorth\ngo 1\n' | ./target/debug/corro
+
+    You move to Menu.
+
+    You are at a Menu.
+    Items:
+      1. _New
+      2. _Open file
+      3. S_ave as
+      4. Expor_t
+      5. _Width
+      6. _Sort view
+      7. _Persist sort
+      8. _Replay
+      9. E_xit
+
+    To the east: Menu
+    To the north: Menu
+    To the south: Menu
+
+That is the File menu, with all nine of corro's items. `go <n>` numbers
+siblings first then children, so the numbering is the tree's, not the
+menu's -- that is worth knowing before you get lost:
+
+    $ for n in 1 2 3 4 5 6 7 8; do printf "go %-2s -> " $n; \
+        printf "light\nnorth\ngo $n\n" | ./target/debug/corro \
+        | awk '/You move to/{f=1} f&&/^  1\./{print; exit}'; done
+
+    go 1  ->   1. _New
+    go 2  ->   1. _TSV
+    go 3  ->   1. _Default width
+    go 4  ->   1. _Cut
+    go 5  ->   1. _Rows
+    go 6  ->   1. _Scope
+    go 7  ->   1. _All
+    go 8  ->   1. _Decimal (generic)
+
+`_Cut` is Edit, `_Rows` is Insert, `_Scope` is Format → Scope, `_TSV` is
+File → Export. All corro's real menus, reached by walking the tree.
+
+------------------------------------------------------------------------
+5. FIRING A MENU ACTION -- `select` dispatches the corro callback
+------------------------------------------------------------------------
+
+    $ printf 'light\nnorth\ngo 6\nlook\n' | ./target/debug/corro
+
+    You move to Menu.
+
+    You are at a Menu.
+    Items:
+      1. _Scope
+      2. _Number
+      3. _Align
+      4. _Reset
+      5. _Night mode
+
+    $ printf 'light\nnorth\ngo 6\nselect 5\n' | ./target/debug/corro
+
+    You selected "_Night mode".
+
+`select 5` is not just a print. It calls `ZorkState::menu_select`, which
+looks up the item's action name (`app.toggle_night_mode`) and calls
+`activate_action` -> `click(id)`, which runs the callbacks corro registered
+on that `SimpleAction`. Same dispatch path the GTK menu bar uses.
+
+------------------------------------------------------------------------
+6. WHAT `select` DOES AND DOES NOT PROVE
+------------------------------------------------------------------------
+
+That the callback *runs* is covered by a test, because a REPL session gives
+you no way to observe it:
+
+    $ cargo test -p rswidgets --no-default-features --features zork menu_select
+
+    running 2 tests
+    test backends::zork::model::tests::menu_select_refuses_separator ... ok
+    test backends::zork::model::tests::menu_select_dispatches_named_action ... ok
+
+`menu_select_dispatches_named_action` registers a `Cell<bool>` on the action
+node, selects the item, and asserts the flag flipped.
+
+**What this does NOT show:** that a selected item changed anything you can
+see. It does not. corro's menu actions talk to the app -- they set a status
+string, mutate the document, quit the event loop -- and the zork REPL prints
+only the model, so no app-level effect is observable from inside a session.
+`select` returning a label is therefore not by itself evidence that a real
+corro feature ran.
+
+Concretely, the obvious demonstration does not work, and it is worth being
+explicit because it is the thing one would naturally reach for:
+
+    $ printf 'light\nnorth\ngo 1\nselect 9\nlight\n' | ./target/debug/corro
+    ...
+    You selected "E_xit".
+
+`E_xit` is corro's real quit action, so selecting it looks like it should
+end the session. It does not. `app.quit` calls `rxapp.quit()`
+(`src/gui/menu.rs:228`), which sets a flag on the GUI event loop, and the
+zork REPL never reads that flag -- it loops on `ZorkState::running` instead.
+The `light` typed *after* the selection still runs, and `Goodbye!` is printed
+only when `quit` is typed explicitly, not at EOF. Both halves verified by
+counting, with and without the selection:
+
+    $ printf 'light\nnorth\ngo 1\nselect 9\nlight\n' | ./target/debug/corro \
+        | grep -c "You light the lantern"
+    1
+    $ printf 'light\nnorth\ngo 1\nlight\n'         | ./target/debug/corro \
+        | grep -c "You light the lantern"
+    1
+
+Same count either way: the command after the selection ran in both, so
+selecting `E_xit` neither ended the session nor skipped anything. Read
+`select` as "the action fired" -- evidenced by the test -- not as "the app
+responded", which this backend does not surface. That gap is recorded as R2
+in `docs/ZORK_MISSING.md`.
+------------------------------------------------------------------------
+7. GETTING YOUR BEARINGS — `inventory` shows the path walked
+------------------------------------------------------------------------
+
+    $ printf 'light\nnorth\ngo 1\nback\ngo 6\ninventory\n' | ./target/debug/corro
+
+    You move to Menu.
+    ...
+    You go back south.
+    ...
+    You move to Menu.
+    ...
+    Current path:
+      Window "corro 0.7.0"
+        Menu
+          Menu
+
+The REPL tracks where you came from (`prev_location`), so `back` works and
+`inventory` prints the ancestor chain of the node you are standing on.
+
+------------------------------------------------------------------------
+8. DARK AGAIN — the lantern state is a model field
+------------------------------------------------------------------------
+
+    $ printf 'light\nnorth\ngo 6\ngrue\ndark\nlook\n' | ./target/debug/corro
+
+    No grue here. The light keeps it at bay.
+
+    You douse the lantern. The room vanishes.
+
+    It is pitch dark, and you feel a presence. A grue lurks in the darkness
+    here, and it is very likely to eat you.
+
+    You are in a dark room you cannot see. If a grue is here, it will surely
+    eat you. Light the lantern with 'light' before you go further.
+
+Dousing re-arms the grue warning even though the room was already walked,
+because a room that was lit and then went dark is a new hazard. The warning
+is latched per dark period, so `look` in a loop warns once rather than
+every command.
+
+------------------------------------------------------------------------
+WHAT THIS IS, AND WHAT IT IS NOT
+------------------------------------------------------------------------
+
+This is a **model driver**. corro builds its real widget tree and its real
+menu model; the REPL lets you walk the tree and fire real menu actions.
+
+It is **not** an interactive spreadsheet. There is no display, so there is
+no key routing to the grid, no clicking cells, no scrolling with a wheel.
+`docs/ZORK_MISSING.md` enumerates what the backend genuinely lacks, and
+what it deliberately does not do (`[-]` rows).
+
+Features that are absent from *every* backend are listed there too: as of
+the last check, `DrawContext::draw_rgba_image` is unimplemented on six of
+the eight backends -- only GTK and wasm override the trait default. corro
+never calls it, so it is backend completeness rather than a corro bug.
