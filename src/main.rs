@@ -692,6 +692,52 @@ pub extern "system" fn WinMain(
 /// CreateFileA (no std::fs, no TLS, no heap-alloc in the write path — the
 /// default hook dies in thread-local storage on 9x, masking the real site).
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+/// Append `bytes` to the rust9x diagnostic log (or a suffixed sibling of it),
+/// through raw ANSI Win32 calls only.
+///
+/// Nothing in `std` is usable here: `std::fs` goes through `CreateFileW`,
+/// which is a stub on Windows 9x (error 120), and `std::io::stderr()` is the
+/// very thing that panicked. So the whole path is CreateFileA/WriteFile over
+/// a fixed buffer, and it cannot itself fail in a way that propagates.
+///
+/// `suffix` is appended to the log's stem, so `b".panic"` writes
+/// `gcorro.log.panic` beside `gcorro.log` - keeping the panic next to the
+/// breadcrumbs rather than in a file the harness cannot read.
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+unsafe fn write_raw95(bytes: &[u8], suffix: &[u8]) {
+    use std::os::raw::c_void;
+    unsafe extern "system" {
+        fn CreateFileA(name: *const u8, access: u32, share: u32, sa: *mut c_void,
+            disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
+        fn SetFilePointer(h: *mut c_void, lo: i32, hi: *mut i32, how: u32) -> u32;
+        fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, w: *mut u32, ov: *mut c_void) -> i32;
+        fn CloseHandle(h: *mut c_void) -> i32;
+    }
+    let base = corro::debug_log::win95_diag_log_path();
+    let mut path = [0u8; 260];
+    let n_copy = (base.len() - 1).min(240);
+    path[..n_copy].copy_from_slice(&base[..n_copy]);
+    let end = n_copy + suffix.len();
+    if end >= path.len() {
+        return;
+    }
+    path[n_copy..end].copy_from_slice(suffix);
+    path[end] = 0;
+    let h = CreateFileA(path.as_ptr(), 0x4000_0000, 1,
+        std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
+    if h.is_null() || h as isize == -1 {
+        return;
+    }
+    SetFilePointer(h, 0, std::ptr::null_mut(), 2);
+    let mut wr = 0u32;
+    WriteFile(h, bytes.as_ptr(), bytes.len() as u32, &mut wr, std::ptr::null_mut());
+    CloseHandle(h);
+}
+
+/// TEMPORARY Win95 diagnosis: panic hook that records the panic site via raw
+/// CreateFileA (no std::fs, no TLS, no heap-alloc in the write path -
+/// the default hook dies in thread-local storage on 9x, masking the real site).
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
 fn install_raw_panic_hook95() {
     use std::os::raw::c_void;
     struct SliceW<'a> { b: &'a mut [u8], p: usize }
@@ -704,13 +750,6 @@ fn install_raw_panic_hook95() {
         }
     }
     std::panic::set_hook(Box::new(|info| {
-        unsafe extern "system" {
-            fn CreateFileA(name: *const u8, access: u32, share: u32, sa: *mut c_void,
-                disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
-            fn SetFilePointer(h: *mut c_void, lo: i32, hi: *mut i32, how: u32) -> u32;
-            fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, w: *mut u32, ov: *mut c_void) -> i32;
-            fn CloseHandle(h: *mut c_void) -> i32;
-        }
         let mut buf = [0u8; 768];
         let mut w = SliceW { b: &mut buf, p: 0 };
         {
@@ -731,27 +770,7 @@ fn install_raw_panic_hook95() {
             let _ = write!(w, "\n");
         }
         let n = w.p;
-        unsafe {
-            // Same overridable path as mark95, suffixed with the panic marker,
-            // so a panic shows up next to the breadcrumbs instead of in a file
-            // on a read-only volume the harness cannot read.
-            let base = corro::debug_log::win95_diag_log_path();
-            let mut path = [0u8; 260];
-            let n_copy = (base.len() - 1).min(240);
-            path[..n_copy].copy_from_slice(&base[..n_copy]);
-            let suffix = b".panic";
-            let end = n_copy + suffix.len();
-            path[n_copy..end].copy_from_slice(suffix);
-            path[end] = 0;
-            let h = CreateFileA(path.as_ptr(), 0x4000_0000, 1,
-                std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
-            if !h.is_null() && h as isize != -1 {
-                SetFilePointer(h, 0, std::ptr::null_mut(), 2);
-                let mut wr = 0u32;
-                WriteFile(h, buf.as_ptr(), n as u32, &mut wr, std::ptr::null_mut());
-                CloseHandle(h);
-            }
-        }
+        unsafe { write_raw95(&buf[..n], b".panic") }
     }));
 }
 
@@ -923,9 +942,79 @@ fn corro_main() {
     // sequence tripped it) instead of leaving only "Aborted (core dumped)".
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let msg = format!("corro panic: {info}\n{}", std::backtrace::Backtrace::force_capture());
-        let _ = std::fs::write("/tmp/corro-panic.log", &msg);
-        default_hook(info);
+        // Windows 9x: NEVER chain to the default hook. It prints the panic to
+        // stderr, and printing to stderr there *is* the failure that panicked:
+        // WriteConsoleW is a stub on Win95 and FormatMessageW cannot describe
+        // the error (120), so std's print_to panics again - inside the panic
+        // hook, where the second panic cannot be caught. The process then
+        // aborts with the original message lost, which is how a layout that
+        // only mis-sizes a widget turned into "the app just dies".
+        //
+        // write_raw95 is used for the same reason: std::fs is broken on 9x
+        // (CreateFileW is a stub, error 120), so the log write must go through
+        // the ANSI API directly. A backtrace capture is best-effort - it
+        // allocates, and a failure there must not cost us the message.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        {
+            let mut buf = [0u8; 512];
+            let mut n = 0usize;
+            let put = |buf: &mut [u8; 512], n: &mut usize, s: &[u8]| {
+                let room = buf.len().saturating_sub(*n);
+                let take = s.len().min(room);
+                buf[*n..*n + take].copy_from_slice(&s[..take]);
+                *n += take;
+            };
+            put(&mut buf, &mut n, b"corro panic: ");
+            if let Some(loc) = info.location() {
+                put(&mut buf, &mut n, loc.file().as_bytes());
+                put(&mut buf, &mut n, b":");
+                // Line/column rendered by hand: `write!` needs fmt machinery
+                // that is fine here, but the integer-to-ASCII loop keeps this
+                // hook allocation-free and impossible to fail.
+                let mut line = [0u8; 12];
+                let mut k = line.len();
+                let mut v = loc.line() as u64;
+                loop {
+                    k -= 1;
+                    line[k] = b'0' + (v % 10) as u8;
+                    v /= 10;
+                    if v == 0 || k == 0 {
+                        break;
+                    }
+                }
+                put(&mut buf, &mut n, &line[k..]);
+                put(&mut buf, &mut n, b":");
+                let mut col = [0u8; 12];
+                let mut k = col.len();
+                let mut v = loc.column() as u64;
+                loop {
+                    k -= 1;
+                    col[k] = b'0' + (v % 10) as u8;
+                    v /= 10;
+                    if v == 0 || k == 0 {
+                        break;
+                    }
+                }
+                put(&mut buf, &mut n, &col[k..]);
+                put(&mut buf, &mut n, b" ");
+            }
+            if let Some(s) = info.payload().downcast_ref::<&str>() {
+                put(&mut buf, &mut n, s.as_bytes());
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                put(&mut buf, &mut n, s.as_bytes());
+            } else {
+                put(&mut buf, &mut n, b"<non-string payload>");
+            }
+            put(&mut buf, &mut n, b"\n");
+            unsafe { write_raw95(&buf[..n], b".panic") }
+            return;
+        }
+        #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+        {
+            let msg = format!("corro panic: {info}\n{}", std::backtrace::Backtrace::force_capture());
+            let _ = std::fs::write("/tmp/corro-panic.log", &msg);
+            default_hook(info);
+        }
     }));
     let (res, exit_message) = try_main();
     if let Some(msg) = exit_message {
