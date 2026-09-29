@@ -213,7 +213,47 @@ def start_qemu():
     ], stdout=logp, stderr=subprocess.STDOUT, start_new_session=True)
 
 
-def interact(q, out):
+def encode_video(frames, out_path, fps=12, slow=3.0):
+    """Turn the captured frames into an mp4.
+
+    A failed encode is a warning, not a run failure: the screenshots and the
+    app log are the real evidence and are already on disk by this point, and
+    a missing ffmpeg should not throw away a good run.
+
+    `slow` holds each captured frame for that many times its real duration.
+    The frames are grabbed half a second apart purely to catch the redraws,
+    so at 1:1 the whole session is a three-second flicker that flashes past
+    before the cursor move is legible. Stretching the timeline is the honest
+    way to make it watchable - no frame is invented or dropped.
+    """
+    if not os.path.isdir(frames):
+        return
+    files = sorted(f for f in os.listdir(frames) if f.endswith(".png"))
+    if len(files) < 2:
+        log("   (too few frames for a video)")
+        return
+    if not shutil.which("ffmpeg"):
+        log("   (no ffmpeg; frames kept in %s)" % frames)
+        return
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-framerate", str(fps), "-i", os.path.join(frames, "f%05d.png"),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        # Width/height must both be even for yuv420p; the screendump is
+        # 800x600 so this is belt-and-braces.
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,setpts=PTS*%g" % slow,
+        "-r", str(fps), "-crf", "20",
+        out_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"   (ffmpeg failed: {r.stderr[-300:]})")
+    elif os.path.exists(out_path):
+        log(f"== video {out_path} ({len(files)} frames, "
+            f"{os.path.getsize(out_path)} bytes)")
+
+
+def interact(q, out, frames=None):
     """Drive the app like a user and snapshot each step.
 
     A screenshot of a freshly launched app only proves it painted once. This
@@ -222,6 +262,10 @@ def interact(q, out):
     the grid actually reacted. Each step is timed generously: the guest runs
     an emulated 486 and its redraw goes through the message loop, so an
     immediate screendump catches the previous frame.
+
+    `frames` is a directory: when given, a frame is also grabbed at a steady
+    cadence through each step, so the resulting video shows the redraws
+    actually happening rather than six stills with dead air between them.
     """
     steps = [
         # (label, keys) - qcode names per QEMU's PS/2 keycode set.
@@ -230,16 +274,44 @@ def interact(q, out):
         ("commit",  [{"type": "qcode", "data": "ret"}]),
         ("right",   [{"type": "qcode", "data": "right"}]),
         ("down",    [{"type": "qcode", "data": "down"}]),
-        ("type-7",  [{"type": "qcode", "data": "7"}]),
+        ("left",    [{"type": "qcode", "data": "left"}]),
+        ("up",      [{"type": "qcode", "data": "up"}]),
+        ("type-99", [{"type": "qcode", "data": "9"},
+                     {"type": "qcode", "data": "9"}]),
         ("commit2", [{"type": "qcode", "data": "ret"}]),
+        ("down2",   [{"type": "qcode", "data": "down"},
+                     {"type": "qcode", "data": "down"}]),
     ]
+    counter = [0]
+
+    def grab():
+        """One screendump; a PNG always, plus a numbered frame for the video."""
+        path = os.path.join(out, f"ix-{len(steps):02d}.png")
+        q.cmd("screendump", {"filename": path, "format": "ppm"})
+        if frames:
+            # Written as PNG directly: the screendump is PPM, and transcoding
+            # a whole run of those to PNG afterwards is both slower and a
+            # second thing that can fail after the VM is already gone.
+            png = os.path.join(frames, "f%05d.png" % counter[0])
+            counter[0] += 1
+            try:
+                from PIL import Image
+                Image.open(path).save(png)
+            except Exception:
+                pass
+        return path
+
     log("== interaction: driving the grid")
+    time.sleep(3)
+    grab()
     for label, keys in steps:
         q.cmd("send-key", {"keys": keys})
-        time.sleep(4)  # let the guest process, redraw and settle
-        path = os.path.join(out, f"ix-{label}.png")
-        q.cmd("screendump", {"filename": path, "format": "ppm"})
-        log(f"   {label} -> {os.path.basename(path)}")
+        # Let the guest process the key and redraw. Several frames per step so
+        # the video shows the transition, not just its end state.
+        for _ in range(4):
+            time.sleep(0.5)
+            grab()
+        log(f"   {label} done ({counter[0]} frames)")
 
 
 def main():
@@ -314,9 +386,15 @@ def main():
             q.cmd("screendump", {"filename": f"{OUT}/app-0.png", "format": "ppm"})
             # Interaction: the app being *on screen* only proves it painted
             # once. Drive it like a user and check the grid responds, which
-            # is the difference between "renders" and "works".
+            # is the difference between "renders" and "works". Frames are
+            # recorded at the same time so the run also yields a video.
+            frames = os.path.join(OUT, "frames")
+            if os.path.isdir(frames):
+                shutil.rmtree(frames)
+            os.makedirs(frames, exist_ok=True)
             try:
-                interact(q, OUT)
+                interact(q, OUT, frames=frames)
+                encode_video(frames, os.path.join(OUT, "corro-reactos.mp4"))
             except Exception as e:
                 log(f"== interaction phase failed: {e}")
             break
