@@ -979,6 +979,7 @@ impl Dialog {
     pub fn mark_destroyed(&self) {
         crate::backends::zork::dialog_mark_destroyed(self.id);
     }
+
     /// The response ids a test can fire, in registration order.
     pub fn response_ids(&self) -> Vec<i32> {
         crate::backends::zork::dialog_buttons(self.id).into_iter().map(|(_, r)| r).collect()

@@ -549,6 +549,16 @@ pub fn dialog_transient_for(id: usize) -> Option<usize> {
 pub fn dialog_mark_destroyed(id: usize) {
     with_state(|s| s.dialog_mark_destroyed(id));
 }
+/// Dismiss a dialog with no button, reporting its default response id.
+///
+/// See [`ZorkState::dialog_dismiss`]: a dismissal that carries no button has
+/// no `dialog_add_button` entry to match, so it goes through the recorded
+/// default instead.
+pub fn dialog_dismiss(id: usize) {
+    let response = with_state(|s| s.node(id).and_then(|n| n.dialog_default_response)).unwrap_or(0);
+    dialog_respond(id, response);
+}
+
 /// Deliver a response id to a dialog's `connect_response` handler. Only a
 /// response registered with `dialog_add_button` fires.
 pub fn dialog_respond(id: usize, response_id: i32) {

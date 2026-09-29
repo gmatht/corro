@@ -1615,6 +1615,25 @@ impl ZorkState {
     /// [`Self::dialog_add_button`] reaches the handlers — an unregistered id is
     /// ignored rather than silently firing, which is what the old
     /// `connect_response` no-op could not express.
+    /// Dismiss a dialog with no button and report `dialog_default_response`.
+    ///
+    /// The counterpart to [`Self::dialog_respond`], which requires a
+    /// registered button. GTK reports `GTK_RESPONSE_DELETE_EVENT` for a
+    /// dismissal with no button when no default was set, so the same two
+    /// answers exist here: the recorded default if there is one, and 0 --
+    /// which is not a valid GTK response id, so a caller can tell "no
+    /// default" from a real id unambiguously.
+    ///
+    /// This is what gives `Dialog::set_default_response` a reason to exist: it
+    /// was previously stored and never read, so a dismissal reported nothing.
+    pub fn dialog_dismiss(&mut self, id: usize) {
+        let response = self
+            .node(id)
+            .and_then(|n| n.dialog_default_response)
+            .unwrap_or(0);
+        self.dialog_respond(id, response);
+    }
+
     pub fn dialog_respond(&mut self, id: usize, response_id: i32) {
         let known = self
             .node(id)
