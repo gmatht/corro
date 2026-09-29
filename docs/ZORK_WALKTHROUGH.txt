@@ -1,0 +1,180 @@
+ZORK_WALKTHROUGH — corro 0.7.0 on the zork backend
+========================================================================
+
+The widget tree below is corro's REAL GUI construction path (the same
+new_window / new_canvas / build_menu / draw callbacks the GTK and NWG
+backends use), built against the in-memory model instead of a display.
+So every line is evidence about the shared GUI pipeline, not about a stub.
+
+HOW TO READ
+------------------------------------------------------------------------
+  [PASS]  the feature is present and reported with evidence
+  [MISS]  not present *in the tree as built*. Usually means the
+          widget is created on demand (a dialog, a picker), not
+          that the feature is missing. See ZORK_MISSING.md for the
+          features that are genuinely absent.
+  [N/A]   not a widget question (an app-state fact, reported anyway)
+
+1. WINDOW AND TOP-LEVEL CHROME
+------------------------------------------------------------------------
+  [PASS] Window                 title="corro 0.7.0"  size=Some(1200)xSome(800)  node 1
+  [PASS]   set_default_size     width=Some(1200) height=Some(800)
+  [PASS]   title set by app     "corro 0.7.0"
+
+2. MENU BAR AND ACTIONS
+------------------------------------------------------------------------
+  [PASS] MenuBar                1 MenuBar node(s)
+  [PASS] Menu / submenus        19 Menu node(s)
+  [PASS] SimpleAction           67 registered action(s)
+  [PASS] menu item model        132 item(s) across 20 menu(s)
+  Menu tree (6 top-level):
+    _File                    submenu
+      _New                     app.new_file
+      _Open file               app.open
+      S_ave as                 app.save_as
+      Expor_t                  submenu
+        _TSV                     app.export_tsv
+        _CSV                     app.export_csv
+        _ASCII table             app.export_ascii
+        Export a_ll              app.export_all
+        O_DS                     app.export_ods
+      _Width                   submenu
+        _Default width           app.set_max_col_width
+        _Column width            app.set_col_width
+      _Sort view               app.sort_view
+      _Persist sort            app.persist_sort
+      _Replay                  app.replay
+      E_xit                    app.quit
+    _Edit                    submenu
+      _Cut                     app.cut
+      _Copy                    app.copy
+      _Paste                   app.paste
+      Select _all              app.select_all
+      _Find                    app.find
+      _Replace                 app.replace
+      _Duplicate               app.duplicate
+      _Extrapolate             app.extrapolate
+      Edi_t in Text Editor     app.edit_external
+      _Workbook (External)     app.edit_workbook_external
+      F_ollow link             app.follow_hyperlink
+    _Insert                  submenu
+      _Rows                    app.insert_rows
+      _Mitosis (Row)           app.insert_mitosis_row
+      Mit_osis (Col)           app.insert_mitosis_col
+      _Cols                    app.insert_cols
+      _Special Char            app.insert_special_chars
+      A_ggregate               app.insert_aggregate
+      _Date                    app.insert_date
+      _Time                    app.insert_time
+      _Hyperlink               app.insert_hyperlink
+    Fo_rmat                  submenu
+      _Scope                   submenu
+        _All                     app.format_apply_all
+        _Full col                app.format_apply_full_column
+        _Data                    app.format_apply_data
+        _Special                 app.format_apply_special
+        _Cell                    app.format_apply_cell
+        Se_lection               app.format_apply_selection
+      _Number                  submenu
+        _Decimal (generic)       app.format_decimal_generic
+        Currency (_$)            app.format_currency
+        _Rational                app.format_rational
+        Fixed _0                 app.format_fixed_0
+        Fixed _1                 app.format_fixed_1
+        Fixed _2                 app.format_fixed_2
+        Fixed _n                 app.format_fixed_custom
+      _Align                   submenu
+        _Left                    app.format_align_left
+        _Center                  app.format_align_center
+        _Right                   app.format_align_right
+        _Default                 app.format_align_default
+      _Reset                   app.format_reset
+      _Night mode              app.toggle_night_mode
+    _Sheet                   submenu
+      _Prev sheet              app.sheet_prev
+      _Next sheet              app.sheet_next
+      _New sheet               app.new_sheet
+      _Rename sheet            app.rename_sheet
+      _Copy sheet              app.copy_sheet
+      _Move sheet              app.move_sheet
+      _Go                      app.go_to_cell
+      _Balance books           app.balance_books
+      Free_ze                  submenu
+        _Col Lock                app.col_lock
+        _X-Lock                  app.row_lock
+    _Help                    submenu
+      _About                   app.about
+      _Row ops                 app.help_rows
+      _Col ops                 app.help_cols
+      Full _help               app.help_full
+  Distinct action names reachable: 68
+
+3. CANVAS AND THE DRAW CALLBACK
+------------------------------------------------------------------------
+  [PASS] Canvas                 node 8  size=Some(1)xSome(1)
+  [PASS]   draw callback        2891 ops recorded
+  [PASS]   text runs            146 text draw(s)
+  grid labels (first 12): ["~1", "1", "2", "_1", "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9"]
+  [PASS]   sheet chrome         margin/header labels present: true
+  [PASS]   redraws queued       3 on this canvas
+
+4. FORMULA BAR AND LABELS
+------------------------------------------------------------------------
+  [PASS] Entry (formula)        1 node(s)
+  [PASS] Label (chrome)         4 node(s)
+  [PASS]   fixed-width labels   92px (Some("A1")), 220px (Some(""))
+  [N/A]   formula buffer       ""
+
+5. SCROLLED VIEWPORT
+------------------------------------------------------------------------
+  [PASS] ScrolledWindow         node 9  hscroll=0.0 vscroll=0.0  size=NonexNone
+  [PASS]   scroll recorded      (0.0, 0.0)
+
+6. CONTAINERS AND TABS
+------------------------------------------------------------------------
+  [PASS] BoxWidget              2 node(s)
+  [MISS] Grid                   0 node(s)
+  [N/A]   sheets               1 (tab bar shows when >= 2)
+
+7. ON-DEMAND WIDGETS (created when used, so absent at rest)
+------------------------------------------------------------------------
+  [MISS] Dialog                 0 node(s)  — file open/save, special-char picker, aggregate picker
+  [MISS] DropDown               0 node(s)  — aggregate picker
+  [MISS] CheckButton            0 node(s)  — dialogs
+  [MISS] RadioButton            0 node(s)  — dialogs
+  [MISS] TextView               0 node(s)  — log / revision panes
+  [MISS] Overlay                0 node(s)  — context menus
+
+8. BACKEND MODEL STATE (the zork-specific layer)
+------------------------------------------------------------------------
+  [N/A] night mode             dark
+  [N/A] focused node           Some(6)
+  [N/A] current node           1
+  [N/A] running                true
+
+9. APP STATE THE GUI MIRRORS
+------------------------------------------------------------------------
+  [N/A] cursor                 R999999999C702
+  [N/A] editing                true
+  [N/A] status                 ""
+  [N/A] ops applied            0
+  [N/A] grid extent            2x2
+
+10. SUMMARY
+------------------------------------------------------------------------
+  Total nodes: 98
+    BoxWidget            2
+    Canvas               2
+    Entry                1
+    Label                4
+    Menu                 19
+    MenuBar              1
+    ScrolledWindow       1
+    SimpleAction         67
+    Window               1
+
+  Every widget type the GTK suite exercises through xdotool/OCR is
+  either present above or listed in section 7 as on-demand. What this
+  file cannot show is *pixels* — GTK's tests assert on rendered
+  output, and a model has none. What it can show, and GTK's cannot, is
+  the widget tree and the draw ops themselves.
