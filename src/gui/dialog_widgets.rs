@@ -26,10 +26,24 @@ pub use rswidgets::backends_nwg_adapter::{CheckButton, DropDown, RadioButton};
 // (which is what `zork` selects) — takes the prelude, i.e. whichever backend
 // `backends::init` will pick. This must not overlap the two arms above, or the
 // names are imported twice.
-// Re-exported for `dialogs.rs`, which uses them from any GUI-capable build.
-// A `pancurses`-only build compiles that module but constructs none of these
-// (it has its own terminal dialog path), so the import is legitimately unused
-// there — hence the allow rather than a cfg that would fork the caller too.
-#[cfg(not(all(feature = "gui", any(target_os = "linux", windows))))]
-#[allow(unused_imports)]
+//
+// Gated on `gui` / `gui-core`, matching the dialog bodies that are this
+// module's only consumer: the six dialog functions in `dialogs.rs` that
+// `use super::dialog_widgets::{CheckButton, DropDown, RadioButton}` are each
+// `#[cfg(any(feature = "gui", feature = "gui-core"))]`. A `pancurses`, `zork`
+// or `wasm` build has no such body -- `pancurses` routes `App::run` to
+// `pnc_backend`, and the other two compile their dialog bodies to no-ops -- so
+// re-exporting here was a dead-code warning for an import nothing performs.
+//
+// The two arms above are deliberately *not* gated the same way: they are the
+// definition of which backend supplies these widgets, and a build that runs a
+// GUI needs them even where no dialog is wired.
+// The `not(all(gui, linux|windows))` part is load-bearing, not decoration: the
+// two arms above already name these types on a GTK desktop, so a predicate
+// that also matched there would import them twice (E0252). The original
+// comment said as much and this keeps that half of it.
+#[cfg(all(
+    any(feature = "gui", feature = "gui-core"),
+    not(all(feature = "gui", any(target_os = "linux", windows)))
+))]
 pub use rswidgets::prelude::{CheckButton, DropDown, RadioButton};

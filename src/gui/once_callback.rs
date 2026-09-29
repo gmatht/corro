@@ -16,10 +16,29 @@
 //! is handed to several widget signals; `Rc<OnceCallback>` (or a clone) is
 //! what each `connect_*` closure captures.
 //!
-//! Its only callers live in `dialogs.rs` under `#[cfg(any(feature = "gui", feature = "gui-core"))]`
-//! (the native GTK/nwg dialog wiring), so the `gui` module gates this module
-//! to `gui` plus `test` — a pancurses-only build otherwise compiled the
-//! struct and both methods and then warned they were never used.
+//! Its callers are the six dialog bodies in `dialogs.rs`, each gated
+//! `#[cfg(any(feature = "gui", feature = "gui-core"))]`, so `gui/mod.rs` gates
+//! this module on the same pair.
+//!
+//! Three gates, and each earlier one was wrong, which is worth writing down:
+//!
+//!   * `gui` + `test` -- the original. True while the dialog wiring was
+//!     GTK-only, and false as soon as a backend without the `gui` feature grew
+//!     a dialog: the module compiled while its users could not name it.
+//!   * every widget backend -- fixed that, and overshot. `pancurses` routes
+//!     `App::run` to `pnc_backend`, so it has no dialog bodies either, and the
+//!     struct and both methods became dead code.
+//!   * the `gui_backend`-runs set (`gui` / `gui-core` / `zork` / `wasm`) --
+//!     overshot again, for the same reason one level down: `zork` and `wasm`
+//!     do run `gui_backend`, but their dialog bodies are `#[cfg(gui)]`
+//!     no-ops, so neither constructs an `OnceCallback` either.
+//!
+//! The predicate that is actually right is therefore the same one on the
+//! callers: `gui` or `gui-core`. The test is on the *bodies* having a body, not
+//! on the backend being able to run.
+//!
+//! The module is pure `Rc`/`RefCell` logic and reaches no backend, so the gate
+//! is purely "is there a dialog body that can call it".
 
 use std::cell::RefCell;
 use std::rc::Rc;
