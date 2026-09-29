@@ -5141,6 +5141,10 @@ mod mobile_gesture {
     /// is the mapping the gesture machine already agreed with: a second copy
     /// here would drift from it the first time the display order or the
     /// pinned-row set changed.
+    ///
+    /// Android-only for now — see the `open_cell_context_menu` re-export below
+    /// for why, and for what has to happen before iOS can use it.
+    #[cfg(target_os = "android")]
     pub(crate) fn open_cell_context_menu(x: f64, y: f64) {
         let state = MOBILE_MENU_STATE.with(|s| s.borrow().clone());
         let Some(state) = state else { return };
@@ -5284,7 +5288,19 @@ pub(crate) use mobile_gesture::{
 /// sheet. Re-exported from [`mobile_gesture`] for the same reason as the
 /// gesture entry points above: `android_backend` is a sibling module and
 /// `mobile_gesture` is private to this file.
-#[cfg(any(target_os = "android", target_os = "ios"))]
+///
+/// **Android only.** iOS is excluded because the iOS host does not have a
+/// context menu to open, and gating it on `ios` anyway produced three
+/// `never used` warnings on every iOS build while asserting a capability the
+/// platform does not have: `gesture_long_press` passes `menu_mode = false`
+/// (see `ios_backend::gesture_long_press`) because a long press on iPhone is
+/// a *selection* arm, and the two-finger-tap path that would open the menu is
+/// not implemented. So on iOS this would be a function with no caller and no
+/// gesture bound to reach it. The moment `ios/corro` wires a menu gesture,
+/// widen this gate to `any(android, ios)` — the menu itself already exists
+/// (it is the same `app.*` action list the desktop Edit menu registers), so
+/// only the host-side gesture is missing.
+#[cfg(target_os = "android")]
 pub(crate) use mobile_gesture::open_cell_context_menu;
 
 /// The sheet canvas's backend id, for a host that needs to route a key event
@@ -5292,7 +5308,11 @@ pub(crate) use mobile_gesture::open_cell_context_menu;
 /// from the re-export above because it is a *query*, not a gesture entry
 /// point, and re-exporting it under the `mobile_gesture` name would suggest
 /// it belongs to the gesture machine.
-#[cfg(any(target_os = "android", target_os = "ios"))]
+///
+/// **Android only**, for the same reason as the re-export above: the iOS host
+/// already learns the sheet canvas's id from the `corro_ios_canvas_*` calls
+/// it makes (it passes the id in on every gesture), so it never needs to ask.
+#[cfg(target_os = "android")]
 pub(crate) fn mobile_sheet_canvas_id() -> u64 {
     mobile_gesture::sheet_canvas_id()
 }
@@ -6980,16 +7000,30 @@ fn zork_handoff(
     let cursor = (shared.last_row.get(), shared.last_col.get());
     let edit = shared.formula_entry.get_text().unwrap_or_default();
 
-    println!("corro {} on the zork backend", env!("CARGO_PKG_VERSION"));
-    println!("======================================================");
-    println!();
-    println!("The widget tree above this text is corro's real GUI tree,");
-    println!("built against an in-memory model instead of a display.");
-    println!();
+    // Every line the handoff prints goes through `say`, so the same text can be
+    // written to the console (what a person sees) and captured for the record
+    // (what `ZORK_WALKTHROUGH.txt` is). Duplicating the strings instead would
+    // let the two drift, and a record that disagreed with the console would be
+    // worse than no record.
+    let mut console = String::new();
+    macro_rules! say {
+        ($($arg:tt)*) => {{
+            let line = format!($($arg)*);
+            println!("{line}");
+            console.push_str(&line);
+            console.push('\n');
+        }};
+    }
+    say!("corro {} on the zork backend", env!("CARGO_PKG_VERSION"));
+    say!("======================================================");
+    say!("");
+    say!("The widget tree above this text is corro's real GUI tree,");
+    say!("built against an in-memory model instead of a display.");
+    say!("");
 
     // --- what the GUI built -------------------------------------------------
     let snap = read_state(|s| s.snapshot());
-    println!("Widgets built: {}", snap.nodes.len());
+    say!("Widgets built: {}", snap.nodes.len());
     let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
     for n in &snap.nodes {
         *counts.entry(match n.kind.as_str() {
@@ -7004,16 +7038,16 @@ fn zork_handoff(
         })
         .or_default() += 1;
     }
-    println!("  {}", counts.iter().map(|(k, v)| format!("{} x{}", v, k)).collect::<Vec<_>>().join(", "));
+    say!("  {}", counts.iter().map(|(k, v)| format!("{} x{}", v, k)).collect::<Vec<_>>().join(", "));
 
     // NB: not inside a `read_state` — the model cell is already borrowed there,
     // and a nested borrow is a panic. Read the title on its own.
     if let Some(title) = win_title(win) {
-        println!("Window title: \"{}\"", title);
+        say!("Window title: \"{}\"", title);
     }
-    println!("Cursor at rest: R{}C{}", cursor.0, cursor.1);
+    say!("Cursor at rest: R{}C{}", cursor.0, cursor.1);
     if !edit.is_empty() {
-        println!("Formula buffer: \"{}\"", edit);
+        say!("Formula buffer: \"{}\"", edit);
     }
 
     // --- the canvas draw callback ------------------------------------------
@@ -7035,31 +7069,31 @@ fn zork_handoff(
         rswidgets::backends::headless::DrawOp::StyledText { text, .. } => Some(text.as_str()),
         _ => None,
     }).collect();
-    println!("Canvas draw: {} ops, {} text runs", ops.len(), texts.len());
+    say!("Canvas draw: {} ops, {} text runs", ops.len(), texts.len());
     // The sheet chrome and the row/column headers are the easiest proof that
     // this is corro's real grid, so show a few of each.
     let mut headers: Vec<&&str> = texts.iter().filter(|t| t.len() <= 4).collect();
     headers.dedup();
-    println!("  grid labels: {:?}", &headers[..headers.len().min(8)]);
+    say!("  grid labels: {:?}", &headers[..headers.len().min(8)]);
     if let Some(t) = snap.nodes.iter().find(|n| n.kind == "Spreadsheet").and_then(|n| n.title.clone()) {
-        println!("  sheet title: {:?}", t);
+        say!("  sheet title: {:?}", t);
     }
 
     // --- the menu model -----------------------------------------------------
     let menu_count: usize = snap.menu_items.values().map(|v| v.len()).sum();
-    println!("Menu items: {}", menu_count);
+    say!("Menu items: {}", menu_count);
 
     // --- dark mode ----------------------------------------------------------
     // corro already has a night mode; report whether the model's light agrees.
     let night = read_state(|s| s.is_night());
-    println!("Model night mode: {}", if night { "dark" } else { "lit" });
+    say!("Model night mode: {}", if night { "dark" } else { "lit" });
     if night {
-        println!("  {}", read_state(|s| s.dark_room_description()));
+        say!("  {}", read_state(|s| s.dark_room_description()));
     }
 
-    println!();
-    println!("Driving the model from the zork REPL. 'help' lists commands.");
-    println!();
+    say!("");
+    say!("Driving the model from the zork REPL. 'help' lists commands.");
+    say!("");
 
     // Record the walkthrough, while the tree is still live.
     //
@@ -7073,8 +7107,8 @@ fn zork_handoff(
     // Opt-in via `CORRO_ZORK_WALKTHROUGH` naming the output path, so an
     // ordinary run is unchanged and the file is only written on request.
     if let Some(path) = std::env::var_os("CORRO_ZORK_WALKTHROUGH") {
-        match write_zork_walkthrough(&path, &snap, corro_app, shared) {
-            Ok(()) => println!("Walkthrough written to {}", path.to_string_lossy()),
+        match write_zork_walkthrough(&path, &console, &snap, corro_app, shared) {
+            Ok(()) => say!("Walkthrough written to {}", path.to_string_lossy()),
             Err(e) => eprintln!("walkthrough write failed: {e}"),
         }
     }
@@ -7200,6 +7234,7 @@ fn win_title(win: &Window) -> Option<String> {
 #[cfg(feature = "zork")]
 fn write_zork_walkthrough(
     path: &std::ffi::OsStr,
+    console: &str,
     snap: &rswidgets::backends::zork::model::Snapshot,
     app: &mut super::App,
     shared: &Rc<GuiState>,
@@ -7210,6 +7245,7 @@ fn write_zork_walkthrough(
     let _ = writeln!(out, "ZORK_WALKTHROUGH — corro {} on the zork backend", env!("CARGO_PKG_VERSION"));
     let _ = writeln!(out, "{}", "=".repeat(72));
     let _ = writeln!(out);
+
     let _ = writeln!(
         out,
         "What this records: the widget tree corro's GUI construction path built\n\
@@ -7230,6 +7266,20 @@ fn write_zork_walkthrough(
     let _ = writeln!(out, "  [N/A]   not a widget question (an app-state fact, reported anyway)");
     let _ = writeln!(out);
 
+    // The backend's own output, verbatim, as the first section.
+    //
+    // This is the part a reader should start with. The sections below are a
+    // *report about* that output -- counts, PASS/MISS rows, a menu tree
+    // re-rendered -- and a report that does not show its own subject is asking
+    // to be taken on faith. So the console text comes first, unmodified, and
+    // the analysis follows it.
+    let _ = writeln!(out, "1. THE BACKEND'S OUTPUT");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    for line in console.lines() {
+        let _ = writeln!(out, "  {}", line);
+    }
+    let _ = writeln!(out);
+
     // -- helpers -----------------------------------------------------------
     // Count nodes of a kind, and find the first one.
     let count_of = |kind: &str| snap.nodes.iter().filter(|n| n.kind == kind).count();
@@ -7239,8 +7289,8 @@ fn write_zork_walkthrough(
         let _ = writeln!(out, "  [{}] {:<22} {}", mark, feature, detail);
     };
 
-    // -- 1. the window -----------------------------------------------------
-    let _ = writeln!(out, "1. WINDOW AND TOP-LEVEL CHROME");
+    // -- 2. the window -----------------------------------------------------
+    let _ = writeln!(out, "2. WINDOW AND TOP-LEVEL CHROME");
     let _ = writeln!(out, "{}", "-".repeat(72));
     let windows = count_of("Window");
     if windows == 0 {
@@ -7270,8 +7320,8 @@ fn write_zork_walkthrough(
     }
     let _ = writeln!(out);
 
-    // -- 2. the menu bar ---------------------------------------------------
-    let _ = writeln!(out, "2. MENU BAR AND ACTIONS");
+    // -- 3. the menu bar ---------------------------------------------------
+    let _ = writeln!(out, "3. MENU BAR AND ACTIONS");
     let _ = writeln!(out, "{}", "-".repeat(72));
     let bars = count_of("MenuBar");
     let menus = count_of("Menu");
@@ -7346,8 +7396,8 @@ fn write_zork_walkthrough(
     let _ = writeln!(out, "  Distinct action names reachable: {}", distinct_actions.len());
     let _ = writeln!(out);
 
-    // -- 3. the grid canvas ------------------------------------------------
-    let _ = writeln!(out, "3. CANVAS AND THE DRAW CALLBACK");
+    // -- 4. the grid canvas ------------------------------------------------
+    let _ = writeln!(out, "4. CANVAS AND THE DRAW CALLBACK");
     let _ = writeln!(out, "{}", "-".repeat(72));
     let canvases = count_of("Canvas");
     if canvases == 0 {
@@ -7394,8 +7444,8 @@ fn write_zork_walkthrough(
     }
     let _ = writeln!(out);
 
-    // -- 4. the formula row ------------------------------------------------
-    let _ = writeln!(out, "4. FORMULA BAR AND LABELS");
+    // -- 5. the formula row ------------------------------------------------
+    let _ = writeln!(out, "5. FORMULA BAR AND LABELS");
     let _ = writeln!(out, "{}", "-".repeat(72));
     let entries = count_of("Entry");
     let labels = count_of("Label");
@@ -7424,8 +7474,8 @@ fn write_zork_walkthrough(
     );
     let _ = writeln!(out);
 
-    // -- 5. the scrolled viewport -----------------------------------------
-    let _ = writeln!(out, "5. SCROLLED VIEWPORT");
+    // -- 6. the scrolled viewport -----------------------------------------
+    let _ = writeln!(out, "6. SCROLLED VIEWPORT");
     let _ = writeln!(out, "{}", "-".repeat(72));
     let scrollers = count_of("ScrolledWindow");
     if scrollers == 0 {
@@ -7442,8 +7492,8 @@ fn write_zork_walkthrough(
     }
     let _ = writeln!(out);
 
-    // -- 6. containers and the sheet tab bar -------------------------------
-    let _ = writeln!(out, "6. CONTAINERS AND TABS");
+    // -- 7. containers and the sheet tab bar -------------------------------
+    let _ = writeln!(out, "7. CONTAINERS AND TABS");
     let _ = writeln!(out, "{}", "-".repeat(72));
     row(&mut out, if count_of("BoxWidget") > 0 { "PASS" } else { "MISS" }, "BoxWidget", format!("{} node(s)", count_of("BoxWidget")));
     row(&mut out, if count_of("Grid") > 0 { "PASS" } else { "MISS" }, "Grid", format!("{} node(s)", count_of("Grid")));
@@ -7451,7 +7501,7 @@ fn write_zork_walkthrough(
     row(&mut out, "N/A", "  sheets", format!("{sheets} (tab bar shows when >= 2)"));
     let _ = writeln!(out);
 
-    // -- 7. on-demand features ---------------------------------------------
+    // -- 8. on-demand features ---------------------------------------------
     // These are not in the tree corro built, because corro has not opened one
     // yet. Recording "0 nodes" would therefore say nothing about whether the
     // backend *can* do them -- it would only describe a moment in time, and a
@@ -7465,7 +7515,7 @@ fn write_zork_walkthrough(
     // nodes are created and dropped, and this file reports counts from the
     // snapshot taken before any of it (see the `snap` argument), so section 1
     // through 6 and the summary still describe what corro built.
-    let _ = writeln!(out, "7. ON-DEMAND WIDGETS (built by the app when used; probed here)");
+    let _ = writeln!(out, "8. ON-DEMAND WIDGETS (built by the app when used; probed here)");
     let _ = writeln!(out, "{}", "-".repeat(72));
     let _ = writeln!(out, "  Each row constructs the widget through the adapter and reports what");
     let _ = writeln!(out, "  it holds. corro builds none of these at startup, so a count alone");
@@ -7498,8 +7548,8 @@ fn write_zork_walkthrough(
     }
     let _ = writeln!(out);
 
-    // -- 8. the model's own world state -----------------------------------
-    let _ = writeln!(out, "8. BACKEND MODEL STATE (the zork-specific layer)");
+    // -- 9. the model's own world state -----------------------------------
+    let _ = writeln!(out, "9. BACKEND MODEL STATE (the zork-specific layer)");
     let _ = writeln!(out, "{}", "-".repeat(72));
     row(&mut out, "N/A", "night mode", format!("{}", if snap.night_mode { "dark" } else { "lit" }));
     row(&mut out, "N/A", "focused node", format!("{:?}", snap.focused));
@@ -7507,8 +7557,8 @@ fn write_zork_walkthrough(
     row(&mut out, "N/A", "running", format!("{}", snap.running));
     let _ = writeln!(out);
 
-    // -- 9. app state that the GUI reflects --------------------------------
-    let _ = writeln!(out, "9. APP STATE THE GUI MIRRORS");
+    // -- 10. app state that the GUI reflects --------------------------------
+    let _ = writeln!(out, "10. APP STATE THE GUI MIRRORS");
     let _ = writeln!(out, "{}", "-".repeat(72));
     row(&mut out, "N/A", "cursor", format!("R{}C{}", shared.last_row.get(), shared.last_col.get()));
     row(&mut out, "N/A", "editing", format!("{}", shared.editing.get()));
@@ -7517,8 +7567,8 @@ fn write_zork_walkthrough(
     row(&mut out, "N/A", "grid extent", format!("{}x{}", app.core.workbook.active_sheet().grid.main_rows(), app.core.workbook.active_sheet().grid.main_cols()));
     let _ = writeln!(out);
 
-    // -- 10. summary -------------------------------------------------------
-    let _ = writeln!(out, "10. SUMMARY");
+    // -- 11. summary -------------------------------------------------------
+    let _ = writeln!(out, "11. SUMMARY");
     let _ = writeln!(out, "{}", "-".repeat(72));
     let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
     for n in &snap.nodes {

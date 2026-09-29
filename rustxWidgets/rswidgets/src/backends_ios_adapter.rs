@@ -772,6 +772,32 @@ mod ios_adapter {
         pub fn set_hexpand(&self, expand: bool) {
             core_ios::set_view_expanding(self.0, expand);
         }
+
+        /// Size the stack view, in points.
+        ///
+        /// The `common::WidgetBox` contract: "minimum size of the box
+        /// itself", needed for a horizontal row so a button child cannot be
+        /// laid out taller than the strip (GTK's own note: consecutive rows
+        /// overlap and render as garbled text).
+        ///
+        /// The AppKit twin sends `setFrameSize:`. UIKit's `setFrame:` takes a
+        /// `CGRect` — *four* `CGFloat`s, origin first — so the argument order
+        /// matters and is the reason this is not a shared helper with the
+        /// macOS adapter. The origin is left at zero: the stack view is
+        /// positioned by its superview, and moving it here would fight the
+        /// autoresizing mask `attach` installed.
+        ///
+        /// A negative request means "unconstrained" on the GTK contract, so
+        /// it is ignored rather than turned into a negative frame.
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if self.0.is_null() {
+                return;
+            }
+            if w > 0 && h > 0 {
+                unsafe { msg4cv(self.0, "setFrame:", 0.0, 0.0, w as f64, h as f64) };
+                unsafe { msg0v(self.0, "setNeedsLayout") };
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2238,6 +2264,60 @@ mod ios_adapter {
 
         pub fn set_default_response(&self, _response_id: i32) {}
         pub fn close(&self) {}
+
+        /// Measure the alert before it opens.
+        ///
+        /// A `UIAlertController`/`UIAlertView` sizes itself from its title
+        /// and its actions, so there is no separate layout pass to run —
+        /// presenting already lays it out. Kept because the shared
+        /// `common::Dialog` forwards it and a caller written for GTK/NWG
+        /// calls it unconditionally; an absent method is a *compile* error
+        /// there, which is a worse outcome than a documented no-op.
+        pub fn layout_dialog(&self) {}
+
+        /// Show or hide without dismissing.
+        ///
+        /// Distinct from `close`, which is "destroy the dialog": an
+        /// iOS alert cannot be re-presented after its presenting view
+        /// controller has torn it down, so `close` is a dismissal and this
+        /// is a presentation — the same pair of operations GTK's
+        /// `set_visible`/`destroy` are, and the same reason the macOS twin
+        /// documents them separately.
+        pub fn set_visible(&self, visible: bool) {
+            if visible {
+                self.present();
+            } else {
+                self.close();
+            }
+        }
+
+        /// The container a dialog's children are added to.
+        ///
+        /// `UIAlertController` has no content-area view of its own — the
+        /// host shim builds and owns one — so there is nothing to hand back,
+        /// and this returns null rather than a dangling id. Exactly the
+        /// answer the macOS `NSAlert` twin gives, and the same answer the
+        /// terminal backends give for a dialog that is drawn as text.
+        pub fn get_content_area(&self) -> *mut c_void {
+            std::ptr::null_mut()
+        }
+
+        /// Present the dialog and return the last response id (0 if none).
+        ///
+        /// `Dialog::run` is a *synchronous* nested loop on GTK, NWG and
+        /// macOS. There is no nested loop here: UIKit owns the run loop, the
+        /// answer arrives from the host shim's alert delegate long after this
+        /// returns, and blocking would deadlock the main thread the delegate
+        /// has to run on. So this presents and returns 0 — not a valid GTK
+        /// response id (those start at 1), so a caller gets an unambiguous
+        /// "none yet" rather than a plausible wrong answer. A caller that
+        /// needs the answer must use `connect_response`, which is the correct
+        /// shape on a touch platform anyway. The macOS adapter is the
+        /// contrast: it *can* `runModal`, and says why it differs.
+        pub fn run(&self) -> i32 {
+            self.present();
+            0
+        }
     }
 
     // ------------------------------------------------------------------

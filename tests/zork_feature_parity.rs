@@ -253,6 +253,55 @@ fn zork_walkthrough_is_recorded() {
     );
 }
 
+/// The record opens with the backend's own console output, verbatim.
+///
+/// This is the assertion that should have existed from the start. The file
+/// grew a thorough report -- counts, PASS/MISS rows, a re-rendered menu tree --
+/// while never including the text the program actually prints, so every
+/// statement in it was a statement *about* the run rather than the run. A
+/// reader could diff it and see a number change without ever seeing what the
+/// backend said.
+///
+/// So section 1 is the console output unmodified, and this checks that it is
+/// still there and still the backend's: its own banner, its own node census,
+/// its own draw counts, and the grue line that only appears because the model
+/// starts in the dark.
+#[test]
+fn walkthrough_leads_with_the_backends_own_output() {
+    let text = walkthrough();
+    let start = text.find("1. THE BACKEND'S OUTPUT")
+        .unwrap_or_else(|| panic!("the record must open with the backend's own output\n\n{text}"));
+    let end = text[start..]
+        .find("\n2. ")
+        .map(|i| start + i)
+        .unwrap_or(text.len());
+    let section = &text[start..end];
+
+    for expected in [
+        "corro 0.7.0 on the zork backend", // its own banner
+        "Widgets built:",                    // its node census
+        "Canvas draw:",                      // what the draw callback produced
+        "Menu items:",                       // the menu model
+        "Model night mode:",                 // the dungeon's light
+        "grue",                              // only reachable in the dark
+        "Driving the model from the zork REPL",
+    ] {
+        assert!(
+            section.contains(expected),
+            "section 1 must carry the backend's own output, and {expected:?} is \
+             not in it. A record that only reports about the run, and does not \
+             show it, asks to be taken on faith.\n\n{section}"
+        );
+    }
+    // Section 1 must be the *backend's* lines, not the report's: no marker, no
+    // column alignment, just what it printed.
+    assert!(
+        !section.contains("[PASS]") && !section.contains("[MISS]"),
+        "section 1 is the console output and must not contain the report's \
+         PASS/MISS markers -- that is section 2 onward"
+    );
+}
+
 /// Every feature section the GTK suite covers has a row in the walkthrough.
 ///
 /// This is the parity assertion proper: it names the sections rather than
@@ -262,16 +311,17 @@ fn zork_walkthrough_is_recorded() {
 fn zork_walkthrough_covers_every_feature() {
     let text = walkthrough();
     for section in [
-        "1. WINDOW AND TOP-LEVEL CHROME",
-        "2. MENU BAR AND ACTIONS",
-        "3. CANVAS AND THE DRAW CALLBACK",
-        "4. FORMULA BAR AND LABELS",
-        "5. SCROLLED VIEWPORT",
-        "6. CONTAINERS AND TABS",
-        "7. ON-DEMAND WIDGETS",
-        "8. BACKEND MODEL STATE",
-        "9. APP STATE THE GUI MIRRORS",
-        "10. SUMMARY",
+        "1. THE BACKEND'S OUTPUT",
+        "2. WINDOW AND TOP-LEVEL CHROME",
+        "3. MENU BAR AND ACTIONS",
+        "4. CANVAS AND THE DRAW CALLBACK",
+        "5. FORMULA BAR AND LABELS",
+        "6. SCROLLED VIEWPORT",
+        "7. CONTAINERS AND TABS",
+        "8. ON-DEMAND WIDGETS",
+        "9. BACKEND MODEL STATE",
+        "10. APP STATE THE GUI MIRRORS",
+        "11. SUMMARY",
     ] {
         assert!(text.contains(section), "walkthrough is missing section {section:?}");
     }

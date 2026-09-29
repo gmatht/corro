@@ -15,13 +15,34 @@ HOW TO READ
           features that are genuinely absent.
   [N/A]   not a widget question (an app-state fact, reported anyway)
 
-1. WINDOW AND TOP-LEVEL CHROME
+1. THE BACKEND'S OUTPUT
+------------------------------------------------------------------------
+  corro 0.7.0 on the zork backend
+  ======================================================
+  
+  The widget tree above this text is corro's real GUI tree,
+  built against an in-memory model instead of a display.
+  
+  Widgets built: 98
+    2 xBoxWidget, 2 xCanvas, 1 xEntry, 4 xLabel, 20 xMenu, 1 xScrolledWindow, 67 xSimpleAction, 1 xWindow
+  Window title: "corro 0.7.0"
+  Cursor at rest: R999999999C702
+  Canvas draw: 2891 ops, 146 text runs
+    grid labels: ["~1", "1", "2", "_1", "_2", "_3", "_4", "_5"]
+  Menu items: 132
+  Model night mode: dark
+    You are in a dark room you cannot see. If a grue is here, it will surely eat you. Light the lantern with 'light' before you go further.
+  
+  Driving the model from the zork REPL. 'help' lists commands.
+  
+
+2. WINDOW AND TOP-LEVEL CHROME
 ------------------------------------------------------------------------
   [PASS] Window                 title="corro 0.7.0"  size=Some(1200)xSome(800)  node 1
   [PASS]   set_default_size     width=Some(1200) height=Some(800)
   [PASS]   title set by app     "corro 0.7.0"
 
-2. MENU BAR AND ACTIONS
+3. MENU BAR AND ACTIONS
 ------------------------------------------------------------------------
   [PASS] MenuBar                1 MenuBar node(s)
   [PASS] Menu / submenus        19 Menu node(s)
@@ -109,7 +130,7 @@ HOW TO READ
       Full _help               app.help_full
   Distinct action names reachable: 68
 
-3. CANVAS AND THE DRAW CALLBACK
+4. CANVAS AND THE DRAW CALLBACK
 ------------------------------------------------------------------------
   [PASS] Canvas                 node 8  size=Some(1)xSome(1)
   [PASS]   draw callback        2891 ops recorded
@@ -118,25 +139,25 @@ HOW TO READ
   [PASS]   sheet chrome         margin/header labels present: true
   [PASS]   redraws queued       3 on this canvas
 
-4. FORMULA BAR AND LABELS
+5. FORMULA BAR AND LABELS
 ------------------------------------------------------------------------
   [PASS] Entry (formula)        1 node(s)
   [PASS] Label (chrome)         4 node(s)
   [PASS]   fixed-width labels   92px (Some("A1")), 220px (Some(""))
   [N/A]   formula buffer       ""
 
-5. SCROLLED VIEWPORT
+6. SCROLLED VIEWPORT
 ------------------------------------------------------------------------
   [PASS] ScrolledWindow         node 9  hscroll=0.0 vscroll=0.0  size=NonexNone
   [PASS]   scroll recorded      (0.0, 0.0)
 
-6. CONTAINERS AND TABS
+7. CONTAINERS AND TABS
 ------------------------------------------------------------------------
   [PASS] BoxWidget              2 node(s)
   [MISS] Grid                   0 node(s)
   [N/A]   sheets               1 (tab bar shows when >= 2)
 
-7. ON-DEMAND WIDGETS (built by the app when used; probed here)
+8. ON-DEMAND WIDGETS (built by the app when used; probed here)
 ------------------------------------------------------------------------
   Each row constructs the widget through the adapter and reports what
   it holds. corro builds none of these at startup, so a count alone
@@ -149,14 +170,14 @@ HOW TO READ
   [PASS] TextView               constructs and holds state  — log / revision panes
   [PASS] Overlay                constructs and holds state  — context menus
 
-8. BACKEND MODEL STATE (the zork-specific layer)
+9. BACKEND MODEL STATE (the zork-specific layer)
 ------------------------------------------------------------------------
   [N/A] night mode             dark
   [N/A] focused node           Some(6)
   [N/A] current node           1
   [N/A] running                true
 
-9. APP STATE THE GUI MIRRORS
+10. APP STATE THE GUI MIRRORS
 ------------------------------------------------------------------------
   [N/A] cursor                 R999999999C702
   [N/A] editing                true
@@ -164,7 +185,7 @@ HOW TO READ
   [N/A] ops applied            0
   [N/A] grid extent            2x2
 
-10. SUMMARY
+11. SUMMARY
 ------------------------------------------------------------------------
   Total nodes: 98
     BoxWidget            2
