@@ -1526,7 +1526,10 @@ mod night_mode_dispatch_tests {
         use rswidgets::core::ColorScheme;
 
         // The colour scheme is process-wide state shared with
-        // the brightness tests in `gui_backend`; see `lock_scheme_for_tests`.
+        // the brightness tests in `gui_backend`; see
+        // `lock_scheme_for_tests`, re-exported from the private
+        // `gui_backend` module by `crate::gui` precisely so this test and
+        // those share one lock instead of declaring their own.
         let _scheme = crate::gui::lock_scheme_for_tests();
 
         rswidgets::core::set_color_scheme(ColorScheme::Light);

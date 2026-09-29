@@ -1,0 +1,138 @@
+name: Backends
+
+# Keeps the non-GTK backends compiling *and testing*. Every job here exists
+# because a backend reached a broken state invisibly.
+#
+# The pattern is the same for all of them, and it is the one wasm.yml already
+# established: a feature that no CI job enables is not a feature, because
+# nothing reports on it until a human happens to run the build by hand. Two
+# separate confirmations of that in this repo's own history:
+#
+#   * `zork` had never been compiled by anything. It carried 38 errors
+#     (docs/ZORK_MISSING.md section 0) and had never been built. Adding this
+#     job found a second, quieter one immediately: `actions.rs` is compiled on
+#     every build, but the scheme lock its test needs lived in the GUI-gated
+#     `gui_backend` module, so `cargo test --features pancurses` failed to
+#     build the lib test target. A compile check would have missed that -- it
+#     is `cargo test` that compiles the `#[cfg(test)]` code.
+#   * `pancurses` was only ever checked as `--features ratatui,pancurses`,
+#     which turns on `gui` as a side effect. The bare `--features pancurses`
+#     build, the one that has no GTK, was never exercised.
+#
+# So each backend is checked in the configuration it is actually meant to be
+# used in, and each feature's lib tests are run -- not just `cargo check`.
+#
+# What this does NOT cover, stated here so it is not assumed:
+#   * Android/iOS/macOS native backends. These need NDK/Xcode toolchains and
+#     live in ios.yml / macos.yml. `aarch64-linux-android` is verified by hand
+#     with `cargo check --target aarch64-linux-android -p rswidgets
+#     --no-default-features`, and is not asserted here.
+#   * Any runtime behaviour. These are compile and test checks; GTK's
+#     rendering needs an X server, zork's REPL needs a terminal.
+#   * `--features wasm` WITHOUT `--no-default-features`. That combination is
+#     still broken (18 errors: the default `gtk` feature cfg's out the
+#     `crate::common::*` types the wasm adapter names). It is a real defect,
+#     documented in docs/ZORK_MISSING.md, and fixing it is a separate job. The
+#     supported invocations are checked in wasm.yml.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - "rustxWidgets/rswidgets/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/backends.yml"
+      - "tests/**"
+  pull_request:
+    paths:
+      - "src/**"
+      - "rustxWidgets/rswidgets/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/backends.yml"
+      - "tests/**"
+
+env:
+  CARGO_TERM_COLORS: false
+  # Warnings are errors, for the reason given in wasm.yml: the dead-code paths
+  # these backends grow are exactly the failure mode that let them rot.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  zork:
+    # No toolchain target to install and no display needed, so this is cheap.
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: zork
+
+      - name: rswidgets builds with zork
+        # `--no-default-features` matters: zork is a headless model and must
+        # not drag GTK in.
+        run: cargo +stable build -p rswidgets --no-default-features --features zork
+
+      - name: rswidgets zork tests
+        # The 130 model/harness/adapter tests. No X server, no OCR, no GTK.
+        run: cargo +stable test -p rswidgets --no-default-features --features zork
+
+      - name: corro builds with zork
+        run: cargo +stable build --no-default-features --features zork
+
+      - name: corro zork feature-parity tests
+        # tests/zork_feature_parity.rs: 32 tests that re-ask each GTK pixel
+        # question against the widget tree, at the walkthrough and adapter
+        # levels.
+        run: cargo +stable test --no-default-features --features zork --test zork_feature_parity
+
+      - name: corro lib tests build and pass under zork
+        # This is the check that found the E0425: `cargo check` does not
+        # compile `#[cfg(test)]` code, `cargo test` does.
+        run: cargo +stable test --no-default-features --features zork --lib
+
+  pancurses:
+    # The terminal backend, built WITHOUT gui/gui-core -- the configuration
+    # that had never been exercised. gtk is not available on a bare runner, so
+    # this also proves the terminal path is genuinely toolkit-free.
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pancurses
+
+      - name: rswidgets builds with pancurses and no default features
+        run: cargo +stable build -p rswidgets --no-default-features --features pancurses
+
+      - name: corro builds with pancurses and no default features
+        run: cargo +stable build --no-default-features --features pancurses
+
+      - name: corro lib tests build and pass under pancurses
+        # The step that fails at HEAD~ without the lock_scheme_for_tests move.
+        run: cargo +stable test --no-default-features --features pancurses --lib
+
+  lib-test-matrix:
+    # Belt and braces for the shared layer: `src/gui/actions.rs` and friends
+    # are compiled under every one of these, and their `#[cfg(test)]` modules
+    # are where the cfg-gate mismatch hid. Cheap, and it catches the same
+    # class of bug appearing under a feature nobody has thought about yet.
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lib-test-matrix
+
+      - name: lib tests under the default feature set
+        run: cargo +stable test --lib
+
+      - name: lib tests under gui
+        run: cargo +stable test --no-default-features --features gui --lib

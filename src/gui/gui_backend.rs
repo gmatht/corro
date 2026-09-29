@@ -8615,24 +8615,13 @@ fn display_col_width(sheet: &crate::ops::SheetState, c: usize, mc: usize) -> usi
 /// its own and fails perhaps one run in five in the suite. That looks like
 /// flakiness and gets ignored or retried, when it is really a determinism bug
 /// in the test.
-///
-/// One lock, shared by every writer in the crate: a second lock in another
-/// module would not exclude these threads, which is how an earlier attempt at
-/// this left the race in place (`actions.rs` has a fourth scheme-touching test
-/// in the same binary).
-///
-/// Note this cannot help across *test binaries*: rswidgets' own theme tests
-/// live in its own binary, so their writes are in a different process. That is
-/// harmless, and the reason the failure mode is confined to one binary.
-pub(crate) fn lock_scheme_for_tests() -> std::sync::MutexGuard<'static, ()> {
-    static SCHEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // A poisoned lock only means another scheme test panicked; the theme is
-    // still a plain global, so recovering is correct and keeps one failure
-    // from cascading into every other test in the binary.
-    SCHEME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// The scheme lock now lives in [`crate::gui::lock_scheme_for_tests`], not
+/// here. It has to: `actions::night_mode_dispatch_tests` calls it, `actions` is
+/// compiled on every build, and this module is gated on a GUI feature -- so a
+/// lock defined here was missing under `--features pancurses`, which failed the
+/// lib-test build with E0425.
 
-/// As [`lock_scheme_for_tests`], but also pins the scheme to `Light`.
+/// As [`crate::gui::lock_scheme_for_tests`], but also pins the scheme to `Light`.
 ///
 /// This is what a test that *reads* the palette wants. Taking only the lock is
 /// not enough: the lock excludes other threads, but it does not make the value
@@ -8642,7 +8631,7 @@ pub(crate) fn lock_scheme_for_tests() -> std::sync::MutexGuard<'static, ()> {
 /// fixed once and the suite still failed one run in five.
 #[cfg(test)]
 pub(crate) fn light_scheme_for_tests() -> std::sync::MutexGuard<'static, ()> {
-    let guard = lock_scheme_for_tests();
+    let guard = crate::gui::lock_scheme_for_tests();
     rswidgets::core::set_color_scheme(rswidgets::core::ColorScheme::Light);
     guard
 }
@@ -8876,7 +8865,7 @@ mod brightness_tests {
     #[test]
     fn night_mode_repaints_the_grid_palette() {
         // The colour scheme is process-wide state; see SCHEME_LOCK.
-        let _scheme = super::lock_scheme_for_tests();
+        let _scheme = crate::gui::lock_scheme_for_tests();
         // Only `ColorScheme` is used: `Role`/`Theme` were imported here for a
         // version of this test that read the toolkit's palette directly, which
         // this one no longer does (it drives corro's own paint path instead).
@@ -8957,7 +8946,7 @@ mod brightness_tests {
     #[test]
     fn the_default_scheme_is_unchanged() {
         // The colour scheme is process-wide state; see SCHEME_LOCK.
-        let _scheme = super::lock_scheme_for_tests();
+        let _scheme = crate::gui::lock_scheme_for_tests();
         use rswidgets::core::ColorScheme;
         rswidgets::core::set_color_scheme(ColorScheme::Light);
         let pal = chrome::palette();
@@ -8981,7 +8970,7 @@ mod brightness_tests {
     #[test]
     fn padlocks_stay_visible_in_night_mode() {
         // The colour scheme is process-wide state; see SCHEME_LOCK.
-        let _scheme = super::lock_scheme_for_tests();
+        let _scheme = crate::gui::lock_scheme_for_tests();
         use rswidgets::core::ColorScheme;
         rswidgets::core::set_color_scheme(ColorScheme::Night);
         let gutter = chrome::palette().gutter();

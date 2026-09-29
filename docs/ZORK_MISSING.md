@@ -1,7 +1,24 @@
 # Zork backend — missing features vs. GTK / NWG (and pancurses)
 
 Status: **§0-§3 implemented and tested**; §4-§5 extended; §6-§7 still open.
-Last updated: 2026-09-28.
+Last updated: 2026-09-29.
+
+## What this pass fixed
+
+Two real defects, both found the same way — a feature set that no CI job
+compiled or tested:
+
+* `--features pancurses` did not build its lib test target (E0425). The cause
+  and the fix are described under *Pre-existing, unrelated* below. All four
+  feature sets now build and pass: default 694, `gui` 824, `pancurses` 749,
+  `zork` 467.
+* `DrawContext::draw_rgba_image` is unimplemented on six of eight backends. See
+  S26.
+
+`.github/workflows/backends.yml` is new and builds `zork` and `pancurses` in
+the configurations they are actually meant to be used in, running each
+feature's lib tests. All twelve commands in it were executed here before the
+file was committed.
 
 Verify with:
 
@@ -185,6 +202,41 @@ adapter method can be more than a no-op until the model grows.
 | S23 | Snapshot is too thin | `SnapshotNode` has no geometry/visibility/classes/focus/size-request/caret, so a snapshot regression test cannot detect a regression in any of §3's properties. `Snapshot` also omits `prev_location` and any scroll/expansion state. |
 | S24 | `set_child` is destructive-but-buggy | `set_child` removes the child from *all* parents' `children` lists but only fixes up the **new** parent's link; the old parent's list is cleaned, but `add_node` also pushes to the parent, so a node can end up duplicated. And `append_child` is an alias of `set_child` — it *replaces* rather than appends, despite the name. |
 | S25 | No `Fixed`/`Overlay` pass-through | `Overlay::add_overlay` and `set_child` are the same code path; pass-through is a no-op. |
+| S26 | No `draw_rgba_image` on the draw context | See below. |
+
+### S26 — `DrawContext::draw_rgba_image` is not implemented on zork
+
+Found while writing `tests/zork_feature_parity.rs` (a test that asserts the
+trait default rather than an image, because the default is the honest answer).
+
+Verbatim, over the whole of `rustxWidgets/rswidgets/src/`:
+
+```
+$ grep -rn "fn draw_rgba_image" rustxWidgets/rswidgets/src/
+rustxWidgets/rswidgets/src/backends_wasm_adapter.rs:2815:        fn draw_rgba_image(
+rustxWidgets/rswidgets/src/core.rs:1206:    fn draw_rgba_image(&mut self, x: f64, y: f64, pixels: &[u8], width: u32, height: u32, scale: f64) -> bool {
+rustxWidgets/rswidgets/src/backends_gtk_adapter_impl.rs:853:        fn draw_rgba_image(&mut self, x: f64, y: f64, pixels: &[u8], width: u32, height: u32, scale: f64) -> bool {
+```
+
+```
+$ grep -n "draw_rgba_image" rustxWidgets/rswidgets/src/backends/headless.rs
+  (no output — zork's recording context does not implement it)
+```
+
+Three sites: the trait default in `core.rs:1206` returns `false`, and only GTK
+and wasm override it. So **every** backend other than GTK and wasm — android,
+ios, macos, nwg, pancurses and zork — takes the default. This is not a zork
+defect; it is a gap common to six of the eight backends, and it only surfaces
+on zork because zork is the one backend with a test that asks.
+
+`false` is also the *correct* value, not an omission to paper over: the trait
+documents it as "fall back to vector drawing", so a caller that gets `false`
+still draws something. Returning `true` would promise a blit that never
+happened.
+
+Scope: corro itself never calls `draw_rgba_image` (`grep -rn draw_rgba_image
+src/` is empty), so this is backend completeness for a third-party draw
+callback, not a corro bug. Not yet constructed.
 
 ## 4. Harness (`backends::zork::harness`) gaps
 
@@ -301,9 +353,36 @@ gap pancurses fills, and out of scope here.
 
 ### Pre-existing, unrelated
 
-`cargo check --features wasm` fails with 19 errors, and `--features
-pancurses` / `gui-mobile` / `gui-macos` with 2 / 19 / 19. Verified identical
-before this work (`git stash`), so not caused by it.
+Re-measured at `d7ec288a` + the `lock_scheme_for_tests` move, so the counts here
+are current rather than quoted from the original session. Each is the count of
+diagnostics that are *not* `error: could not compile` summary lines:
+
+```
+$ cargo check --features wasm        # NOTE: no --no-default-features
+rswidgets/src/lib.rs: E0432/E0425 x18 — `crate::common::{Menu,Window,SimpleAction,
+  Canvas,Entry,Label,Dialog,ScrolledWindow,WidgetBox,Orientation}` not found,
+  `crate::backends::init` not found
+```
+
+18 errors for `wasm`, and the same 18 for `gui-mobile` and `gui-macos`.
+
+This is **not** a wasm problem, and it is not a regression from any work in
+this document: enabling `wasm` *without* `--no-default-features` leaves the
+default `gtk` feature on, so the gtk adapter's `crate::common::*` types are
+cfg'd out while the wasm code still names them. The supported invocations —
+`--no-default-features --features wasm`, and `--target
+wasm32-unknown-unknown --features wasm --no-default-features` — are both clean
+at `-D warnings`, and `wasm32` links `corro.wasm`. Verified byte-identical with
+this change stashed and unstashed (`comm` over the two sorted error lists: no
+line appears on only one side).
+
+`--features pancurses` recorded 2 errors here and is now **0**: this work fixed
+it. `actions::night_mode_dispatch_tests` called
+`crate::gui::lock_scheme_for_tests`, which lived in the GUI-gated
+`gui_backend` module — but `actions` is compiled on every build, so any
+feature that omits `gui`/`gui-core` (pancurses is the one that gets tested)
+failed the lib-test build with E0425. The lock is a `static Mutex` with no
+toolkit in it and now lives in `src/gui/mod.rs`, which is always compiled.
 
 ## Implementation order
 

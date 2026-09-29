@@ -40,6 +40,35 @@ pub mod special_picker;
     all(feature = "wasm", target_arch = "wasm32")
 ))]
 mod gui_backend;
+/// The theme-scheme test lock, shared by every test that writes the global.
+///
+/// The scheme is a process-wide global (`rswidgets::core::set_color_scheme`),
+/// so every test that touches it has to take the same lock or two of them can
+/// flip it under each other. `gui_backend`'s brightness tests and the
+/// menu-dispatch tests in [`actions`] share this one lock rather than each
+/// declaring its own.
+///
+/// It lives here, not in [`gui_backend`], because the tests that need it are
+/// not all behind a GUI feature. `actions` is compiled on every build, so its
+/// `#[cfg(test)]` night-mode test runs under `--features pancurses` too -- and
+/// with the lock living in the GUI-gated `gui_backend` that build failed with
+/// E0425, "cannot find function `lock_scheme_for_tests`". The lock is a
+/// `static Mutex` with no toolkit in it, so nothing about it needs a GUI.
+///
+/// `pub(crate)`, not `pub`: this is test coordination between two modules inside
+/// the crate, not part of the library's API -- a host has no global scheme of
+/// its own to serialise against.
+///
+/// `#[cfg(test)]` because the lock guards *test* writers of a process-wide
+/// global and has no production caller, so a non-test build must not carry it.
+#[cfg(test)]
+pub(crate) fn lock_scheme_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    static SCHEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A poisoned lock only means another scheme test panicked; the theme is
+    // still a plain global, so recovering is correct and keeps one failure
+    // from cascading into every other test in the binary.
+    SCHEME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 #[cfg(any(feature = "gui", feature = "gui-core",
     feature = "gui-mobile",
     feature = "gui-macos",
@@ -544,5 +573,52 @@ impl App {
 
     pub fn take_final_exit_hint(&mut self) -> Option<String> {
         self.core.exit_message.take()
+    }
+}
+
+
+#[cfg(test)]
+mod scheme_lock_tests {
+    use super::lock_scheme_for_tests;
+
+    /// The scheme lock must be reachable from *every* feature set, not only the
+    /// GUI ones. `actions::night_mode_dispatch_tests` is compiled on every
+    /// build but needs this lock, so while the lock lived in the GUI-gated
+    /// `gui_backend` module, `cargo test --features pancurses` failed to build
+    /// the lib test target with E0425, and no other feature set noticed.
+    ///
+    /// That this module compiles *is* the assertion: the failure mode is a
+    /// compile error in whichever feature set is under test. The body adds the
+    /// runtime half -- that the lock actually excludes.
+    #[test]
+    fn scheme_lock_is_reachable_and_excludes() {
+        let guard = lock_scheme_for_tests();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let acquired2 = acquired.clone();
+        let tx2 = tx.clone();
+        std::thread::spawn(move || {
+            let _g = lock_scheme_for_tests();
+            acquired2.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx2.send(());
+        });
+
+        // Give the spawned thread ample time to try. While `guard` is held the
+        // lock excludes, so the send cannot have happened and this times out.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(250)).is_err(),
+            "a second thread acquired the scheme lock while it was held, so it does not exclude"
+        );
+        assert!(
+            !acquired.load(std::sync::atomic::Ordering::SeqCst),
+            "a second thread acquired the scheme lock while it was held"
+        );
+
+        // On release it must get in: a lock that only ever blocked would pass
+        // the check above and still be broken.
+        drop(guard);
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the second holder never acquired the lock after it was released");
     }
 }
