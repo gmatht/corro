@@ -110,14 +110,27 @@ pub fn file_save_dialog() -> Option<PathBuf> {
 ///
 /// [`file_save_dialog_named`] keeps the `PathBuf` signature for the desktop
 /// callers that genuinely have a path, and delegates here.
-#[cfg(any(feature = "gui", feature = "gui-core"))]
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-core",
+    all(feature = "wasm", target_arch = "wasm32")
+))]
 #[allow(unused_variables)]
 pub(crate) fn file_save_target(suggested: &str) -> Option<SaveTarget> {
     // `gui-core` alongside `gui`, for the reason the rest of this file now
     // spells: a build that has the dialog *model* but not a GUI backend
     // still compiles it. The body is a no-op there, which is what the
     // `unreachable_code` arm below is for.
-    #[cfg(any(feature = "gui", feature = "gui-core"))]
+    // WASM: no native dialog exists to ask, and the path-returning
+    // `save_file_filtered` is a documented no-op on a page (a browser cannot
+    // return a path from a synchronous function). The download itself is
+    // driven by the browser, so the target is just the suggested name forced
+    // to `.corro` -- the same rule `save_target` applies to a real pick.
+    #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+    {
+        return Some(save_target(suggested));
+    }
+    #[cfg(all(feature = "gui", feature = "gui-core", not(all(feature = "wasm", target_arch = "wasm32"))))]
     return App::init().ok().and_then(|app| {
         app.save_file_filtered(
             "Save Spreadsheet",
@@ -167,7 +180,8 @@ pub fn file_save_dialog_named(suggested: &str) -> Option<PathBuf> {
 /// The `.corro` extension is still forced, but on the *filename* rather than
 /// the URI: the platform picker appends the extension itself when the name
 /// lacks one, and a URI is not something an extension can be appended to.
-#[cfg(any(feature = "gui", feature = "gui-core"))]
+#[allow(dead_code)]
+#[cfg(any(feature = "gui", feature = "gui-core", all(feature = "wasm", target_arch = "wasm32")))]
 fn save_target(picked: &str) -> SaveTarget {
     if picked.starts_with("content://") {
         return SaveTarget::Document(picked.to_string());
@@ -177,23 +191,46 @@ fn save_target(picked: &str) -> SaveTarget {
 
 /// Where a save goes: a real file, or a Storage Access Framework document.
 ///
+/// Gated on the set of features that actually runs `gui_backend`.
+/// `App::run` routes a `pancurses` build to `pnc_backend` instead (the
+/// `Backend::Pancurses` arm in `gui/mod.rs`), so the whole menu chain -- and
+/// with it every caller of this type -- is dead there; compiling it anyway
+/// produced dead-code warnings for a save that cannot happen.
+///
+/// The predicate is deliberately the same one on `file_save_target`, which
+/// names this type in its signature, and on `save_target` / `write_workbook`,
+/// which use it. They have to move together: gating the type without gating
+/// the function that mentions it is an "undeclared type" error, and gating the
+/// function without the type is the mirror image. An earlier attempt here had
+/// the type gated and the function not, which is how that error was found.
+///
 /// Plain data with no backend behind it, and `file_save_dialog_named` matches
-/// on it unconditionally — so a `pancurses` build (which has dialogs but no GUI
-/// backend) needs the type to exist even though it never constructs a
-/// `Document`. The `dead_code` allow covers that build: nothing there reaches
-/// it, but the match in the public entry point must still typecheck.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// on it unconditionally -- so a `zork` build (`gui-core`, which reaches
+/// `gui_backend` and therefore compiles the menu chain) needs the type to
+/// exist even though it never constructs a `Document`. The `dead_code` allow
+/// covers that build: nothing there reaches it, but the match in the entry
+/// point must still typecheck. The same reasoning covers `pancurses`.
 #[allow(dead_code)]
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-core",
+    all(feature = "wasm", target_arch = "wasm32")
+))]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SaveTarget {
     Path(PathBuf),
     /// A `content://` URI. Written through the content resolver.
     Document(String),
 }
 
+#[cfg(any(
+    feature = "gui",
+    feature = "gui-core",
+    all(feature = "wasm", target_arch = "wasm32")
+))]
 impl SaveTarget {
     /// The name to show in a status line. A URI is a long opaque string, so
     /// only its last segment is shown — which is the document's own name.
-    #[allow(dead_code)]
     pub(crate) fn display(&self) -> String {
         match self {
             SaveTarget::Path(p) => p.display().to_string(),
@@ -216,9 +253,36 @@ impl SaveTarget {
 /// difference in failure behaviour — a document save interrupted part-way
 /// leaves a truncated file, where a path save leaves the old one intact — and
 /// it is inherent to SAF, not a choice: there is no other handle to write to.
-#[cfg(any(feature = "gui", feature = "gui-core"))]
+#[cfg(any(feature = "gui", feature = "gui-core", all(feature = "wasm", target_arch = "wasm32")))]
 pub(crate) fn write_workbook(target: &SaveTarget, workbook: &WorkbookState, sorts: &std::collections::HashMap<u32, Vec<crate::grid::SortSpec>>) -> Result<(), String> {
     match target {
+        // WASM: a page has no filesystem to write into, and no path to name
+        // one with -- the browser decides where a download lands and never
+        // reports it back. So the save is serialised here (the same
+        // `serialize_workbook_log` every other backend's bytes come from) and
+        // handed to the browser as a download.
+        //
+        // This lives in `write_workbook` rather than in a wasm-only function in
+        // `gui_backend` so that there is one save path in the codebase. The
+        // first version had its own, and the cost was that `SaveTarget`,
+        // `write_workbook` and `SaveTarget::display` had no caller at all in a
+        // wasm build -- three dead-code warnings for machinery that is in fact
+        // used, just not from where the first version called it.
+        #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+        SaveTarget::Path(p) => {
+            let text = crate::io::serialize_workbook_log(workbook, sorts);
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Sheet1.corro".to_string());
+            rswidgets::backends_wasm_adapter::save_file_content(&name, &text)
+                .map_err(|e| e.to_string())?;
+            // A page cannot report a path, and must not pretend to: leaving
+            // `core.path` as `None` is what routes a later plain "save" back
+            // through the download instead of a silent write to a stale file.
+            Ok(())
+        }
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
         SaveTarget::Path(p) => crate::io::write_workbook_log(p, workbook, sorts).map_err(|e| e.to_string()),
         SaveTarget::Document(uri) => {
             // Only Android can produce a Document, so this is the one place
