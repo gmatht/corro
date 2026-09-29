@@ -101,12 +101,19 @@ def write_startup_bat():
     %SystemRoot% is used on purpose: the LiveCD mounts itself on whatever
     drive letter it picks (X: in this image), not C:. The log goes to the
     floppy (A:) so the host can read it back.
+
+    The app is launched *with a sheet* when one was staged (see install_sheet).
+    An empty grid renders fine but proves nothing about values or formulas,
+    so the bring-up wants a real sheet on screen: the interaction phase then
+    edits a cell that has neighbours, which is what a spreadsheet user does.
     """
+    open_arg = "sheet.corro" if os.path.exists(
+        os.path.join(TREE, "reactos", "sheet.corro")) else ""
     bat = (
         "@echo off\r\n"
         "set CORRO_WIN95_LOG=A:\\gcorro.log\r\n"
         "cd /d \"%SystemRoot%\"\r\n"
-        "\"%SystemRoot%\\gcorro.exe\"\r\n"
+        f"\"%SystemRoot%\\gcorro.exe\" {open_arg}\r\n"
     )
     startup_dirs = [
         os.path.join(TREE, "Profiles", "All Users", "Start Menu", "Programs", "StartUp"),
@@ -130,6 +137,8 @@ def build_iso(exe):
     # next to the exe first. ReactOS ships no unicows.dll, so without this the
     # process never starts (no window, no log).
     shutil.copy(UNICOWS, os.path.join(TREE, "reactos", "unicows.dll"))
+    # Stage a real sheet next to the exe so the app opens with content.
+    install_sheet()
     write_startup_bat()
 
     genisoimage = make_genisoimage()
@@ -150,6 +159,22 @@ def build_iso(exe):
         "-hide", "boot.catalog", "-sort", sortfile, "-no-cache-inodes", TREE,
     ], check=True)
     log(f"   built {OUT_ISO} ({os.path.getsize(OUT_ISO)} bytes)")
+
+
+def install_sheet():
+    """Copy a real .corro sheet into <live>/reactos so the app opens with data.
+
+    Bringing the app up against an empty grid only proves it paints. A sheet
+    with values and formulas lets the run check the part that actually
+    matters - that content lands in the cells and that editing one cell
+    behaves. ROS_SHEET overrides which file is used.
+    """
+    src = os.environ.get("ROS_SHEET") or os.path.join(CORRO, "subtotal.corro")
+    if not os.path.exists(src):
+        log(f"   (no sheet at {src}; app will start empty)")
+        return
+    shutil.copy(src, os.path.join(TREE, "reactos", "sheet.corro"))
+    log(f"   staged sheet {os.path.basename(src)} -> <live>/reactos/sheet.corro")
 
 
 def make_floppy():
@@ -188,6 +213,35 @@ def start_qemu():
     ], stdout=logp, stderr=subprocess.STDOUT, start_new_session=True)
 
 
+def interact(q, out):
+    """Drive the app like a user and snapshot each step.
+
+    A screenshot of a freshly launched app only proves it painted once. This
+    types into the grid, commits with Enter, and moves the cursor with the
+    arrows, capturing the screen after each step so a caller can see whether
+    the grid actually reacted. Each step is timed generously: the guest runs
+    an emulated 486 and its redraw goes through the message loop, so an
+    immediate screendump catches the previous frame.
+    """
+    steps = [
+        # (label, keys) - qcode names per QEMU's PS/2 keycode set.
+        ("type-42", [{"type": "qcode", "data": "4"},
+                     {"type": "qcode", "data": "2"}]),
+        ("commit",  [{"type": "qcode", "data": "ret"}]),
+        ("right",   [{"type": "qcode", "data": "right"}]),
+        ("down",    [{"type": "qcode", "data": "down"}]),
+        ("type-7",  [{"type": "qcode", "data": "7"}]),
+        ("commit2", [{"type": "qcode", "data": "ret"}]),
+    ]
+    log("== interaction: driving the grid")
+    for label, keys in steps:
+        q.cmd("send-key", {"keys": keys})
+        time.sleep(4)  # let the guest process, redraw and settle
+        path = os.path.join(out, f"ix-{label}.png")
+        q.cmd("screendump", {"filename": path, "format": "ppm"})
+        log(f"   {label} -> {os.path.basename(path)}")
+
+
 def main():
     exe = sys.argv[1] if len(sys.argv) > 1 else os.path.join(CORRO, "dist", "gcorro.exe")
     os.makedirs(OUT, exist_ok=True)
@@ -211,6 +265,12 @@ def main():
         logf = "/tmp/qemu-corro-ros.log"
         if os.path.exists(logf):
             log(f"== qemu said:\n" + open(logf).read()[-2000:])
+        # Reap the VM on this path too, or a failed run leaks one just like a
+        # successful one (see the shutdown note in main()).
+        try:
+            proc.kill()
+        except Exception:
+            pass
         raise SystemExit(1)
     t0 = time.time()
     last_enter = 0.0
@@ -249,10 +309,16 @@ def main():
                 log(f"== {what} reached at t={time.time()-t0:.0f}s")
                 at_desktop = True
                 q.cmd("screendump", {"filename": f"{OUT}/desktop.png", "format": "ppm"})
-            # let the Startup batch launch the app, then snapshot it
-            for k in range(6):
-                time.sleep(15)
-                q.cmd("screendump", {"filename": f"{OUT}/app-{k}.png", "format": "ppm"})
+            # Let the Startup batch launch the app, then settle.
+            time.sleep(45)
+            q.cmd("screendump", {"filename": f"{OUT}/app-0.png", "format": "ppm"})
+            # Interaction: the app being *on screen* only proves it painted
+            # once. Drive it like a user and check the grid responds, which
+            # is the difference between "renders" and "works".
+            try:
+                interact(q, OUT)
+            except Exception as e:
+                log(f"== interaction phase failed: {e}")
             break
         # Boot gates that block until a key is pressed: the FreeLDR menu, the
         # CD driver "press any key" gate, and the first-boot language splash.
@@ -278,6 +344,23 @@ def main():
             log(f"   [t={time.time()-t0:.0f}s] Enter (stall re-send)")
         time.sleep(3)
     q.close()
+    # Shut the VM down. Without this every run leaks a QEMU: it is started
+    # with start_new_session=True so it outlives the harness, and nothing
+    # ever reaps it. A handful of concurrent runs is survivable, but they
+    # pile up fast - after a dozen runs the host had 13 live VMs, load
+    # average 24 on 16 cores, and fresh boots stopped reaching the desktop
+    # inside the time budget, which reads as random harness flakiness.
+    # Screendumps and the log are already taken by this point, so nothing
+    # downstream needs the VM.
+    try:
+        proc.terminate()
+        proc.wait(timeout=10)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    log("== qemu shut down")
     # fetch the app log off the floppy
     mount = "/tmp/_ros_floppy"
     os.makedirs(mount, exist_ok=True)
