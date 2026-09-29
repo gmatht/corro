@@ -6887,17 +6887,25 @@ pub fn run_gui_with_movie(
     // built the real widget tree against the in-memory model, which is the
     // part worth exercising. Dump what it built and hand off to the backend's
     // REPL, which reads that same model.
+    //
+    // The two arms below are `#[cfg]`-split rather than one `return` followed
+    // by `Ok(())` because the tail is unreachable under zork, and both halves
+    // of that used to be errors. `Ok(())` after the early return is an
+    // `unreachable_expression`, and `rxapp` is named only by the `run()` call
+    // this branch removes, so leaving it un-gated is an `unused_variable`.
+    // Neither is worth a `#[allow]`: they are the compiler correctly saying
+    // "this code does not run", and a real loop below does run.
     #[cfg(feature = "zork")]
-    {
-        return zork_handoff(corro_app, &rxapp, &win, &shared);
-    }
+    return zork_handoff(corro_app, &win, &shared);
 
     #[cfg(not(feature = "zork"))]
-    rxapp.run()?;
-    // TEMPORARY Win95 diagnosis (unreachable if run() loops until quit).
-    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-    unsafe { mark95(b"post-run\n"); }
-    Ok(())
+    {
+        rxapp.run()?;
+        // TEMPORARY Win95 diagnosis (unreachable if run() loops until quit).
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        unsafe { mark95(b"post-run\n"); }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6917,7 +6925,6 @@ pub fn run_gui_with_movie(
 #[cfg(feature = "zork")]
 fn zork_handoff(
     corro_app: &mut super::App,
-    rxapp: &rswidgets::App,
     win: &Window,
     shared: &Rc<GuiState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
