@@ -5,6 +5,9 @@
 #   ./run95-gui.sh --show         visible QEMU window (needs a working X display)
 #   ./run95-gui.sh --no-build     reuse dist/gcorro.exe
 #   ./run95-gui.sh --no-shutdown  leave the VM running afterwards
+#   ./run95-gui.sh --refresh-base rebuild the clean base from the golden
+#                               master: stage the exe, run fsck, so the next
+#                               boot goes straight to the desktop
 #
 # The sibling run95.sh does the same for the *console TUI* (corro-win95.exe,
 # launched through Start > Run so it gets a DOS box). This one runs the GUI
@@ -18,15 +21,35 @@
 #   * the app is a GUI, so it is verified the way the ReactOS harness does it:
 #     by driving it and looking at frames, not by spotting a console window.
 #
-# Both harnesses boot a FRESH per-run overlay backed by the golden master, so
-# whatever happens in the guest (kills, dirty shutdowns, test debris) lands in
-# the overlay and the golden master stays clean. The golden is only ever
-# written offline, by the upload step.
+# Always boots a CLEAN snapshot.
+# -------------------------------
+# Win95 decides whether to run ScanDisk from a dirty bit the OS sets in the
+# FAT and clears on an orderly unmount. A VM that is killed, or whose Explorer
+# is still running, leaves that bit set - so every later boot spends ten
+# minutes in ScanDisk on an emulated 486 and then stops on a lost-cluster
+# dialog that has to be answered by hand. That is pure overhead, and it made
+# runs look broken when nothing was wrong.
+#
+# So the images are split in two:
+#
+#   BASE    a qcow2 that has been fsck'd and already has the exe, sheet and
+#           unicows staged. Never booted; only written offline, by the staging
+#           step and by `--refresh-base`.
+#   SESSION a throwaway overlay on BASE, recreated every run. Everything the
+#           guest does - including dirtying its own filesystem - lands here
+#           and is discarded with it.
+#
+# Every boot therefore starts from a filesystem the OS believes is clean.
+# `--refresh-base` rebuilds BASE from the golden master when the golden has
+# itself drifted; that is the only step that ever writes it.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-DISK=${WIN95_DISK:-/root/vm/win95-flat.qcow2}
-SESSION_DISK=${WIN95_SESSION:-${DISK%.qcow2}-gui-session.qcow2}
+GOLDEN=${WIN95_DISK:-/root/vm/win95-flat.qcow2}
+# BASE is derived from the golden's name so the two cannot be mistaken for
+# one another on disk.
+BASE=${WIN95_BASE:-${GOLDEN%.qcow2}-gui-base.qcow2}
+SESSION_DISK=${WIN95_SESSION:-${GOLDEN%.qcow2}-gui-session.qcow2}
 QEMU_PIDFILE=/tmp/qemu-win95-gui.pid
 SHEET=${WIN95_SHEET:-subtotal.corro}
 UNICOWS=${UNICOWS_DLL:-/opt/wine-stable/lib/wine/i386-windows/unicows.dll}
@@ -35,14 +58,50 @@ VNC_DISPLAY=${VNC_DISPLAY:-:6}          # = TCP port 5906
 MODE=headless
 NO_BUILD=0
 NO_SHUTDOWN=0
+REFRESH_BASE=0
 for a in "$@"; do
   case "$a" in
     --show) MODE=show ;;
     --no-build) NO_BUILD=1 ;;
     --no-shutdown) NO_SHUTDOWN=1 ;;
+    --refresh-base) REFRESH_BASE=1 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
+
+# Clear a ScanDisk run, if one is on screen.
+#
+# The dialog that needs answering is "ScanDisk found N bytes of data ... To look
+# at the data, choose Save". Its default is Save, which writes a .CHK file into
+# the image root on every boot; Right moves focus to "Don't Fix It", which is
+# what we want - the bytes are just lost clusters from however the previous VM
+# was killed, and the filesystem is about to be fsck'd offline anyway. The
+# follow-up "There was an error running SCANDISK.EXE ... Press any key"
+# message just needs a keypress.
+#
+# Bounded and screen-driven, so it is a no-op when there is no ScanDisk to
+# clear - which is the normal case now that BASE is fsck'd.
+dismiss_scandisk() {
+  local i
+  for i in $(seq 1 24); do
+    QMP_PORT=$QMP_PORT python3 scripts/qmp.py shot /tmp/_w95_scan.png >/dev/null 2>&1 || return 0
+    if ! tesseract /tmp/_w95_scan.png - --psm 6 2>/dev/null | grep -qi scandisk; then
+      return 0
+    fi
+    # Only answer the prompt once it is actually there; the scan text is on
+    # screen long before the buttons are.
+    if tesseract /tmp/_w95_scan.png - --psm 6 2>/dev/null | grep -qi "choose Save"; then
+      echo "   ScanDisk prompt: choosing Don't Fix It"
+      QMP_PORT=$QMP_PORT python3 scripts/qmp.py key right
+      sleep 1
+      QMP_PORT=$QMP_PORT python3 scripts/qmp.py key ret
+      sleep 20
+    fi
+    # "Press any key to continue starting Windows..."
+    QMP_PORT=$QMP_PORT python3 scripts/qmp.py key ret
+    sleep 15
+  done
+}
 
 # Prints the pidfile PID, but ONLY if that process is actually our QEMU
 # (matched by binary + our QMP port). A stale pidfile whose PID got
@@ -79,65 +138,116 @@ if [ -n "$pids" ]; then
 fi
 rm -f "$QEMU_PIDFILE"
 
-# -------------------------------------------------------- 3. upload exe+sheet
-echo "== 3/6 uploading to $DISK"
-if [ ! -f "$DISK" ]; then
-  echo "ERROR: $DISK missing (the golden master image)" >&2; exit 1
+# ------------------------------------------------------- 3. build the BASE
+# Everything the guest needs is staged into BASE, never into the golden
+# master. The golden is a shared, human-curated artifact (other operators run
+# their own sessions off it); writing test binaries into it is how it drifts.
+#
+# BASE is rebuilt from the golden only when it is missing or when
+# --refresh-base is given, so the common run does no image work at all - it
+# just makes a throwaway overlay and boots.
+echo "== 3/6 preparing the clean base"
+if [ ! -f "$GOLDEN" ]; then
+  echo "ERROR: $GOLDEN missing (the golden master image)" >&2; exit 1
 fi
 export LIBGUESTFS_BACKEND=direct
-
-# The workbook goes on the image too, so the Run line is just the exe name
-# and the app opens with content. Launching an empty grid would prove only
-# that it paints; the ReactOS harness got real verification by naming a
-# sheet, and this one should too.
 [ -f "$SHEET" ] || { echo "ERROR: sheet $SHEET not found" >&2; exit 1; }
-guestfish -a "$DISK" -m /dev/sda1 upload dist/gcorro.exe /GCORRO.EXE
-guestfish -a "$DISK" -m /dev/sda1 upload "$SHEET" /SHEET.CORRO
 
-# Verify the upload byte-for-byte. Uploads have silently failed before, and
-# a truncated exe on the guest is indistinguishable from a broken app.
-guestfish -a "$DISK" -m /dev/sda1 download /GCORRO.EXE /tmp/_gcorro_verify.exe
-disk_md5=$(md5sum /tmp/_gcorro_verify.exe | cut -d' ' -f1)
-want_md5=$(md5sum dist/gcorro.exe | cut -d' ' -f1)
-if [ "$disk_md5" != "$want_md5" ]; then
-  echo "ERROR: upload md5 mismatch ($disk_md5 != $want_md5)" >&2
-  exit 1
-fi
-rm -f /tmp/_gcorro_verify.exe
-echo "   upload verified (md5 $want_md5), sheet $SHEET staged"
-
-# unicows.dll is required on Win9x/ME: the rust9x targets import the Unicode
-# layer through it, and without it the loader fails before any window opens
-# (no window, no evidence). Wine's copy is the usual source.
-have_unicows=0
-for p in /WINDOWS/SYSTEM/UNICOWS.DLL /WINDOWS/SYSTEM/unicows.dll \
-         /Windows/System/unicows.dll /windows/system/unicows.dll; do
-  if guestfish --ro -a "$DISK" -m /dev/sda1 exists "$p" >/dev/null 2>&1; then
-    have_unicows=1
-    break
-  fi
-done
-if [ "$have_unicows" != 1 ]; then
-  if [ -f "$UNICOWS" ]; then
-    echo "   unicows.dll not on image; uploading $UNICOWS"
-    guestfish -a "$DISK" -m /dev/sda1 mkdir-p /WINDOWS/SYSTEM
-    guestfish -a "$DISK" -m /dev/sda1 upload "$UNICOWS" /WINDOWS/SYSTEM/UNICOWS.DLL
+if [ "$REFRESH_BASE" = 1 ] || [ ! -f "$BASE" ]; then
+  if [ "$REFRESH_BASE" = 1 ]; then
+    echo "   --refresh-base: rebuilding $BASE from $GOLDEN"
+    rm -f "$BASE"
   else
-    echo "   WARNING: unicows.dll not on image and $UNICOWS missing; the exe" >&2
-    echo "            may fail to load (needs unicows.dll on Win9x/ME)" >&2
+    echo "   no base yet; creating $BASE from $GOLDEN"
   fi
+  qemu-img convert -O qcow2 "$GOLDEN" "$BASE"
+
+  # The workbook goes on the image too, so the Run line is just the exe name
+  # and the app opens with content. Launching an empty grid would prove only
+  # that it paints; the ReactOS harness got real verification by naming a
+  # sheet, and this one should too.
+  guestfish -a "$BASE" -m /dev/sda1 upload dist/gcorro.exe /GCORRO.EXE
+  guestfish -a "$BASE" -m /dev/sda1 upload "$SHEET" /SHEET.CORRO
+
+  # Verify the upload byte-for-byte. Uploads have silently failed before, and
+  # a truncated exe on the guest is indistinguishable from a broken app.
+  guestfish -a "$BASE" -m /dev/sda1 download /GCORRO.EXE /tmp/_gcorro_verify.exe
+  disk_md5=$(md5sum /tmp/_gcorro_verify.exe | cut -d' ' -f1)
+  want_md5=$(md5sum dist/gcorro.exe | cut -d' ' -f1)
+  if [ "$disk_md5" != "$want_md5" ]; then
+    echo "ERROR: upload md5 mismatch ($disk_md5 != $want_md5)" >&2
+    exit 1
+  fi
+  rm -f /tmp/_gcorro_verify.exe
+  echo "   upload verified (md5 $want_md5), sheet $SHEET staged"
+
+  # unicows.dll is required on Win9x/ME: the rust9x targets import the Unicode
+  # layer through it, and without it the loader fails before any window opens
+  # (no window, no evidence). Wine's copy is the usual source. This image had
+  # no copy at all, which is a plausible reason an earlier attempt to launch
+  # the GUI here produced nothing.
+  have_unicows=0
+  for p in /WINDOWS/SYSTEM/UNICOWS.DLL /WINDOWS/SYSTEM/unicows.dll \
+           /Windows/System/unicows.dll /windows/system/unicows.dll; do
+    if guestfish --ro -a "$BASE" -m /dev/sda1 exists "$p" >/dev/null 2>&1; then
+      have_unicows=1
+      break
+    fi
+  done
+  if [ "$have_unicows" != 1 ]; then
+    if [ -f "$UNICOWS" ]; then
+      echo "   unicows.dll not on image; uploading $UNICOWS"
+      guestfish -a "$BASE" -m /dev/sda1 mkdir-p /WINDOWS/SYSTEM
+      guestfish -a "$BASE" -m /dev/sda1 upload "$UNICOWS" /WINDOWS/SYSTEM/UNICOWS.DLL
+    else
+      echo "   WARNING: unicows.dll not on image and $UNICOWS missing; the exe" >&2
+      echo "            may fail to load (needs unicows.dll on Win9x/ME)" >&2
+    fi
+  else
+    echo "   unicows.dll already on image"
+  fi
+
+  # Clear the filesystem's dirty bit BEFORE the first boot. The golden has
+  # almost always been killed rather than shut down, so Windows would
+  # otherwise run ScanDisk for ten minutes on an emulated 486 and then stop
+  # on a lost-cluster prompt nobody is there to answer. fsck returns 0x1 when
+  # it corrected something, which is the expected result here, not a failure.
+  echo "   fsck to clear the dirty bit (skips ScanDisk on first boot)"
+  # guestfish needs an explicit `run` before any appliance command, and the
+  # here-doc form is the only one that takes it. `|| true` because fsck exits
+  # 0x1 when it corrected something, which is the expected outcome here.
+  guestfish -a "$BASE" <<'FSCK' || true
+run
+fsck fat /dev/sda1
+FSCK
 else
-  echo "   unicows.dll already on image"
+  echo "   reusing existing base $BASE (pass --refresh-base to rebuild)"
+  # The exe may have been rebuilt since BASE was made, so refresh just the
+  # binary when its md5 no longer matches. Cheap, and it keeps "no image work
+  # on a normal run" from quietly becoming "always runs yesterday's binary".
+  guestfish -a "$BASE" -m /dev/sda1 download /GCORRO.EXE /tmp/_gcorro_have.exe 2>/dev/null || true
+  have_md5=$(md5sum /tmp/_gcorro_have.exe 2>/dev/null | cut -d' ' -f1)
+  want_md5=$(md5sum dist/gcorro.exe | cut -d' ' -f1)
+  rm -f /tmp/_gcorro_have.exe
+  if [ "$have_md5" != "$want_md5" ]; then
+    echo "   exe changed since the base was built; restaging"
+    guestfish -a "$BASE" -m /dev/sda1 upload dist/gcorro.exe /GCORRO.EXE
+    guestfish -a "$BASE" -m /dev/sda1 upload "$SHEET" /SHEET.CORRO
+    guestfish -a "$BASE" <<'FSCK' || true
+run
+fsck fat /dev/sda1
+FSCK
+  fi
 fi
 
 # ------------------------------------------------------------- 4. boot VM
-# Boot a FRESH overlay backed by the golden master: every run starts from the
-# same snapshot, and whatever happens inside the guest lands in the overlay,
-# which is discarded next run. The golden is only ever written by step 3.
+# Boot a FRESH throwaway overlay on BASE. Whatever happens inside the guest
+# lands here and is discarded next run, so BASE stays fsck-clean no matter
+# how violently this run ends.
 echo "== 4/6 booting VM (this takes a few minutes)"
 rm -f "$SESSION_DISK"
-qemu-img create -f qcow2 -F qcow2 -b "$DISK" "$SESSION_DISK" >/dev/null
-echo "   session overlay: $SESSION_DISK (backed by $DISK)"
+qemu-img create -f qcow2 -F qcow2 -b "$BASE" "$SESSION_DISK" >/dev/null
+echo "   session overlay: $SESSION_DISK (backed by $BASE)"
 ACCEL=kvm
 [ -w /dev/kvm ] || ACCEL=tcg
 DISP_ARGS=(-display none -vnc "$VNC_DISPLAY")
@@ -157,6 +267,14 @@ if ! kill -0 "$(cat "$QEMU_PIDFILE")" 2>/dev/null; then
   exit 1
 fi
 
+# Win95 will still run ScanDisk if the guest dirties the volume, so handle
+# it rather than wait it out: the scan itself is slow on an emulated 486, and
+# it then stops on a lost-cluster prompt that has to be answered by hand.
+# 'Right' moves focus off the default (Save) onto "Don't Fix It" - Save would
+# write FILE0000.CHK into the image root on every run - and the dialogs that
+# follow are cleared with a keypress each.
+echo "   handling any ScanDisk / boot dialogs"
+dismiss_scandisk
 QMP_PORT=$QMP_PORT python3 scripts/qmp.py wait-stable --min 140 --timeout 720 --verbose || \
   echo "   WARNING: desktop detection timed out; continuing anyway"
 # Dismiss any boot-time dialogs (e.g. Display Properties in Safe Mode)
