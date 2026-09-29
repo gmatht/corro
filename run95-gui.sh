@@ -85,12 +85,15 @@ dismiss_scandisk() {
   local i
   for i in $(seq 1 24); do
     QMP_PORT=$QMP_PORT python3 scripts/qmp.py shot /tmp/_w95_scan.png >/dev/null 2>&1 || return 0
-    if ! tesseract /tmp/_w95_scan.png - --psm 6 2>/dev/null | grep -qi scandisk; then
+    # `command grep` with long options: the `grep` on PATH is an rg wrapper
+    # here and it rejects bundled short flags like -qi.
+    screen=$(tesseract /tmp/_w95_scan.png - --psm 6 2>/dev/null)
+    if ! printf '%s' "$screen" | command grep --ignore-case --quiet scandisk; then
       return 0
     fi
     # Only answer the prompt once it is actually there; the scan text is on
     # screen long before the buttons are.
-    if tesseract /tmp/_w95_scan.png - --psm 6 2>/dev/null | grep -qi "choose Save"; then
+    if printf '%s' "$screen" | command grep --ignore-case --quiet "choose Save"; then
       echo "   ScanDisk prompt: choosing Don't Fix It"
       QMP_PORT=$QMP_PORT python3 scripts/qmp.py key right
       sleep 1
