@@ -55,14 +55,60 @@ fn docs_dir() -> PathBuf {
     repo_root().join("docs")
 }
 
-/// The file name the app writes when `CORRO_ZORK_WALKTHROUGH` names a path.
+/// The feature report the app writes when `CORRO_ZORK_WALKTHROUGH` names a
+/// path: one `[PASS]`/`[MISS]` row per widget, plus the backend's own console
+/// output as its first section.
 ///
-/// Committed rather than ignored because it is a *record*, not a log: a
-/// reviewer diffing it between changes sees exactly which feature moved, and a
-/// test asserting against it is asserting against a checked-in expectation.
-/// `docs/ZORK_MISSING.md` holds the prose analysis; this is the machine-written
-/// counterpart.
-const WALKTHROUGH: &str = "ZORK_WALKTHROUGH.txt";
+/// # Why this is not `docs/ZORK_WALKTHROUGH.txt`
+///
+/// It was, alongside a hand-written verbatim transcript under the same name,
+/// and because this report is generated *by the test that reads it*, it always
+/// won: a plain `cargo test` replaced the transcript with the report, and then
+/// passed by asserting against the file it had just written. The replacement
+/// was not obviously wrong — a 200-line generated report in place of a
+/// 350-line session transcript — which is how it survived two rounds of
+/// `git add -A` before commit bd8e326f identified it.
+///
+/// So they are separate documents, each with one owner:
+///
+/// * `docs/ZORK_WALKTHROUGH.txt` — the transcript. Hand-written, quoting real
+///   sessions, and the one a reader starts with.
+/// * `docs/ZORK_FEATURE_REPORT.txt` — this. Machine-written, regenerated on
+///   request, and the one the assertions below parse.
+///
+/// Both are committed because both are *records*: a reviewer diffing them
+/// between changes sees exactly what moved.
+const WALKTHROUGH: &str = "ZORK_FEATURE_REPORT.txt";
+
+/// Where the report is written during a test run.
+///
+/// A plain `cargo test` reads the committed report and writes **nothing**. It
+/// used to write straight into `docs/`, which is what made the clobbering
+/// invisible — see the note on [`WALKTHROUGH`]. Regenerate the record with
+/// `CORRO_ZORK_WALKTHROUGH_WRITE=1`, and what you get back is a real diff to
+/// review rather than an accident to notice later.
+fn walkthrough_out_path() -> PathBuf {
+    if std::env::var_os("CORRO_ZORK_WALKTHROUGH_WRITE").is_some() {
+        docs_dir().join(WALKTHROUGH)
+    } else {
+        std::env::temp_dir().join(format!(
+            "corro_zork_feature_report_{}.txt",
+            std::process::id()
+        ))
+    }
+}
+
+/// Read the committed report without regenerating it.
+fn committed_walkthrough() -> String {
+    std::fs::read_to_string(docs_dir().join(WALKTHROUGH)).unwrap_or_else(|e| {
+        panic!(
+            "{} must be committed and readable ({e}). It is a *record*, not a \
+             log: regenerate it with CORRO_ZORK_WALKTHROUGH_WRITE=1 cargo test \
+             --no-default-features --features zork --test zork_feature_parity",
+            docs_dir().join(WALKTHROUGH).display()
+        )
+    })
+}
 
 /// The repo root, from the test's own location.
 fn repo_root() -> PathBuf {
@@ -180,7 +226,15 @@ fn run_app_and_read_walkthrough(out_path: &PathBuf) -> String {
 /// computed and the lock would only add a failure mode.
 fn walkthrough() -> &'static str {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    TEXT.get_or_init(|| run_app_and_read_walkthrough(&docs_dir().join(WALKTHROUGH)))
+    TEXT.get_or_init(|| {
+        // Opt in to rewriting the committed record; otherwise read it as-is.
+        // See `walkthrough_out_path` for why that distinction is the whole fix.
+        if std::env::var_os("CORRO_ZORK_WALKTHROUGH_WRITE").is_some() {
+            run_app_and_read_walkthrough(&walkthrough_out_path())
+        } else {
+            committed_walkthrough()
+        }
+    })
 }
 
 /// The value of a `[MARK] feature` row's detail column, if the row exists.
@@ -249,7 +303,17 @@ fn zork_walkthrough_is_recorded() {
     );
     assert!(
         docs_dir().join(WALKTHROUGH).exists(),
-        "the walkthrough must be written under docs/ so it is reviewable and committable"
+        "the feature report must be committed under docs/ so it is reviewable \
+         and committable; regenerate it with CORRO_ZORK_WALKTHROUGH_WRITE=1"
+    );
+    // The transcript is a separate artefact and must survive a test run. This
+    // is the assertion that catches the two documents colliding again: it
+    // fails the moment a generator is pointed back at that filename, which is
+    // how the clobbering survived two rounds unnoticed the first time.
+    assert!(
+        docs_dir().join("ZORK_WALKTHROUGH.txt").exists(),
+        "the hand-written transcript must still be there; it and the feature \
+         report are separate documents now"
     );
 }
 
