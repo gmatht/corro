@@ -9,14 +9,27 @@ use std::io::{self, BufRead, Write};
 use crate::backends::BackendApp;
 use crate::backends::zork::model::{ZorkKind, ZorkNode, ZorkState};
 
+/// Virtual milliseconds the model's clock advances by at each REPL prompt.
+///
+/// Nominal rather than measured: the point is that a turn is a tick, so a
+/// timer a host installed actually comes due, not that the REPL is a real-time
+/// scheduler. It is the same figure the model starts with in a test, so a REPL
+/// session and a test see the same deadlines.
+const REPL_TICK_MS: u64 = 50;
+
 pub struct ZorkApp {
     state: ZorkState,
+    /// Standees already told that a `sheet` command aimed at a spreadsheet
+    /// they are not standing on. Presentation state, not model state: it
+    /// belongs to the *reader*, and it is deliberately not in the snapshot so
+    /// it cannot affect a regression comparison.
+    sheet_aim_notice: Vec<usize>,
 }
 
 impl ZorkApp {
     /// A REPL over a fresh, empty model — the standalone case.
     pub fn new() -> Self {
-        ZorkApp { state: ZorkState::new() }
+        ZorkApp { state: ZorkState::new(), sheet_aim_notice: Vec::new() }
     }
 
     /// A REPL over the *existing* singleton model.
@@ -26,7 +39,7 @@ impl ZorkApp {
     /// would get a REPL that can see none of it. This adopts whatever is
     /// already there.
     pub fn from_existing_state(state: ZorkState) -> Self {
-        ZorkApp { state }
+        ZorkApp { state, sheet_aim_notice: Vec::new() }
     }
 
     /// Take the singleton model's current contents.
@@ -56,6 +69,15 @@ impl BackendApp for ZorkApp {
         let mut rl = rustyline::DefaultEditor::new()?;
 
         while self.state.running {
+            // The model has no wall clock, so a timer fires when the clock
+            // moves. A REPL turn is the only place time passes here, so each
+            // prompt advances it by a nominal 50ms — enough for a timer with
+            // any sane interval to come due within a few turns, and it makes
+            // `wait` a way to *skip* ahead rather than the only way forward.
+            // Without this, a host that installs a timer and hands off to the
+            // REPL would see a timer that never fires and no error.
+            self.state.advance_timers(REPL_TICK_MS);
+
             if let Some(node) = self.state.node(self.state.current_id) {
                 describe_room(&self.state, node);
             }
@@ -67,7 +89,7 @@ impl BackendApp for ZorkApp {
                     let trimmed = line.trim().to_string();
                     if !trimmed.is_empty() {
                         rl.add_history_entry(&trimmed)?;
-                        execute_command(&mut self.state, &trimmed);
+                        execute_command(&mut self.state, &mut self.sheet_aim_notice, &trimmed);
                     }
                 }
                 Err(rustyline::error::ReadlineError::Interrupted)
@@ -199,12 +221,6 @@ fn prop_summary(state: &ZorkState, node: &ZorkNode) -> String {
     }
 }
 
-fn dir_name(dirs: &[(&str, &ZorkNode)], id: usize) -> String {
-    dirs.iter()
-        .find(|(_, t)| t.id == id)
-        .map(|(d, _)| (*d).to_string())
-        .unwrap_or_else(|| "?".to_string())
-}
 
 fn describe_room(state: &ZorkState, node: &ZorkNode) {
     println!();
@@ -300,43 +316,10 @@ fn describe_room_lit(state: &ZorkState, node: &ZorkNode) {
         }
     }
 
-    let parent_dir = node.parent.and_then(|pid| state.node(pid));
-    let children: Vec<&ZorkNode> = node.children.iter().filter_map(|cid| state.node(*cid)).collect();
-    let siblings: Vec<&ZorkNode> = if let Some(pid) = node.parent {
-        state.node(pid).map(|p| p.children.iter().filter_map(|cid| state.node(*cid)).collect()).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    let mut my_idx = None;
-    for (i, sib) in siblings.iter().enumerate() {
-        if sib.id == node.id {
-            my_idx = Some(i);
-            break;
-        }
-    }
-
-    let mut dirs: Vec<(&str, &ZorkNode)> = Vec::new();
-    if let Some(idx) = my_idx {
-        if idx > 0 {
-            if let Some(prev) = siblings.get(idx - 1) {
-                dirs.push(("west", prev));
-            }
-        }
-        if idx + 1 < siblings.len() {
-            if let Some(next) = siblings.get(idx + 1) {
-                dirs.push(("east", next));
-            }
-        }
-    }
-    if !children.is_empty() {
-        if let Some(first) = children.first() {
-            dirs.push(("north", first));
-        }
-    }
-    if parent_dir.is_some() {
-        dirs.push(("south", parent_dir.unwrap()));
-    }
+    // Directions, from the shared helper so `navigate_find`, the printed
+    // "To the <dir>" lines and the numbered list cannot disagree about which
+    // node is north.
+    let dirs: Vec<(&str, &ZorkNode)> = navigate_dirs(state, node);
 
     if !dirs.is_empty() {
         println!();
@@ -356,30 +339,94 @@ fn describe_room_lit(state: &ZorkState, node: &ZorkNode) {
     println!("You see:");
     println!("  0. (yourself) {}", short_desc(state, node));
     let mut idx = 1;
-    for (_, target) in &dirs {
-        println!("  {}. {} ({})", idx, short_desc(state, target), dir_name(&dirs, target.id));
-        idx += 1;
-    }
-    if let Some(pid) = node.parent {
-        if let Some(p) = state.node(pid) {
-            for cid in &p.children {
-                if *cid == node.id {
-                    continue;
-                }
-                if dirs.iter().any(|(_, t)| t.id == *cid) {
-                    continue;
-                }
-                if let Some(other) = state.node(*cid) {
-                    println!("  {}. {}", idx, short_desc(state, other));
-                    idx += 1;
-                }
-            }
+    for id in visible_from(state, node) {
+        // A node can be both a direction and a sibling; it is listed once, with
+        // its direction noted, because the reader can only move to it one way.
+        let dir = dirs
+            .iter()
+            .find(|(_, t)| t.id == id)
+            .map(|(d, _)| format!(" ({})", d))
+            .unwrap_or_default();
+        if let Some(other) = state.node(id) {
+            println!("  {}. {}{}", idx, short_desc(state, other), dir);
         }
+        idx += 1;
     }
     println!();
 }
 
-fn execute_command(state: &mut ZorkState, line: &str) {
+/// The directions out of `node`, in the order the REPL names them.
+///
+/// One definition, used by the printed direction lines, the numbered "You see"
+/// list, `navigate_find` and [`resolve_number_target`]. When those were four
+/// separate computations they agreed only by coincidence, and the numbered
+/// list — the one the reader actually uses to pick a target — was not the list
+/// `go <n>` walked.
+fn navigate_dirs<'a>(state: &'a ZorkState, node: &ZorkNode) -> Vec<(&'static str, &'a ZorkNode)> {
+    let siblings: Vec<&ZorkNode> = if let Some(pid) = node.parent {
+        state
+            .node(pid)
+            .map(|p| p.children.iter().filter_map(|cid| state.node(*cid)).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let my_idx = siblings.iter().position(|s| s.id == node.id);
+
+    let mut dirs: Vec<(&'static str, &'a ZorkNode)> = Vec::new();
+    if let Some(idx) = my_idx {
+        if idx > 0 {
+            if let Some(prev) = siblings.get(idx - 1) {
+                dirs.push(("west", prev));
+            }
+        }
+        if idx + 1 < siblings.len() {
+            if let Some(next) = siblings.get(idx + 1) {
+                dirs.push(("east", next));
+            }
+        }
+    }
+    if let Some(first) = node.children.iter().filter_map(|cid| state.node(*cid)).next() {
+        dirs.push(("north", first));
+    }
+    if let Some(pid) = node.parent {
+        if let Some(p) = state.node(pid) {
+            dirs.push(("south", p));
+        }
+    }
+    dirs
+}
+
+/// The numbered list the reader sees after "You see:", excluding yourself
+/// (which is always `0`): the directions first, then the parent's other
+/// children, then this node's own children — each node once.
+fn visible_from(state: &ZorkState, node: &ZorkNode) -> Vec<usize> {
+    let dirs = navigate_dirs(state, node);
+    let mut items: Vec<usize> = Vec::new();
+    let mut push = |id: usize| {
+        if id != node.id && !items.contains(&id) {
+            items.push(id);
+        }
+    };
+    for (_, target) in &dirs {
+        push(target.id);
+    }
+    if let Some(pid) = node.parent {
+        if let Some(p) = state.node(pid) {
+            for cid in &p.children {
+                push(*cid);
+            }
+        }
+    }
+    for cid in &node.children {
+        push(*cid);
+    }
+    items
+}
+
+/// `aim_notice` is the driver's standee-aimed-at-already list; see
+/// [`ZorkApp::sheet_aim_notice`].
+fn execute_command(state: &mut ZorkState, aim_notice: &mut Vec<usize>, line: &str) {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
         return;
@@ -533,19 +580,58 @@ fn execute_command(state: &mut ZorkState, line: &str) {
             }
         }
         "type" | "write" => {
-            if !matches!(state.node(state.current_id).map(|n| &n.kind), Some(ZorkKind::Entry { .. })) {
-                println!("You are not at an Entry. Navigate to an Entry first.");
+            // `type <n> [text]` targets a specific Entry; bare `type` uses the
+            // one you are standing on. Requiring a walk to the target first
+            // made the verb unusable for driving a form with two entries, which
+            // is the only reason a form has more than one (R6 in
+            // docs/ZORK_MISSING.md §5).
+            //
+            // A first word is read as a target only when it *resolves* to
+            // something. Without that, `type hello there` on a non-Entry
+            // answered `there is no "hello" here` — a nonsense complaint about
+            // what the reader plainly meant, and one that hid the real problem
+            // (you are not at an Entry) behind a remark about their text.
+            let at_entry = matches!(state.node(state.current_id).map(|n| &n.kind), Some(ZorkKind::Entry { .. }));
+            let is_address =
+                |w: &str| w.chars().all(|c| c.is_ascii_digit()) || matches!(w.to_ascii_lowercase().as_str(), "north" | "south" | "east" | "west" | "n" | "s" | "e" | "w");
+            let (target_id, rest) = match args.first() {
+                Some(first) if resolve_arg_to_id(state, first).is_some() => {
+                    (resolve_arg_to_id(state, first), args[1..].to_vec())
+                }
+                // Unresolvable, but we are at an Entry: the word is the text.
+                _ if at_entry => (Some(state.current_id), args.to_vec()),
+                // Unresolvable and not at an Entry. A bare number or a
+                // direction that names nothing is a genuine targeting mistake
+                // and is worth saying so about.
+                Some(first) if is_address(first) => {
+                    println!("There is no \"{}\" here.", first);
+                    return;
+                }
+                // Otherwise the whole line is the text, and the check below
+                // reports the actual problem.
+                _ => (Some(state.current_id), args.to_vec()),
+            };
+            let Some(id) = target_id else { return };
+            if !matches!(state.node(id).map(|n| &n.kind), Some(ZorkKind::Entry { .. })) {
+                println!("That is not an Entry.");
                 return;
             }
-            println!("(Enter text, press Enter when done)");
-            print!("> ");
-            io::stdout().flush().ok();
-            let mut input = String::new();
-            io::stdin().lock().read_line(&mut input).ok();
-            let text = input.trim().to_string();
-            state.set_entry_text(state.current_id, &text);
+            // The text is whatever followed the target on the line, so
+            // `type 3 hello` types "hello" without a second prompt and
+            // `type 3` still opens one for a longer value.
+            let text = if rest.is_empty() {
+                println!("(Enter text, press Enter when done)");
+                print!("> ");
+                io::stdout().flush().ok();
+                let mut input = String::new();
+                io::stdin().lock().read_line(&mut input).ok();
+                input.trim().to_string()
+            } else {
+                rest.join(" ")
+            };
+            state.set_entry_text(id, &text);
             println!("You inscribed \"{}\" into the Entry.", text);
-            state.click(state.current_id);
+            state.click(id);
         }
         "read" => {
             examine(state, state.current_id);
@@ -787,6 +873,208 @@ fn execute_command(state: &mut ZorkState, line: &str) {
                 println!("You can only lay out a Box.");
             }
         }
+        "sheet" => {
+            // The F9/F10 surface has no other way to be driven or inspected
+            // from here, so without this verb the chrome is reachable only
+            // from Rust — and a REPL that can only `look` at a spreadsheet is
+            // exactly the "model driver, not an interactive UI" limitation
+            // docs/ZORK_MISSING.md §7 records.
+            //
+            // A *subcommand* is read before the target is resolved, because
+            // `sheet cell 1 1` names a cell and not a widget: resolving `1` as
+            // the target first made every cell command fail with "there is
+            // nothing like that here", which is a bug that looks like a
+            // missing feature.
+            const SHEET_SUBS: &[&str] = &[
+                "show", "cursor", "edit", "stop-edit", "commit", "cell",
+            ];
+            let head: &str = args.first().copied().unwrap_or("show");
+            let (target, sub, rest): (Option<&str>, &str, &[&str]) = if SHEET_SUBS.contains(&head) {
+                (None, head, if args.is_empty() { &[] } else { &args[1..] })
+            } else {
+                (Some(head), args.get(1).copied().unwrap_or("show"), if args.len() > 2 { &args[2..] } else { &[] })
+            };
+            let id = match target {
+                Some(t) => match resolve_arg_to_id(state, t) {
+                    Some(id) => id,
+                    None => {
+                        println!("There is nothing like \"{}\" here.", t);
+                        return;
+                    }
+                },
+                // No target: use the spreadsheet you are standing on, or —
+                // failing that — the one the host built. A model that has
+                // exactly one spreadsheet is not ambiguous, and refusing
+                // because the player happened to be left standing on the
+                // Window made `sheet` unusable in a corro session, where the
+                // spreadsheet is a child of the window you start in. The note
+                // is printed once per standee, not once per command, so
+                // driving the grid does not scroll the explanation away.
+                None => {
+                    let here = state.current_id;
+                    if matches!(state.node(here).map(|n| &n.kind), Some(ZorkKind::Spreadsheet { .. })) {
+                        here
+                    } else {
+                        match state.nodes.iter().find(|n| matches!(n.kind, ZorkKind::Spreadsheet { .. })) {
+                            Some(n) => {
+                                if !aim_notice.contains(&here) {
+                                    aim_notice.push(here);
+                                    println!("(You are not standing on it; using spreadsheet #{}. Move there to aim at a different one.)", n.id);
+                                }
+                                n.id
+                            }
+                            None => {
+                                println!("There is no Spreadsheet in this model.");
+                                return;
+                            }
+                        }
+                    }
+                }
+            };
+            if !matches!(state.node(id).map(|n| &n.kind), Some(ZorkKind::Spreadsheet { .. })) {
+                println!("That is not a Spreadsheet.");
+                return;
+            }
+            match sub {
+                "show" => {
+                    if let Some(c) = state.sheet_chrome(id) {
+                        println!("Spreadsheet #{}: {}", id, state.sheet_border_title(id).unwrap_or_default());
+                        println!("  cursor: R{}C{}", c.cursor.0, c.cursor.1);
+                        println!("  gutter {} col(s), {} data col(s)", c.margin_cols, c.main_cols);
+                        println!("  {} header row(s), {} data row(s)", c.header_rows, c.main_rows);
+                        println!("  {} cell(s) set", state.node(id).map(|n| n.cells.len()).unwrap_or(0));
+                        if !c.column_layout.is_empty() {
+                            let cols: Vec<String> = c
+                                .column_layout
+                                .iter()
+                                .map(|(i, w, t)| format!("{}:{} ({})", i, w, t))
+                                .collect();
+                            println!("  columns: {}", cols.join(", "));
+                        }
+                        if !c.row_labels.is_empty() {
+                            let rows: Vec<String> = c.row_labels.iter().map(|(i, l)| format!("{}={}", i, l)).collect();
+                            println!("  row labels: {}", rows.join(", "));
+                        }
+                        if !c.tabs.is_empty() {
+                            let tabs: Vec<String> = c.tabs.iter().map(|t| format!("{}{}", if c.tabs.iter().position(|x| x == t) == Some(c.active_tab) { "*" } else { " " }, t)).collect();
+                            println!("  tabs: {}", tabs.join(" "));
+                        }
+                        if !c.menu_text.is_empty() {
+                            println!("  menu: {}", c.menu_text);
+                        }
+                        if !c.status_text.is_empty() {
+                            println!("  status: {}", c.status_text);
+                        }
+                        if !c.formula_address.is_empty() || !c.formula_entry.is_empty() {
+                            println!("  formula bar: {} {}", c.formula_address, c.formula_entry);
+                        }
+                        if !c.formula_bar_trailing.is_empty() {
+                            println!("  trailing: {}", c.formula_bar_trailing);
+                        }
+                        if c.editing {
+                            println!("  editing: \"{}\" (caret {})", c.edit_buf, c.edit_pos);
+                        }
+                    }
+                }
+                "cursor" => {
+                    let Some((r, c)) = parse_pair(&rest.join(" ")) else {
+                        println!("Usage: sheet cursor <row> <col>");
+                        return;
+                    };
+                    if r < 0 || c < 0 {
+                        println!("Rows and columns start at 0.");
+                        return;
+                    }
+                    state.sheet_set_cursor(id, r as u32, c as u32);
+                    let (r2, c2) = state.sheet_cursor(id).unwrap_or((0, 0));
+                    println!("Cursor at R{}C{}.", r2, c2);
+                }
+                "edit" => {
+                    let text = rest.join(" ");
+                    state.sheet_set_editing(id, true, &text, text.chars().count());
+                    println!("Editing {}", state.sheet_cursor(id).map(|(r, c)| format!("R{}C{}", r, c)).unwrap_or_default());
+                }
+                "stop-edit" => {
+                    state.sheet_set_editing(id, false, "", 0);
+                    println!("Stopped editing.");
+                }
+                "commit" => {
+                    match state.sheet_commit_edit(id) {
+                        Some((r, c, text)) => println!("Committed \"{}\" to R{}C{}.", text, r, c),
+                        None => println!("Nothing was being edited."),
+                    }
+                }
+                "cell" => {
+                    // `sheet cell <row> <col> <text>` writes; omitting the text
+                    // reads. A spreadsheet is a grid, so addressing a cell is
+                    // the most natural thing to do with one.
+                    if rest.len() < 2 {
+                        println!("Usage: sheet cell <row> <col> [text]");
+                        return;
+                    }
+                    let pair = parse_pair(&rest.join(" "));
+                    if rest.len() == 2 {
+                        let Some((r, c)) = pair else {
+                            println!("Usage: sheet cell <row> <col> [text]");
+                            return;
+                        };
+                        match state.sheet_get_cell(id, r as u32, c as u32) {
+                            Some(t) => println!("R{}C{} = \"{}\"", r, c, t),
+                            None => println!("R{}C{} is empty.", r, c),
+                        }
+                    } else {
+                        let Some((r, c)) = parse_pair(&rest[..2].join(" ")) else {
+                            println!("Usage: sheet cell <row> <col> <text>");
+                            return;
+                        };
+                        let text = rest[2..].join(" ");
+                        state.sheet_set_cell(id, r as u32, c as u32, &text, 0);
+                        println!("R{}C{} = \"{}\".", r, c, text);
+                    }
+                }
+                other => println!("Unknown sheet command \"{}\". Try 'sheet'.", other),
+            }
+        }
+        "timers" => {
+            // Timers fire on a *virtual* clock, so a REPL user has to be told
+            // how to move it — otherwise `timers` looks like a list of things
+            // that will never happen.
+            if state.timer_count() == 0 {
+                println!("No timers are pending.");
+            } else {
+                println!("{} timer(s) pending, clock at {}ms:", state.timer_count(), state.now_ms);
+                for t in &state.timers {
+                    let kind = if t.handler.is_some() { "repeating" } else { "once" };
+                    println!(
+                        "  due at {}ms (every {}ms, {})",
+                        t.due_at, t.interval_ms, kind
+                    );
+                }
+            }
+        }
+        "wait" => {
+            // Advance the virtual clock, firing whatever is due. The one verb
+            // that makes `timeout_add_once`/`_repeating` observable from here.
+            let ms: u64 = args.first().and_then(|a| a.parse().ok()).unwrap_or(100);
+            let fired = state.advance_timers(ms);
+            println!(
+                "{}ms later, {} timer(s) fired; clock at {}ms.",
+                ms, fired, state.now_ms
+            );
+        }
+        "dump" => {
+            // The REPL's view of `debug_dump_tree`: the same walk, written to
+            // a file, but over the REPL's *own* state. `adopt_singleton` moved
+            // the model out of the thread-local, so the facade's singleton
+            // entry point would dump an empty tree — and reporting "0 nodes"
+            // for a session that just built a hundred widgets is exactly the
+            // kind of wrong answer a diagnostic must not give.
+            let path: &str = args.first().copied().unwrap_or("zork_tree.txt");
+            match super::facade::debug_dump_tree_of(state, path) {
+                Ok(n) => println!("Wrote {} node(s) to \"{}\".", n, path),
+                Err(e) => println!("Could not write \"{}\": {}", path, e),
+            }
+        }
         "inventory" | "i" => {
             println!("Current path:");
             let mut path: Vec<String> = Vec::new();
@@ -825,7 +1113,9 @@ fn execute_command(state: &mut ZorkState, line: &str) {
             println!("  click / press [n]     - press a button or open menu (default: current)");
             println!("  select / choose <n>   - select a menu item from a MenuBar/Menu");
             println!("  examine / x [n]       - examine something in detail");
-            println!("  type / write          - enter text into an Entry (sub-prompt)");
+            println!("  type / write [n] [text] - type into an Entry (default: current)");
+            println!("                        with <n> a target and text, types it;");
+            println!("                        without text, opens a sub-prompt");
             println!("  light / lantern       - light the lantern (the grue fears it)");
             println!("  dark / douse          - douse the lantern, and meet the grue");
             println!("  grue                  - ask whether a grue is here");
@@ -837,6 +1127,15 @@ fn execute_command(state: &mut ZorkState, line: &str) {
             println!("  hide / show           - toggle visibility");
             println!("  focus                 - take keyboard focus");
             println!("  layout                - lay out a Box's children");
+            println!("  sheet [n]             - show a Spreadsheet's chrome (cursor, tabs, status)");
+            println!("  sheet cursor <r> <c>  - move the spreadsheet cursor");
+            println!("  sheet cell <r> <c> [text] - read or write a cell");
+            println!("  sheet edit <text>     - start editing the cursor cell");
+            println!("  sheet commit          - commit the in-progress edit");
+            println!("  sheet stop-edit       - abandon the in-progress edit");
+            println!("  timers                - list pending timers and the virtual clock");
+            println!("  wait [ms]             - advance the virtual clock, firing timers (default 100)");
+            println!("  dump [path]           - write the widget tree to a file (default zork_tree.txt)");
             println!("  inventory / i         - show your path");
             println!("  back                  - go back the way you came");
             println!("  quit / q / exit       - exit the game");
@@ -902,70 +1201,23 @@ fn resolve_number_target(state: &ZorkState, num: usize) -> Option<usize> {
         return Some(state.current_id);
     }
     let node = state.node(state.current_id)?;
-    let mut items: Vec<usize> = Vec::new();
-
-    let siblings: Vec<usize> = if let Some(pid) = node.parent {
-        state.node(pid).map(|p| p.children.clone()).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let children: Vec<usize> = node.children.clone();
-
-    for id in &siblings {
-        if *id == node.id {
-            continue;
-        }
-        items.push(*id);
-    }
-    for id in &children {
-        if !items.contains(id) {
-            items.push(*id);
-        }
-    }
-
-    items.get(num - 1).copied()
+    // `visible_from` is the *same* list `describe_room_lit` prints after "You
+    // see:". It used to be a second, differently-ordered computation (all
+    // siblings, then all children), which meant the number on screen was not
+    // the number `go <n>` accepted: the reader was shown `3. Entry` and
+    // `go 3` walked somewhere else. Deriving both from one function is the
+    // fix, and the numbered list is the one that has to be right — it is how
+    // every targetable verb names its argument.
+    visible_from(state, node).get(num - 1).copied()
 }
 
 fn navigate_find(state: &ZorkState, dir: &str) -> Option<usize> {
     let node = state.node(state.current_id)?;
-    let siblings: Vec<&ZorkNode> = if let Some(pid) = node.parent {
-        state.node(pid).map(|p| p.children.iter().filter_map(|cid| state.node(*cid)).collect()).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let children: Vec<&ZorkNode> = node.children.iter().filter_map(|cid| state.node(*cid)).collect();
-
-    let mut my_idx = None;
-    for (i, sib) in siblings.iter().enumerate() {
-        if sib.id == node.id {
-            my_idx = Some(i);
-            break;
-        }
-    }
-
-    match dir {
-        "north" | "n" => children.first().map(|n| n.id),
-        "south" | "s" => node.parent,
-        "east" | "e" => {
-            if let Some(idx) = my_idx {
-                siblings.get(idx + 1).map(|n| n.id)
-            } else {
-                None
-            }
-        }
-        "west" | "w" => {
-            if let Some(idx) = my_idx {
-                if idx > 0 {
-                    siblings.get(idx - 1).map(|n| n.id)
-                } else {
-                    node.parent
-                }
-            } else {
-                node.parent
-            }
-        }
-        _ => None,
-    }
+    let dirs = navigate_dirs(state, node);
+    dirs
+        .iter()
+        .find(|(d, _)| *d == dir || (*d == "west" && dir == "w") || (*d == "north" && dir == "n") || (*d == "south" && dir == "s") || (*d == "east" && dir == "e"))
+        .map(|(_, t)| t.id)
 }
 
 fn navigate_to(state: &mut ZorkState, dir: &str) {

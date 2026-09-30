@@ -2110,7 +2110,7 @@ pub fn debug_dump_native_tree(root: *mut c_void, path: &str) {
     };
     if let Some(id) = root_id {
         if crate::backends::zork::node_exists(id) {
-            crate::backends::zork::debug_dump_tree_from(id, path);
+            let _ = crate::backends::zork::debug_dump_tree_from(id, path);
             return;
         }
     }

@@ -840,19 +840,35 @@ pub fn node_exists(id: usize) -> bool {
 /// Returns the number of nodes written. An unwritable path is reported as 0
 /// rather than panicking, so a diagnostic that cannot run does not take the
 /// process with it.
-pub fn debug_dump_tree(path: &str) -> usize {
+pub fn debug_dump_tree(path: &str) -> std::io::Result<usize> {
     with_state(|s| dump_tree(s, None, path))
 }
 
 /// [`debug_dump_tree`] rooted at one node instead of at the tree's roots.
 /// Returns 0 when `id` is not a node.
-pub fn debug_dump_tree_from(id: usize, path: &str) -> usize {
+pub fn debug_dump_tree_from(id: usize, path: &str) -> std::io::Result<usize> {
     with_state(|s| dump_tree(s, Some(id), path))
 }
 
-/// The shared walk behind both entry points. `from` of `None` means "start at
+/// [`debug_dump_tree`] over a state the caller owns.
+///
+/// Needed because the REPL holds its `ZorkState` directly:
+/// `ZorkApp::adopt_singleton` *moves* the singleton's contents into the REPL and
+/// leaves an empty model behind, so the `with_state` entry points above would
+/// dump nothing. Going through the REPL's own state is what makes `dump` show
+/// the widgets the host actually built.
+pub fn debug_dump_tree_of(state: &ZorkState, path: &str) -> std::io::Result<usize> {
+    dump_tree(state, None, path)
+}
+
+/// The shared walk behind every entry point. `from` of `None` means "start at
 /// every parentless node", `Some(id)` means "start at that node".
-fn dump_tree(s: &ZorkState, from: Option<usize>, path: &str) -> usize {
+///
+/// Returns `Err` for an unwritable path — the caller should be able to tell
+/// "could not write" from "wrote an empty file", because a headless backend
+/// hitting a read-only or non-existent directory is a plausible thing to do
+/// and reporting it as "0 nodes" would hide it.
+fn dump_tree(s: &ZorkState, from: Option<usize>, path: &str) -> std::io::Result<usize> {
     use std::fmt::Write as _;
     let mut out = String::new();
     let roots: Vec<usize> = match from {
@@ -886,9 +902,12 @@ fn dump_tree(s: &ZorkState, from: Option<usize>, path: &str) -> usize {
                 n.props.height.unwrap_or(0),
             );
             let vis = if n.props.visible { "visible" } else { "hidden" };
+            // The label is quoted and always present, even when empty. Leaving
+            // it out when a widget has no text ran `#2Book1` together — a dump
+            // line you cannot split by eye is a dump you cannot read.
             let _ = writeln!(
                 out,
-                "{:indent$}{} #{}{} {} {} [{} child(ren), {} callback(s)]",
+                "{:indent$}{} #{} \"{}\" {} {} [{} child(ren), {} callback(s)]",
                 "",
                 n.kind.name(),
                 n.id,
@@ -906,10 +925,8 @@ fn dump_tree(s: &ZorkState, from: Option<usize>, path: &str) -> usize {
             }
         }
     }
-    if std::fs::write(path, out).is_err() {
-        return 0;
-    }
-    written
+    std::fs::write(path, out)?;
+    Ok(written)
 }
 
 /// Bump the queued-redraw counter on `id` **and every descendant**.
