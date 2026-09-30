@@ -809,14 +809,67 @@ mod sheet_chrome {
             let ss = za::create_spreadsheet().unwrap();
             ss.set_grid_config(1, 4);
             ss.set_row_counts(1, 3);
-            // 1 gutter + 4 data columns = 5 addressable; row 1 header + 3 data.
+            // Cells are 1-based: 1 gutter + 4 data columns = 5 addressable
+            // columns, and 1 header row + 3 data rows = 4 addressable rows.
+            // The cursor shares that space, so the last cell is (4, 5).
             ss.set_cursor(99, 99);
-            assert_eq!(ss.cursor_position(), Some((3, 4)), "must not exceed the last cell");
+            assert_eq!(ss.cursor_position(), Some((4, 5)), "must not exceed the last cell");
             // With no geometry configured there is nothing to clamp to, so the
-            // value is kept rather than collapsed to the origin.
+            // value is kept rather than collapsed.
             let bare = za::create_spreadsheet().unwrap();
             bare.set_cursor(7, 9);
             assert_eq!(bare.cursor_position(), Some((7, 9)));
+            // But 0 is not a cell in this space, so it is floored rather than
+            // accepted: a caller passing the old 0-based convention lands on
+            // the first header cell instead of outside the grid.
+            let fresh = za::create_spreadsheet().unwrap();
+            fresh.set_cursor(0, 0);
+            assert_eq!(fresh.cursor_position(), Some((1, 1)));
+        });
+    }
+
+    /// The cursor and the cells share one coordinate space.
+    ///
+    /// This is the invariant that lets shared render code address a cell and
+    /// then put the cursor on it, which is exactly what
+    /// `src/gui/pnc_backend.rs` does on every frame:
+    ///
+    /// ```ignore
+    /// spreadsheet.set_cell(cursor_display_ri, display_cursor_col, text);
+    /// spreadsheet.set_cursor(cursor_display_ri, display_cursor_col);
+    /// ```
+    ///
+    /// When the cursor was 0-based and the cells 1-based, those two calls
+    /// landed on different cells — off by one in both axes — and the test
+    /// suite did not catch it because nothing drove a cursor against a cell it
+    /// had also written. Asserting the round trip is what catches it: put the
+    /// cursor on a cell, read that cell back, and it must be the one the
+    /// cursor names.
+    #[test]
+    fn the_cursor_and_the_cells_share_one_coordinate_space() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            ss.set_grid_config(1, 3);
+            ss.set_row_counts(1, 2);
+            for (row, col, text) in [(1u32, 1u32, "hdr"), (2, 2, "b2"), (3, 3, "c3")] {
+                ss.set_cell(row, col, text);
+            }
+            // Walk the cursor over every written cell and read back through
+            // the same coordinates the cursor reported.
+            for (row, col, want) in [(1u32, 1u32, "hdr"), (2, 2, "b2"), (3, 3, "c3")] {
+                ss.set_cursor(row, col);
+                assert_eq!(
+                    ss.cursor_position(),
+                    Some((row, col)),
+                    "the cursor must report the position it was given"
+                );
+                assert_eq!(
+                    ss.get_cell(row, col).as_deref(),
+                    Some(want),
+                    "R{row}C{col} holds {want:?} under the cell's own addressing"
+                );
+            }
         });
     }
 
@@ -921,7 +974,7 @@ mod sheet_input {
                 ss.add_cursor_move_callback(Box::new(move |r, c| s.set((r, c))));
             }
             ss.set_cursor(50, 50);
-            assert_eq!(seen.get(), (2, 2), "the handler must see where the cursor actually went");
+            assert_eq!(seen.get(), (3, 3), "the handler must see where the cursor actually went");
         });
     }
 
@@ -935,10 +988,10 @@ mod sheet_input {
                 let s = seen.clone();
                 ss.add_commit_edit_callback(Box::new(move |r, c, t| s.borrow_mut().push((r, c, t))));
             }
-            ss.set_cursor(0, 0);
+            ss.set_cursor(1, 1);
             ss.set_editing(true, "hello", 5);
             ss.commit_formula_bar();
-            assert_eq!(*seen.borrow(), vec![(0, 0, "hello".to_string())]);
+            assert_eq!(*seen.borrow(), vec![(1, 1, "hello".to_string())]);
             // A second commit fires nothing: the first one ended the edit.
             ss.commit_formula_bar();
             assert_eq!(seen.borrow().len(), 1);

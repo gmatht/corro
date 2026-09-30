@@ -153,3 +153,10 @@ required-features = ["zork"]
 [[example]]
 name = "zork-demo"
 required-features = ["zork"]
+
+# Editing demo for the zork spreadsheet surface. Gated on `zork` like the
+# other zork examples: without the feature the adapter it drives does not
+# exist, and `cargo build --examples` under any other set would fail on it.
+[[example]]
+name = "zork-edit"
+required-features = ["zork"]

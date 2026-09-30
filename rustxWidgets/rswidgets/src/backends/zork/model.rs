@@ -225,11 +225,25 @@ pub struct SheetCell {
 /// Every field defaults to the "nothing configured" value, so a spreadsheet
 /// created and immediately snapshotted is identical to one that has never been
 /// touched — the same discipline [`ZorkProps`] follows.
-#[derive(Clone, Debug, Default, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct SheetChrome {
-    /// The cursor cell, 0-based `(row, col)`. Defaults to the origin.
+    /// The cursor cell, `(row, col)`.
+    ///
+    /// **The same coordinate space as the cells**, which are addressed 1-based
+    /// (see [`SheetCell`]). corro relies on that: `src/gui/pnc_backend.rs` calls
+    /// `spreadsheet.set_cell(cursor_display_ri, col, ..)` and
+    /// `spreadsheet.set_cursor(cursor_display_ri, col)` with the *same* row, and
+    /// on pancurses they are the same index into the same grid.
+    ///
+    /// Making the cursor 0-based while the cells stayed 1-based meant
+    /// `set_cursor(1, 1)` landed on a different cell than `get_cell(1, 1)`
+    /// returned — off by one in both axes, and invisible until something
+    /// actually drove the cursor against cells. The default is therefore
+    /// `(1, 1)`, the first header cell, which is also where a cursor belongs
+    /// when a sheet has just been built.
     pub cursor: (u32, u32),
-    /// The drag anchor, 0-based. `None` until a selection starts.
+    /// The drag anchor, in the same 1-based space as [`Self::cursor`]. `None`
+    /// until a selection starts.
     pub anchor: Option<(u32, u32)>,
     /// Whether the cursor cell is being edited.
     pub editing: bool,
@@ -259,6 +273,50 @@ pub struct SheetChrome {
     /// The formula bar's address cell and entry text, set by `set_formula_bar`.
     pub formula_address: String,
     pub formula_entry: String,
+}
+
+impl SheetChrome {
+    /// Every field at its zero value, including a `(0, 0)` cursor.
+    ///
+    /// Only [`Default`] should be called by ordinary code, and it moves the
+    /// cursor to `(1, 1)`. This exists so [`Default`] can spell out the one
+    /// field that differs rather than deriving a cursor into a cell that does
+    /// not exist.
+    fn empty() -> Self {
+        SheetChrome {
+            cursor: (0, 0),
+            anchor: None,
+            editing: false,
+            edit_buf: String::new(),
+            edit_pos: 0,
+            margin_cols: 0,
+            main_cols: 0,
+            header_rows: 0,
+            main_rows: 0,
+            column_layout: Vec::new(),
+            row_labels: Vec::new(),
+            tabs: Vec::new(),
+            active_tab: 0,
+            menu_text: String::new(),
+            status_text: String::new(),
+            formula_bar_trailing: String::new(),
+            formula_address: String::new(),
+            formula_entry: String::new(),
+        }
+    }
+}
+
+/// The default is `(1, 1)`: the first header cell, in the same 1-based space
+/// as the cells. `Default` cannot derive, because `0, 0` is not a cell in that
+/// space and a cursor pointing outside the grid is a state the widget cannot be
+/// in.
+impl Default for SheetChrome {
+    fn default() -> Self {
+        SheetChrome {
+            cursor: (1, 1),
+            ..SheetChrome::empty()
+        }
+    }
 }
 
 /// The four input events a `Spreadsheet` accepts, as the other backends
@@ -2302,14 +2360,18 @@ impl ZorkState {
     /// rather than collapsed to the origin, so a spreadsheet driven before its
     /// geometry is configured still remembers where it was put.
     pub fn sheet_set_cursor(&mut self, id: usize, row: u32, col: u32) {
-        let (mut r, mut c) = (row, col);
+        // Cells are addressed 1-based, so a cursor of `0` would be a position
+        // no cell occupies. Floor at 1 in both axes; without this a caller
+        // passing a 0-based row — the obvious mistake, and the convention the
+        // cursor used to have — would silently park the cursor outside the grid.
+        let (mut r, mut c) = (row.max(1), col.max(1));
         if let Some(n) = self.node_mut(id) {
             if n.chrome.main_rows > 0 && n.chrome.header_rows > 0 {
-                let last = n.chrome.main_rows + n.chrome.header_rows - 1;
+                let last = n.chrome.main_rows + n.chrome.header_rows;
                 r = r.min(last);
             }
             if n.chrome.main_cols > 0 && n.chrome.margin_cols > 0 {
-                let last = n.chrome.main_cols + n.chrome.margin_cols - 1;
+                let last = n.chrome.main_cols + n.chrome.margin_cols;
                 c = c.min(last);
             }
             n.chrome.cursor = (r, c);
