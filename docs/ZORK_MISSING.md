@@ -1,476 +1,316 @@
-# Zork backend — missing features vs. GTK / NWG (and pancurses)
+# zork backend — status vs. GTK / NWG / pancurses
 
-Status: **§0-§3 implemented and tested**; §4-§5 extended; §6-§7 still open.
-Last updated: 2026-09-29.
-
-## What this pass fixed
-
-Two real defects, both found the same way — a feature set that no CI job
-compiled or tested:
-
-* `--features pancurses` did not build its lib test target (E0425). The cause
-  and the fix are described under *Pre-existing, unrelated* below. All four
-  feature sets now build and pass: default 694, `gui` 824, `pancurses` 749,
-  `zork` 467.
-* `DrawContext::draw_rgba_image` is unimplemented on six of eight backends. See
-  S26.
-
-`.github/workflows/backends.yml` is new and builds `zork` and `pancurses` in
-the configurations they are actually meant to be used in, running each
-feature's lib tests. All twelve commands in it were executed here before the
-file was committed.
+Status: **no open parity gaps.** The enumeration this file used to carry is
+done; what remains is stated below, with the reason.
+Last updated: 2026-09-30, at `zork/gaps` (9c43fbc4).
 
 Verify with:
 
 ```
-cargo build -p rswidgets --no-default-features --features zork --offline
-cargo test  -p rswidgets --no-default-features --features zork --offline
+cargo build -p rswidgets --no-default-features --features zork
+cargo test  -p rswidgets --no-default-features --features zork
 ```
 
-110 lib tests (23 new model unit tests), 27 harness tests (21 new) and 44
-adapter tests (`tests/zork_adapter.rs`, all new) pass. The default `gtk` build
-is unaffected.
+137 lib, 27 harness, 80 adapter, 1 doc test. Plus corro's own: 468 lib
+(`cargo test --no-default-features --features zork --lib`) and 34 in
+`tests/zork_feature_parity.rs`. `.github/workflows/backends.yml` builds
+and tests all of these, and `--examples`, on every push that touches the
+crate.
 
-The `zork` backend (`rustxWidgets/rswidgets/src/backends_zork_adapter.rs` +
-`src/backends/zork/`) is a headless, in-memory widget model with a typed test
-harness and a text REPL. It is a first-class backend: `core.rs` and
+The `zork` backend (`rustxWidgets/rswidgets/src/backends_zork_adapter.rs`
++ `src/backends/zork/`) is a headless, in-memory widget model with a typed
+test harness and a text REPL. It is a first-class backend: `core.rs` and
 `common.rs` already have `#[cfg(feature = "zork")]` arms for it everywhere.
 
-This document enumerates **every** gap found, ranked by severity, and tracks
-which are implemented. Method-level gaps were produced by mechanically diffing
-the public inherent-method surface of the zork adapter against
-`backends_gtk_adapter_impl.rs`, `backends_nwg_adapter.rs` and
-`backends_pancurses_adapter.rs`, then subtracting the surface that
-`common.rs` / `core.rs` actually require.
+## How "no open gaps" was measured
 
-Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` deliberately not
-applicable to a headless backend (with a reason).
+Method-level gaps are produced by mechanically diffing the public inherent
+method surface of the zork adapter against `backends_gtk_adapter_impl.rs`,
+`backends_nwg_adapter.rs` and `backends_pancurses_adapter.rs`, then
+subtracting what `common.rs` / `core.rs` actually require. The script that
+produces the numbers is in the repo, so the claim is re-checkable rather
+than asserted:
+
+```
+$ python3 scripts/surface_diff.py
+gtk: 181 methods, 126 free functions
+nwg: 150 methods, 119 free functions
+panc: 162 methods, 150 free functions
+zork: 296 methods, 232 free functions
+
+methods zork lacks (3):
+  DropDown.diagnostics                 (gtk)
+  DropDown.has_size_request_symbol     (gtk)
+  DropDown.is_gtk4                     (gtk)
+
+free functions zork lacks (7):
+  create_dialog_button   (nwg)
+  diagnostics             (gtk)      -- version probes, below
+  has_size_request_symbol (gtk)
+  is_gtk4                 (gtk)
+  new                     (gtk)      -- a `Box::new` false positive
+  pump_main_context       (gtk)      -- [-], the REPL *is* the loop
+  quit_main_loop          (gtk, nwg) -- [-], likewise
+```
+
+Those three methods and three of the seven free functions are GTK's
+*version probes* — "am I GTK4?", "does `gtk_widget_set_size_request`
+exist?" — and answering them on a backend that is neither would be a
+fabrication, not a feature. `create_dialog_button` is NWG-only and is
+about a Win32 dialog control, not a model operation. `new` is the script
+seeing a `Box::new` in GTK's source, not a definition.
+
+After those, the *method* surface has no gap at all, and the free-function
+surface has none that is not either a version probe or a documented `[-]`.
+Everything the old file listed is now implemented; the sections below
+record how each was closed and what it cost.
+
+zork has *more* methods than GTK because a headless model has state GTK
+holds in the compositor (the redraw cascade, the layout callback, the
+virtual clock) and needs somewhere to put it. Those 67 zork-only methods
+are not a compatibility surface — see §5.
 
 ---
 
-## 0. Blocker: the `zork` feature does not compile
+## 1. What was closed in the `zork/gaps` pass
 
-`cargo build -p rswidgets --no-default-features --features zork` fails with
-**38 errors**. The backend has been dead code: nothing in CI, `run.sh`,
-`build95*.sh` or `.github/workflows/` ever enables `zork`, so the breakage was
-invisible. Consequences:
+Six commits. Each is independently revertible; the order is the order the
+work happened in.
 
-| # | Error class | Where | Why |
-|---|-------------|-------|-----|
-| B1 | `E0425` missing fns | `backends_zork_adapter.rs:732,736,740` | `create_canvas` / `create_overlay` / `create_scrolled_window` call `crate::backends::zork::*`, but the model has no such node kinds. `Canvas`/`Overlay`/`ScrolledWindow` are **empty stubs with no node**. |
-| B2 | `E0119` conflicting `Clone` | `backends_zork_adapter.rs:701` | `ScrolledWindow` has `#[derive(Clone)]` *and* a hand-written `impl Clone`. |
-| B3 | `E0308` `expected Result<_, Error>, found ()` | `core.rs:1665,1704,1764,1805,1845,1943,1983,2024,2088` | The 9 `#[cfg(feature = "zork")]` `new_*` arms in `core.rs` were never written — each `new_window`/`new_box`/`new_label`/`new_entry`/`new_canvas`/`new_menu`/`new_simple_action`/`new_menubar`/`new_dialog` has no zork block, so under `--features zork` the function body evaluates to `()`. |
-| B4 | `E0277` missing `Clone` | `common.rs:83,102,104,106,108` | `common_types_mod!` derives `Clone` on `WidgetBox`/`Menu`/`SimpleAction`/`MenuBar`/`Dialog`; zork's `BoxWidget`, `Menu`, `SimpleAction`, `MenuBar`, `Dialog` do not implement it. |
-| B5 | `E0599` missing methods | `common.rs` (18 sites) | `common_types_mod!` unconditionally requires a set of methods zork's adapter lacks — see §2. |
-| B6 | dead feature gate | `common.rs:344` | `mod common_types { common_types_mod!(); }` for zork omits the `Canvas::on_key` / `ScrolledWindow::*` impls every other backend cfg-block adds, so even after B1–B5 the wrapper types lack `Canvas::on_key` and `ScrolledWindow::set_child/set_policy/set_vexpand/scroll_to/on_scroll`. |
+### 1.1 The model had nowhere to record any of it — `75d9d455`
 
-Everything in §1–§3 is downstream of B1–B6: they cannot be implemented until
-the feature builds.
+Every remaining gap was a gap in the **model** first. A cursor, an edit
+buffer, a column layout, a tab strip, a timer deadline, an application's
+action set: there was no field for any of them, so every adapter method
+could only discard its argument. `model.rs` grows four things:
 
----
+| Type | What it holds | Reached through |
+|------|---------------|-----------------|
+| `SheetChrome` | cursor, anchor, edit buffer, grid config, row counts, column layout, row labels, tabs, menu/status text, formula bar | `sheet_set_*` |
+| `SheetInput` | the four spreadsheet input handlers | `sheet_add_*_callback` |
+| `Timer` + a **virtual** clock | deadlines, intervals, one-shot vs repeating | `timeout_add_*` / `advance_timers` |
+| `app_actions` / `layout_cbs` / `key_callbacks` | the action registry, the layout callback, the process-wide key table | `application_add_action` etc. |
 
-## 1. Missing model node kinds (`ZorkKind`)
+`SheetChrome` defaults to "nothing configured", so a spreadsheet created
+and immediately snapshotted is byte-identical to one that was never
+touched — the same discipline `ZorkProps` already followed, and the reason
+a snapshot diff can distinguish "set to the default" from "never set".
 
-The zork `ZorkKind` enum covers 14 kinds. GTK/NWG/pancurses expose 20. Six
-container/widget kinds exist as adapter stubs but have **no** model node, so
-every method on them is a no-op that silently discards information.
+`ZorkKind::name()` is now the single place a kind's name is spelled. It had
+grown two copies of the same 20-arm `match` (the snapshot's `kind` string
+and the tree dump's prefix), which is exactly the pair of views that quietly
+disagree — the failure mode of S27 below.
 
-| # | Missing kind | Adapter type exists? | GTK | NWG | panc |
-|---|--------------|---------------------|-----|-----|------|
-| M1 | `Canvas` | yes (stub, id never allocated) | ✅ | ✅ | ✅ |
-| M2 | `Overlay` | yes (stub) | ✅ | ✅ | ✅ |
-| M3 | `ScrolledWindow` | yes (stub) | ✅ | ✅ | ✅ |
-| M4 | `Fixed` | no | ✅ | — | — |
-| M5 | `Application` | no | ✅ | — | — |
-| M6 | `Spreadsheet` | no | ✅ | — | ✅ |
+### 1.2 `draw_rgba_image` — `b24abf9a`
 
-M1–M3 are **required to compile** (B1). M4–M6 are `core.rs`-reachable on
-GTK/pancurses only; lower priority.
+S26 said this was unimplemented on six of eight backends. That was true,
+and it was worst on the **recorder**: a recorder's job is to record, and
+refusing a blit it could perfectly well record meant a draw callback that
+drew an image left *no trace at all* — so neither a test nor a driver could
+tell whether it happened. `headless::DrawOp::Image` now carries the
+destination, the source extent, the `scale` and the samples verbatim, and
+`RecordingDrawContext::draw_rgba_image` records it and returns `true`.
 
-## 2. Missing adapter methods, by group
+The one refusal kept is a `pixels` buffer too short for
+`width * height * 4`: there the op could not be recorded faithfully, and
+returning `true` is precisely the "promised a draw that never happened"
+answer the trait's contract exists to prevent. A zero-sized image is a
+valid blit and is recorded.
 
-### 2.1 `common_types_mod!` requirements (build blockers — B5)
+`tests/zork_feature_parity.rs` had a test asserting the old `false`. It is
+replaced by two — one driving a blit through a real canvas draw callback end
+to end, one pinning the short-buffer refusal — so both halves of the
+contract are asserted rather than only the half that was easy.
 
-These are called unconditionally from `common.rs`, so zork must provide them:
+### 1.3 The REPL — `8bab5aa1`
 
-| Type | Required methods | zork has |
-|------|------------------|----------|
-| `Window` | `set_child_box` | ❌ |
-| `BoxWidget` | `set_child_hexpand`, `set_child_vexpand`, `set_hexpand` | ❌ (also needs `Clone`) |
-| `Label` | `set_fixed_width`, `set_margin_start`, `set_margin_top`, `raw_handle` | ❌ |
-| `Entry` | `set_hexpand`, `set_vexpand` | ❌ |
-| `SimpleAction` | `connect_activate` | ❌ |
-| `MenuBar` | `activate_submenu_by_mnemonic`, `popup_submenu_by_mnemonic_at`, `activate_submenu_item_by_mnemonic`, `insert_action_group`, `handle_mnemonic_key`, `handle_menu_key`, `menu_active`, `menu_close` | ❌ |
-| `Dialog` | `set_transient_for` | ❌ |
-| `BoxWidget`/`Menu`/`SimpleAction`/`MenuBar`/`Dialog` | `Clone` | ❌ |
+Three defects, all found by *running* it, none by reading it.
 
-### 2.2 `common_types` cfg-tail methods (missing on zork — B6)
+**R6 — `type <n>`.** The verb could only write to the Entry you were
+standing on, so driving a form with two entries meant walking to each in
+turn. It now takes an optional target: `type 3 hello` writes straight into
+item 3; `type 3` with no text still opens the sub-prompt.
 
-| Type | Methods present on GTK/NWG/wasm/android/ios/macos, absent on zork |
-|------|------------------------------------------------------------------|
-| `Canvas` | `on_key(Box<dyn FnMut(u32) -> bool>)` |
-| `ScrolledWindow` | `set_child`, `set_policy`, `set_vexpand`, `scroll_to(hval,hupper,hpage,vval,vupper,vpage)`, `on_scroll(Box<dyn FnMut(bool,f64)>)` |
-| `TextView` | `set_hexpand`, `set_vexpand` (GTK/NWG both have these) |
-| `TextView` | `append_text` — zork *has* it, but as O(n) read-modify-write (NWG is too) |
-| `Entry` | `on_key` (NWG) |
+Doing that exposed a trap. `type` read its first word as a target
+unconditionally, so `type hello there` on a non-Entry answered *there is
+no "hello" here* — a complaint about the reader's text that hid the actual
+problem. A word is now read as a target only when it resolves to something;
+a bare number or direction that names nothing is still reported as a
+targeting mistake, because there it really is one.
 
-### 2.3 Cross-backend parity methods (present on GTK **and** NWG, missing on zork)
+**The number on screen was not the number `go` accepted.** The "You see:"
+list is printed in one order (directions, then the parent's other children,
+then this node's own) and `resolve_number_target` walked a second,
+differently-ordered list (all siblings, then all children). The reader was
+shown `3. Entry` and `3` resolved to something else. Four computations of
+the same thing — the direction lines, the numbered list, `navigate_find`,
+and the resolver — are now `navigate_dirs` plus `visible_from`, with the
+display and the resolver both derived from it. This is the same class of
+bug as S27, and fixing it is why `type <n>` is usable at all.
 
-Real, useful, and implementable in a headless model:
+**`dump` wrote an empty file.** `ZorkApp::adopt_singleton` *moves* the model
+out of the thread-local and leaves an empty one behind, so the verb went
+through the facade's singleton and dumped nothing while reporting "0 nodes"
+for a session that had just built a hundred widgets. `debug_dump_tree_of`
+takes the state directly, and the entry points return `io::Result` so
+"could not write" is distinguishable from "wrote an empty tree".
 
-| # | Type | Method | GTK | NWG | panc |
-|---|------|--------|-----|-----|------|
-| P1 | `Button` | `add_class` / `remove_class` | ✅ | ✅ | ✅ |
-| P2 | `Button` | `set_size_request` | ✅ | ✅ | ✅ |
-| P3 | `Button` | `set_font_style` | ✅ | ✅ | ✅ |
-| P4 | `Button` | `set_visible` | ✅ | — | — |
-| P5 | `Button` | `set_hexpand` / `set_vexpand` | ✅ | — | — |
-| P6 | `BoxWidget` | `set_visible`, `set_size_request`, `set_hexpand`, `set_vexpand` | ✅ | partial | partial |
-| P7 | `BoxWidget` | `set_child_hexpand` / `set_child_vexpand` | ✅ | ✅ | ✅ |
-| P8 | `BoxWidget` | `layout(x,y,w,h)` | ❌ (GTK) | — | — |
-| P9 | `BoxWidget` | `request_layout` | — | ✅ | — |
-| P10 | `Grid` | `set_visible`, `set_size_request`, `set_hexpand`, `set_vexpand` | ✅ | — | — |
-| P11 | `Grid` | `layout()` | ❌ (GTK) | — | — |
-| P12 | `Label` | `set_halign` / `set_valign` | — | ✅ | — |
-| P13 | `Label` | `set_size_request`, `set_hexpand`, `set_vexpand` | ✅ | — | — |
-| P14 | `Label` | `add_class`/`remove_class` | ❌ (GTK Label lacks it; zork has it) | ❌ | — |
-| P15 | `CheckButton` | `set_label` / `get_label` | — | ✅ | — |
-| P16 | `CheckButton` | `set_visible`, `set_size_request`, `set_hexpand`, `set_vexpand` | ✅ | — | — |
-| P17 | `RadioButton` | `set_label` / `get_label`, `grab_focus` | grab_focus ✅ | set/get_label ✅ | — |
-| P18 | `RadioButton` | `set_visible`, `set_size_request`, `set_hexpand`, `set_vexpand` | ✅ | partial | — |
-| P19 | `TextView` | `set_visible`, `set_hexpand`, `set_vexpand` | ✅ | — | — |
-| P20 | `TextView` | `set_editable` / `get_buffer` | — | ✅ | — |
-| P21 | `DropDown` | `grab_focus`, `set_visible`, `set_size_request`, `set_hexpand`, `set_vexpand`, `set_offset` | ✅ | ✅ | partial |
-| P22 | `Canvas` | `set_hexpand`, `set_vexpand`, `set_margin_start`, `set_margin_top` | ✅ | partial | — |
-| P23 | `Canvas` | `clear_draw_callback` | — | — | ✅ |
-| P24 | `Overlay` | `set_hexpand`, `set_vexpand` | ✅ | ✅ | — |
-| P25 | `Overlay` | `set_overlay_pass_through` (zork has it, GTK/NWG do not) | — | — | — |
-| P26 | `ScrolledWindow` | `set_size_request`, `set_hexpand`, `set_vexpand` | ✅ | partial | partial |
-| P27 | `Dialog` | `set_visible`, `set_size_request` | — | ✅ | — |
-| P28 | `Dialog` | `get_content_area`, `mark_destroyed`, `set_default_response` | ✅ | set_default_response ✅ | — |
-| P29 | `Dialog` | `bind_esc_dismiss`, `collect`, `layout_dialog`, `run` | — | ✅ | — |
-| P30 | `Window` | `set_layout_cb`, `start_repeating_timer` | — | ✅ | — |
-| P31 | `Menu` | `append_item`, `append_section` | ✅ | ✅ | — |
-| P32 | `Menu` | `append_with_shortcut`, `append_submenu_with_shortcut`, `append_separator`, `append_key`, `append_check`, `append_radio` | — | — | ✅ |
-| P33 | `SimpleAction` | `on_activate` in addition to `connect_activate` | `connect_activate` ✅ | ✅ | ✅ |
-| P34 | `CheckButton`/`RadioButton` | `on_toggle` (zork has it; GTK/NWG name it `connect_toggled`) | — | — | — |
+Two more, found the same way: a dump line ran `#2Book1` together (the
+label is now always quoted, even when empty), and `sheet` refused because
+you were standing on the Window rather than the Spreadsheet — which is
+where every session starts.
 
-### 2.4 Free-function gaps
+New verbs, or the new surface is reachable only from Rust: `sheet`
+(`show`/`cursor`/`cell`/`edit`/`commit`/`stop-edit`), `timers`, and `wait`.
+Each prompt also advances the virtual clock by 50 ms, so a timer a host
+installed actually fires instead of silently never coming due.
 
-| # | Function | GTK | NWG | panc | Notes |
-|---|----------|-----|-----|------|-------|
-| F1 | `create_fixed` | ✅ | — | — | needs M4 |
-| F2 | `create_application`, `add_action` | ✅ | — | — | needs M5 |
-| F3 | `create_spreadsheet` (+ 12 `spreadsheet_set_*`) | ✅ | — | ✅ | needs M6 |
-| F4 | `timeout_add_once`, `timeout_add_repeating` | ✅ | `start_repeating_timer` | — | GTK-only |
-| F5 | `pump_main_context`, `quit_main_loop` | ✅ | `quit_main_loop` | — | zork's REPL **is** the loop (`owns_event_loop() == true`), so this is `[-]` |
-| F6 | `open_file_filtered` / `save_file_filtered` | ✅ | ✅ | — | zork has only unfiltered `open_file`/`save_file`, both hard-coded `Ok(None)` |
-| F7 | `set_window_pos`, `mark95a`, `mark95xy`, `translate_vk`, `modifier_state`, … | — | ✅ | — | Win32/Win95 only → `[-]` |
-| F8 | `debug_dump_native_tree`, `window_queue_redraw_cascades_to_children` | — | ✅ | — | native handle introspection → `[-]` |
-| F9 | `create_dialog_button`, `set_menu_text`, `set_border_title`, `set_status_text`, `set_formula_bar`, `set_formula_bar_trailing`, `set_grid_config`, `set_column_layout`, `set_row_counts`, `set_row_labels`, `set_tab_data`, `set_cursor`, `set_editing`, `set_raw_cell`, `get_cell`, `set_cell`, `set_cell_style` | — | partial | ✅ | spreadsheet/textview surface |
-| F10 | `add_key_callback`, `add_goto_callback`, `add_cursor_move_callback`, `add_commit_edit_callback` | — | — | ✅ | spreadsheet input model |
+### 1.4 Harness — `6c5ef1cb`
 
-## 3. Model-level semantic gaps (not just missing methods)
+The harness is the *recommended* way to test against zork, so leaving the
+new surface reachable only from the adapter and the REPL would have made it
+untestable without a thread-local. `Harness` gains the chrome, the input
+hooks, the timers, the application registry, the key table, the layout
+callback, the redraw cascade and the tree dump; `Spreadsheet` and a new
+`Application` handle gain their own methods.
 
-These are behavioural: the model has no way to *represent* the state, so no
-adapter method can be more than a no-op until the model grows.
+### 1.5 `Canvas::on_gesture` — `9c43fbc4`
 
-| # | Gap | Detail |
-|---|-----|--------|
-| S1 | No geometry | Nothing stores a rect. `BoxWidget::layout(x,y,w,h)`, `Grid::attach(l,t,w,h)`, `set_size_request`, `set_default_size`, `set_offset` all discard their arguments. `Grid`'s `cols`/`rows` are hard-coded `0` and never written. |
-| S2 | No visibility | `set_visible` is a no-op on every type. `show_all` on `Overlay` does nothing. |
-| S3 | No expansion flags | `set_hexpand`/`set_vexpand`/`set_child_hexpand`/`set_child_vexpand` are no-ops. |
-| S4 | No margins | `set_margin_start`/`set_margin_top` (Label, Entry, Canvas) are no-ops. |
-| S5 | No CSS classes | `add_class`/`remove_class` are no-ops; a `classes: Vec<String>` per node is the obvious model. |
-| S6 | No focus | `set_focus` is an empty fn. `grab_focus` is a no-op, `has_focus` hard-coded `false`, `connect_focus_in/out_event` register an *untyped* callback. No `focused` node id. |
-| S7 | No alignment | `set_xalign`, `set_halign`, `set_valign`, `set_fixed_width` are no-ops. |
-| S8 | No font style | `set_font_style` is a no-op on Button. |
-| S9 | No caret | `Entry` has a `cursor` field, but `get_position` hard-codes `None` and `set_position` is a no-op — the field is written once by `set_entry_text` and never read. |
-| S10 | No editability | `TextView::set_editable` / `get_buffer` absent. |
-| S11 | No scroll state | `ScrolledWindow` has no `scroll_to`/`on_scroll`; nothing records a scroll position or range. |
-| S12 | No draw callback / draw surface | `Canvas::set_draw_callback` discards the closure; `force_draw`, `set_content_size`, `queue_redraw` are no-ops. Zork has **no** `DrawContext` implementation at all (only the dependency-free `backends::headless` recording context exists). |
-| S13 | No pointer/key event routing | `on_click`, `on_click_button`, `on_motion`, `on_release`, `on_key`, `on_key_raw`, `connect_button_press` all accept a closure and never store it. `screen_origin` is hard-coded `None`. |
-| S14 | Menu model is lossy | `MenuItemData` has only `label`/`action`/`submenu`. Missing: accelerator/shortcut, kind (normal/separator/check/radio), checked state, section headers, `enabled`. `menu_append_submenu` copies submenu items by value at append time, so later edits to the submenu are lost. `MenuBar` has no mnemonic state, no "menu is open" flag, no selection cursor. |
-| S15 | Menu selection does not dispatch | `Harness::select` validates the index then fires the *node's* callbacks — it never routes to the `SimpleAction` the item names, and `ZorkState::click` on a `Menu`/`MenuBar` fires all callbacks indiscriminately. REPL `select` only prints. |
-| S16 | Radio groups are not enforced | `create_radiobutton(group_id, ..)` stores `group_id` but `set_radiobutton_checked` never clears siblings. GTK/NWG enforce mutual exclusion. |
-| S17 | Dialog responses absent | `add_button`/`connect_response` are no-ops; no response id, no `default_response`, no `transient_for` parent, no `mark_destroyed`. |
-| S18 | No `Clone` on 5 adapter types | `BoxWidget`, `Menu`, `SimpleAction`, `MenuBar`, `Dialog` (B4). |
-| S19 | `MenuBar::insert_action_group` | zork's `MenuBar` has no such method; `Window::insert_action_group` exists but is a no-op. |
-| S20 | Radio group lost in `core.rs` | `core.rs::create_radiobutton` does `let _ = group; create_radiobutton(None, label)` — the group argument is discarded even though the adapter supports it. |
-| S21 | No event loop / quit plumbing | `ZorkState::quit` sets `running = false` but nothing observes it except the REPL. `Window::present`/`Dialog::present`/`close` are no-ops. |
-| S22 | No `owns_event_loop` parity issue | REPL returns `true` — correct, but `ZorkState` is also used by the harness, which has no loop at all. `[-]` (correct as-is) |
-| S23 | Snapshot is too thin | `SnapshotNode` has no geometry/visibility/classes/focus/size-request/caret, so a snapshot regression test cannot detect a regression in any of §3's properties. `Snapshot` also omits `prev_location` and any scroll/expansion state. |
-| S24 | `set_child` is destructive-but-buggy | `set_child` removes the child from *all* parents' `children` lists but only fixes up the **new** parent's link; the old parent's list is cleaned, but `add_node` also pushes to the parent, so a node can end up duplicated. And `append_child` is an alias of `set_child` — it *replaces* rather than appends, despite the name. |
-| S25 | No `Fixed`/`Overlay` pass-through | `Overlay::add_overlay` and `set_child` are the same code path; pass-through is a no-op. |
-| S27 | Submenu nodes were duplicated | Fixed. See below. |
+The last real method GTK and NWG had. One callback for hover, drag, buttons
+and scroll, which `core::DragTracker` turns into a drag without each caller
+reassembling one from three hooks and working out the click-versus-drag
+threshold.
 
-### S27 — every submenu exists twice in the tree
-
-`create_menubar` re-materialises one `Menu` node per submenu so the bar has
-navigable children, but it does not reuse the `Menu` nodes `create_menu`
-already made. The originals stay parented under the window, so the File
-items exist on two nodes and the REPL's direction list names the same place
-twice:
-
-```
-$ printf 'light\nnorth\n' | ./target/debug/corro
-    You are at a Menu.
-    Items:
-      1. _File
-      ...
-    To the east: File Menu
-    To the north: File Menu
-    To the south: Window "corro 0.7.0"
-
-    You see:
-      0. (yourself) Menu
-      1. File Menu (east)
-      2. File Menu (east)          <-- the same submenu, twice
-      3. Window "corro 0.7.0" (south)
-```
-
-Before commit `7a2d7e47` both of those lines read "Menu", so the duplication
-was invisible. `ZorkNode::menu_label` (added in the same commit, purely for
-display) made it visible; the duplication is pre-existing and unrelated.
-
-**Fixed** in the commit that follows `a2136a5f`, pairing by label. The
-earlier attempt cost 53 menu items (132 → 79, 98 nodes → 91) because it paired
-by index: corro builds the tree recursively (`build_common_menu` calls
-`new_menu` for a submenu before returning to its parent), so the Nth node
-created is not the Nth submenu item. `create_menubar` already had every
-label, so the match is exact.
-
-Two things the first attempt got wrong, both found by dumping the live model:
-
-* It only walked **one level**, so six of the thirteen submenu nodes
-  (Export, Width, Scope, Number, Align, Freeze — all nested) were still
-  parented under the window. `collect_submenus` recurses.
-* It re-parented everything onto the **bar**, flattening grandchildren, so
-  `Expor_t` ended up a sibling of `_File` rather than its child. The
-  collection carries the owning node, so a submenu keeps its real parent.
-
-A third point is easy to get wrong: the 79-item figure that the failed attempt
-produced was not a regression. It is the **true** count. 132 had been counting
-the six top-level submenus twice, and 79 is how many distinct items corro
-builds.
-
-Two tests cover it (`menubar_dedup_tests`), both verified to fail when the
-duplication is reintroduced:
-`submenu_nodes_are_not_duplicated` and
-`each_menu_node_stores_its_items_once`.
-
-Also corrected there: `create_menubar` now re-uses `model_id` as the bar rather
-than creating a second node, so the tree no longer holds a `Menu` and a
-`MenuBar` with identical contents.
-| S26 | No `draw_rgba_image` on the draw context | See below. |
-
-### S26 — `DrawContext::draw_rgba_image` is not implemented on zork
-
-Found while writing `tests/zork_feature_parity.rs` (a test that asserts the
-trait default rather than an image, because the default is the honest answer).
-
-Verbatim, over the whole of `rustxWidgets/rswidgets/src/`:
-
-```
-$ grep -rn "fn draw_rgba_image" rustxWidgets/rswidgets/src/
-rustxWidgets/rswidgets/src/backends_wasm_adapter.rs:2815:        fn draw_rgba_image(
-rustxWidgets/rswidgets/src/core.rs:1206:    fn draw_rgba_image(&mut self, x: f64, y: f64, pixels: &[u8], width: u32, height: u32, scale: f64) -> bool {
-rustxWidgets/rswidgets/src/backends_gtk_adapter_impl.rs:853:        fn draw_rgba_image(&mut self, x: f64, y: f64, pixels: &[u8], width: u32, height: u32, scale: f64) -> bool {
-```
-
-```
-$ grep -n "draw_rgba_image" rustxWidgets/rswidgets/src/backends/headless.rs
-  (no output — zork's recording context does not implement it)
-```
-
-Three sites: the trait default in `core.rs:1206` returns `false`, and only GTK
-and wasm override it. So **every** backend other than GTK and wasm — android,
-ios, macos, nwg, pancurses and zork — takes the default. This is not a zork
-defect; it is a gap common to six of the eight backends, and it only surfaces
-on zork because zork is the one backend with a test that asks.
-
-`false` is also the *correct* value, not an omission to paper over: the trait
-documents it as "fall back to vector drawing", so a caller that gets `false`
-still draws something. Returning `true` would promise a blit that never
-happened.
-
-Scope: corro itself never calls `draw_rgba_image` (`grep -rn draw_rgba_image
-src/` is empty), so this is backend completeness for a third-party draw
-callback, not a corro bug. Not yet constructed.
-
-## 4. Harness (`backends::zork::harness`) gaps
-
-The harness is the *recommended* way to test against zork, so its surface
-matters as much as the adapter's.
-
-| # | Gap |
-|---|-------|
-| H1 | No `create_canvas` / `create_overlay` / `create_scrolled_window` handles |
-| H2 | No geometry handles: `set_size_request`, `set_offset`, `layout`, `attach` |
-| H3 | No `set_visible` / `set_hexpand` / `set_vexpand` / `set_margin_*` / `add_class` |
-| H4 | No `set_focus` / `has_focus` / `grab_focus` on any handle |
-| H5 | No `set_position`/`get_position` on `Entry` (the model has the field) |
-| H6 | `Harness::select` does not dispatch to the action the menu item names (S15) |
-| H7 | No `Harness::key_*` / `click_at(x,y)` / `motion` / `release` actions (S13) |
-| H8 | No `Harness::add_class`/`classes` getters for snapshot assertions (S5) |
-| H9 | `snapshot_json` cannot express the §3 properties (S23) |
-
-## 5. REPL (`backends::zork::repl`) gaps
-
-| # | Gap |
-|---|-------|
-| R1 | No verbs for any §3 property — nothing can `look` at geometry, visibility, focus or classes |
-| R2 | `select` only prints the action name; it never fires the named `SimpleAction`'s callbacks |
-| R3 | No verb to set properties (`set title`, `hide`, `show`, `focus`) |
-| R4 | `toggle` on a `RadioButton` does not clear the rest of the group (S16) |
-| R5 | `click` on a non-Button falls through to "You can't click that", even for `Entry`/`CheckButton`/`DropDown` which *do* have click semantics |
-| R6 | `type` requires standing on the `Entry`; no way to target a specific entry |
+The gestures are synthesised from the `pointer_*` entry points the raw hooks
+already use, so a host that registers both gets both from one event. That
+needed one piece of new state, `PointerHooks::down_button`, because a
+`Gesture::Drag` has to report *which* button it belongs to and the raw
+`on_motion` does not carry one.
 
 ---
 
-## 6. Night mode and the Grue (added after the enumeration)
+## 2. Defects found while doing the above
 
-Not a parity gap — a zork-only feature the model needed to grow.
+Four, all of which would have shipped. Recorded because the *kind* of each
+is the argument for the test that found it.
+
+| # | Defect | Symptom | Found by |
+|---|--------|---------|----------|
+| Z4 | A timer handler that touched a widget panicked `RefCell already borrowed` | `advance_timers` ran each handler while the facade held the singleton's `RefCell`. A timer body touching a widget is the *normal* case — a poll that redraws, a tick that activates an action — not an exotic one. Same defect class as the `with_state` bug that killed the first corro run (Z1), in the one place written since. | `timers::a_timer_handler_may_touch_the_model` |
+| Z5 | Advancing 200 ms across a 50 ms timer fired it **once**, not four | The re-arm was measured from the end of the jump, silently skipping every interval in between. | `timers::a_long_jump_fires_a_repeating_timer_once_per_interval` |
+| Z6 | The REPL's printed number was not the number it resolved | See §1.3. | `type 3` on a session that printed `3. Entry` |
+| Z7 | `dump` reported "0 nodes" for a 100-widget session | The REPL's `adopt_singleton` leaves the thread-local empty. | running it |
+
+Z5 **inverted** a policy the first version documented, so the reasoning is
+in the code: "catch up, do not replay" is right for a debounced poll and
+wrong for a main loop reaching successive timeouts, and the latter is what
+a model of `g_timeout_add` has to be.
+
+## 3. Contracts settled, not just implemented
+
+These are the ones that are easy to get subtly wrong, and are therefore
+asserted rather than left to a comment:
+
+* `set_cursor` **clamps to the sheet's known extent** — and leaves the value
+  alone when the extent is unknown (`main_rows == 0`), so a spreadsheet
+  driven before its geometry is configured still remembers where it was put.
+  A cursor one row past the last row is a state the widget can never be in.
+* `set_editing(true, "", _)` **seeds the buffer from the cursor cell**, not
+  from empty. An empty seed would mean F2-then-commit silently blanks the
+  cell — the failure mode a caller would only find by losing data.
+* `set_tab_data` **clamps the active index** to the list, for the same
+  reason `set_dropdown_selected` drops an out-of-range selection.
+* A cursor-move handler **sees the clamped position**, because the clamp and
+  the notification are two borrows and the notification runs second.
+* A commit handler **sees a consistent model**: the mutation lands under one
+  borrow, the notification under a second, released one.
+* `draw_rgba_image` **refuses a short buffer** and records nothing — the
+  only refusal, and the one the contract is written to prevent.
+
+---
+
+## 4. The pre-existing enumeration, resolved
+
+Kept so the claims can be checked against the code rather than taken on
+faith. `model.rs` is 3889 lines, `harness.rs` 1229, `repl.rs` 1401,
+`facade.rs` 1054, the adapter 2193.
 
 | # | Item | State |
 |---|------|-------|
-| N1 | `ZorkState::night_mode` + `grue_warned`, `is_night`, `set_night_mode` | `[x]` |
-| N2 | `ZorkState::grue_warning` — latched per dark period, so repeated `look` does not nag | `[x]` |
-| N3 | `ZorkState::dark_room_description` — replaces the room tour while dark | `[x]` |
-| N4 | `Snapshot::night_mode` so a test can assert it | `[x]` |
-| N5 | REPL `light`/`lantern`, `dark`/`douse`, `grue` verbs | `[x]` |
-| N6 | REPL warns on `look` and on every move; `examine` reports darkness | `[x]` |
-
-The dungeon starts dark. Lighting and dousing the lantern re-arms the warning,
-because a room that was lit and then went dark is a new hazard rather than the
-same one.
-
-## 7. corro on zork (added after the enumeration)
-
-**corro now runs on this backend.** `cargo run --no-default-features --features zork`.
-
-corro had no feature that selected zork at all, so the answer to "is it usable"
-was "you cannot even ask". Getting it to run took two enabling changes plus
-three real bug fixes.
-
-### Enabling
-
-| # | Change | Why |
-|---|--------|-----|
-| C1 | New `corro` feature `zork = ["gui-core", "rswidgets/zork"]` | no feature reached the backend |
-| C2 | Split `gui` into `gui-core` (the widget pipeline, toolkit-free) + `gui` (adds GTK) | `src/gui` was gated on `feature = "gui"`, so a terminal build could not reach it without dragging in GTK. 59 cfg sites now key on `any(feature = "gui", feature = "gui-core")` |
-| C3 | `run_gui` hands off to `zork_handoff` before `rxapp.run()` | zork has no event loop; everything above that line — the window, formula row, canvas + draw callback, scrolled viewport, tab bar, menu model — is corro's real construction path |
-| C4 | `common::ScrolledWindow`'s `set_child`/`set_policy`/`set_vexpand`/`scroll_to`/`on_scroll` | the zork `common_types` block omitted the tail every other backend has (B6) |
-| C5 | `common::Window::model_id()` / `Canvas::model_id()` | the zork backend addresses widgets by `usize`, so an out-of-crate driver needs a way in |
-| C6 | `ZorkApp::adopt_singleton()`; `backends::zork::init()` adopts | the REPL started from a fresh model, so it could not see the ~100 widgets corro had just built |
-
-### Bugs this exposed (all real, all in zork or the shared layer)
-
-| # | Bug | Symptom |
-|---|-----|---------|
-| Z1 | `with_state` held a `RefMut` across the whole operation | **corro died on first run.** Its draw callback calls `scroll_to` every frame, which panicked `RefCell already borrowed`. Re-entrancy from inside a user callback is routine in GTK/NWG-style code, not exotic. |
-| Z2 | `draw_canvas` put back an *emptied* slot | the canvas would paint exactly once and then be permanently blank — a silent, hard-to-spot data-loss bug |
-| Z3 | The zork `common_types` block lacked the `ScrolledWindow`/`Canvas` tail | `common::ScrolledWindow` was unusable for the very code that needs it |
-
-Z1 is fixed by `with_callbacks`: lift the closure out, **release the borrow**,
-run it, put it back. Every callback-firing facade function (`fire`,
-`draw_canvas`, `pointer_click*`, `motion`, `release`, `scroll`,
-`dialog_respond`, and the harness's `scroll`) goes through it. Three regression
-tests cover it, including the subtle one: a nested call must not operate on a
-detached copy whose writes are silently lost.
-
-### What running it looks like
-
-```
-$ cargo run --no-default-features --features zork
-corro 0.7.0 on the zork backend
-======================================================
-
-Widgets built: 98
-  2 xBoxWidget, 2 xCanvas, 1 xEntry, 4 xLabel, 20 xMenu, 1 xScrolledWindow,
-  67 xSimpleAction, 1 xWindow
-Window title: "corro 0.7.0"
-Cursor at rest: R999999999C702
-Canvas draw: 2891 ops, 146 text runs
-  grid labels: ["~1", "1", "2", "_1", "_2", "_3", "_4", "_5"]
-Menu items: 132
-Model night mode: dark
-```
-
-The 2891 draw ops and the column headers are corro's own `paint` callback run
-against a recording `DrawContext` — the strongest evidence the pipeline is
-genuinely live rather than stubbed. Then the zork REPL takes over, describing
-and editing the same model, so `light` / `examine` / `select` work against
-corro's real widget tree.
-
-### What it is *not*
-
-corro on zork is a **model driver, not an interactive spreadsheet**. There is no
-display, so there is no key routing to the grid, no clicking cells, no
-scrolling. The text REPL explores the widget tree. Making zork a genuinely
-interactive corro UI would need a terminal front-end over the model — the same
-gap pancurses fills, and out of scope here.
-
-### Pre-existing, unrelated
-
-Re-measured at `d7ec288a` + the `lock_scheme_for_tests` move, so the counts here
-are current rather than quoted from the original session. Each is the count of
-diagnostics that are *not* `error: could not compile` summary lines:
-
-```
-$ cargo check --features wasm        # NOTE: no --no-default-features
-rswidgets/src/lib.rs: E0432/E0425 x18 — `crate::common::{Menu,Window,SimpleAction,
-  Canvas,Entry,Label,Dialog,ScrolledWindow,WidgetBox,Orientation}` not found,
-  `crate::backends::init` not found
-```
-
-18 errors for `wasm`, and the same 18 for `gui-mobile` and `gui-macos`.
-
-This is **not** a wasm problem, and it is not a regression from any work in
-this document: enabling `wasm` *without* `--no-default-features` leaves the
-default `gtk` feature on, so the gtk adapter's `crate::common::*` types are
-cfg'd out while the wasm code still names them. The supported invocations —
-`--no-default-features --features wasm`, and `--target
-wasm32-unknown-unknown --features wasm --no-default-features` — are both clean
-at `-D warnings`, and `wasm32` links `corro.wasm`. Verified byte-identical with
-this change stashed and unstashed (`comm` over the two sorted error lists: no
-line appears on only one side).
-
-`--features pancurses` recorded 2 errors here and is now **0**: this work fixed
-it. `actions::night_mode_dispatch_tests` called
-`crate::gui::lock_scheme_for_tests`, which lived in the GUI-gated
-`gui_backend` module — but `actions` is compiled on every build, so any
-feature that omits `gui`/`gui-core` (pancurses is the one that gets tested)
-failed the lib-test build with E0425. The lock is a `static Mutex` with no
-toolkit in it and now lives in `src/gui/mod.rs`, which is always compiled.
-
-## Implementation order
-
-1. **Unblock the build** — B1..B6. Nothing else can be verified until
-   `cargo build --features zork` is green. Add the six missing model node kinds
-   (M1–M3 at minimum), give the 5 adapter types `Clone` (S18), delete the
-   duplicate `impl Clone`, write the 9 `core.rs` `new_*` arms, add the missing
-   `common_types_mod!` methods, and give zork the same `common_types` cfg-tail
-   (`Canvas::on_key`, `ScrolledWindow::*`) every other backend has.
-2. **Model properties** (S1–S8, S23) — add a `ZorkProps` struct (rect, visible,
-   expand flags, margins, classes, font, align) plus `focus`, `caret`,
-   `editable`, `scroll`. One struct keeps `ZorkNode` from growing 15 fields and
-   makes the snapshot serializable in one go.
-3. **Wire the adapter** (P1–P34) to those properties.
-4. **Event routing** (S13) — store click/motion/release/key callbacks on
-   `Canvas` and add harness actions to fire them.
-5. **Menu semantics** (S14–S16) — extend `MenuItemData`, fix `set_child`
-   (S24), make `select` dispatch (S15, H6, R2), enforce radio groups.
-6. **Dialog responses** (S17).
-7. **Harness + REPL** (H1–H9, R1–R6).
-8. **Spreadsheet / Fixed / Application** (M4–M6, F1–F3, F9–F10) — optional;
-   only reachable from GTK/pancurses `core.rs` paths today.
+| B1–B6 | §0: the `zork` feature did not compile (38 errors) | `[x]` fixed in 701f961b, and `.github/workflows/backends.yml` exists so nothing rots again |
+| M1–M6 | §1: missing model node kinds | `[x]` `ZorkKind` has 20 variants; `Canvas`/`Overlay`/`ScrolledWindow`/`Fixed`/`Application`/`Spreadsheet` all carry real state |
+| §2.1 | `common_types_mod!` requirements | `[x]` |
+| §2.2 | `common_types` cfg-tail methods | `[x]` |
+| §2.3 P1–P34 | cross-backend parity methods | `[x]` every one; see §1 for the two that were not in the list at all (`on_gesture`, the redraw cascade) |
+| §2.4 F1 | `create_fixed` | `[x]` |
+| §2.4 F2 | `create_application`, `add_action` | `[x]` `75d9d455` |
+| §2.4 F3 | `create_spreadsheet` + 12 `spreadsheet_set_*` | `[x]` `75d9d455` (see F9) |
+| §2.4 F4 | `timeout_add_once`, `timeout_add_repeating` | `[x]` `75d9d455`; found Z4, Z5 |
+| §2.4 F5 | `pump_main_context`, `quit_main_loop` | `[-]` zork's REPL **is** the loop (`owns_event_loop() == true`); there is no loop pointer to publish. Same answer as the old file. The `quit` path itself is real: `ZorkState::quit` sets `running = false` and the REPL polls it. |
+| §2.4 F6 | `open_file_filtered` / `save_file_filtered` | `[-]` unchanged, and unchanged in reasoning: a headless backend has no chooser, so the honest answer is "cancelled". The REPL is text; a real filter picker is a terminal-dialog project. |
+| §2.4 F7 | `set_window_pos`, `mark95a`, `translate_vk`, … | `[-]` Win32/Win95 only |
+| §2.4 F8 | `debug_dump_native_tree`, `window_queue_redraw_cascades_to_children` | `[x]` `75d9d455`; the REPL's `dump` found Z7 |
+| §2.4 F9 | 15 `set_*` spreadsheet calls | `[x]` `75d9d455` — `SheetChrome` plus one setter per field |
+| §2.4 F10 | `add_key_callback`, `add_goto_callback`, `add_cursor_move_callback`, `add_commit_edit_callback` | `[x]` `75d9d455` — `SheetInput`, each fired with the borrow released |
+| S1–S5 | no geometry / visibility / expansion / margins / classes | `[x]` `ZorkProps` (pre-existing) |
+| S6–S11 | focus, caret, editability, scroll | `[x]` |
+| S12 | no draw callback / draw surface | `[x]` |
+| S13 | no pointer/key routing | `[x]`, and extended with the `Gesture` stream in `9c43fbc4` |
+| S14–S16 | lossy menu model, selection does not dispatch, radio groups | `[x]` |
+| S17 | dialog responses absent | `[x]` |
+| S18 | no `Clone` on 5 adapter types | `[x]` |
+| S19 | `MenuBar::insert_action_group` | `[x]` |
+| S20 | radio group lost in `core.rs` | `[x]` |
+| S21 | no event loop / quit plumbing | `[x]` for the model side (`quit` sets `running`); `[-]` for `present()`, which has nothing to present to |
+| S22 | `owns_event_loop` parity | `[-]` correct as-is |
+| S23 | snapshot too thin | `[x]` — it now carries `props`, and also `chrome`, `sheet_hooks`, `timers`, `now_ms` and `app_actions` |
+| S24 | `set_child` destructive-but-buggy | `[x]` `append_child` is a genuine append; re-parenting cannot duplicate |
+| S25 | no pass-through | `[x]` |
+| S26 | `draw_rgba_image` | `[x]` `b24abf9a` |
+| S27 | submenu nodes duplicated | `[x]` 59e3a0de; and §1.3 removed the second, worse instance of the same bug in the numbered list |
+| H1–H9 | harness gaps | `[x]` (pre-existing) and extended in `6c5ef1cb` |
+| R1–R5 | REPL gaps | `[x]` (pre-existing) |
+| R6 | `type` needs a target | `[x]` `8bab5aa1`; found Z6 on the way |
 
 ### Explicitly out of scope (`[-]`)
 
-* Win32/Win95 shims (F7), native-handle introspection (F8), `pump_main_context`
-  / `quit_main_loop` (F5 — zork's REPL is the loop), CSS-vs-`pdcurses-sys`
-  feature conflicts (a pre-existing, unrelated workspace resolution failure:
-  `rustxWidgets/Cargo.lock` has a registry `pdcurses-sys 0.7.1` while the
-  repo-root `[patch.crates-io]` points `pdcurses-sys` at `vendor/pdcurses-sys`.
-  Build zork from the **repo-root** workspace, which has a correct lock file).
+* Win32/Win95 shims (F7), `pump_main_context` / `quit_main_loop` (F5 — the
+  REPL is the loop), and the four file-dialog functions (F6 — no chooser
+  exists to open). Each of these has a *reason* rather than a `todo`, and
+  the reason is in the code at the site.
+* The `--features wasm` **without** `--no-default-features` build: still
+  18 errors, and still not a wasm problem (the default `gtk` feature cfgs
+  out the `crate::common::*` types the wasm adapter names). The supported
+  invocations are clean at `-D warnings`; see `docs/WASM_MISSING.md`.
+* CSS-vs-`pdcurses-sys` feature conflicts: a pre-existing, unrelated
+  workspace resolution failure (`rustxWidgets/Cargo.lock` has a registry
+  `pdcurses-sys 0.7.1` while the repo-root `[patch.crates-io]` points
+  `pdcurses-sys` at `vendor/pdcurses-sys`). Build zork from the
+  **repo-root** workspace, which has a correct lock file.
+
+---
+
+## 5. What is still not true
+
+Stated plainly, because a document that only lists wins is a document you
+cannot plan from.
+
+* **corro on zork is a model driver, not an interactive spreadsheet.** There
+  is no display, so no key routing to the grid, no clicking cells, no
+  scrolling. The text REPL explores and edits the widget tree, and `sheet`
+  now drives the grid's cursor, cells and edit state — which is a great deal
+  more than it could do before, and still not a terminal front-end.
+* **`ZorkState` is single-threaded and in-memory.** No persistence, no
+  concurrency, and the harness and REPL each take a whole `&mut` state. A
+  model test cannot exercise two threads touching widgets, because there is
+  nothing there to exercise.
+* **The virtual clock is not a clock.** Timers fire when a driver advances
+  it. A host that never advances it registers a timer that never fires —
+  the same situation as registering one and leaving the main loop before it
+  elapses, but with no error to tell you.
+* **The four GTK version probes stay unanswered**, and should: `is_gtk4` on
+  a backend that is not GTK would be a fabrication.
+* **67 of 296 zork methods are zork-only.** They exist because a headless
+  model needs somewhere to put state GTK keeps in the compositor. They are
+  not a compatibility surface, and nothing outside the backend should need
+  them — the shared code is supposed to go through `common.rs`.

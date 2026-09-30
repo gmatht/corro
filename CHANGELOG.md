@@ -1,5 +1,49 @@
 # 0.7.0 – Windows 95 support (WIP); new release artifacts
 
+## The zork backend's parity gaps are closed
+- **`docs/ZORK_MISSING.md` now reports no open gaps**, and the measurement is
+  reproducible rather than asserted: `scripts/surface_diff.py` diffs the zork
+  adapter's public method and free-function surface against the GTK, NWG and
+  pancurses adapters. The only remaining differences are GTK's version probes
+  (`is_gtk4`, `has_size_request_symbol`, `diagnostics`), which would be a
+  fabrication to answer on a backend that is not GTK, and two loop functions
+  the REPL has no use for because it *is* the loop.
+- The gaps were closed in six commits, each independently revertible. The
+  bulk of the work was in the **model**, not the adapter: there was nowhere to
+  record a cursor, an edit buffer, a column layout, a tab strip, a timer
+  deadline or an application's action set, so every method could only discard
+  its argument. `SheetChrome`, `SheetInput`, `Timer` on a *virtual* clock, and
+  an action registry are what the F9/F10/F4/F2 surfaces stand on.
+- **`DrawContext::draw_rgba_image` on the headless recorder** records the blit
+  instead of taking the trait default, so a draw callback that draws an image
+  leaves a trace a test can assert on. The one refusal kept is a `pixels`
+  buffer too short for the extent it claims — returning `true` there is
+  exactly the "promised a draw that never happened" answer the contract is
+  written to prevent.
+- **`Canvas::on_gesture`**, the last method GTK and NWG had: one stream for
+  hover, drag, buttons and scroll, which `core::DragTracker` turns into a
+  drag without each caller reassembling one from three hooks.
+- **REPL: `type <n>`** targets a specific Entry, `sheet` drives a
+  spreadsheet's cursor/cells/edit state, `timers` and `wait` drive the clock,
+  and `dump` writes the widget tree.
+- Four defects surfaced and were fixed along the way, three of them by tests
+  written for the new work:
+  * a **timer handler that touched a widget panicked** with
+    "RefCell already borrowed" — a timer body touching a widget is the
+    normal case, and the borrow was held across the call. The same defect
+    class as the one that killed the first corro run, in the one place
+    written since.
+  * **advancing 200 ms across a 50 ms timer fired it once, not four**: the
+    re-arm was measured from the end of the jump, silently skipping three.
+  * **the REPL's printed number was not the number it resolved** — two views
+    of one list, quietly disagreeing. The same class as the duplicated
+    submenu nodes fixed in 59e3a0de.
+  * **`dump` reported "0 nodes" for a 100-widget session**, because the
+    REPL's `adopt_singleton` leaves the thread-local model empty.
+- 137 lib + 27 harness + 80 adapter + 468 corro lib + 34 feature-parity tests
+  pass, and `.github/workflows/backends.yml` builds and runs all of them plus
+  the crate's examples.
+
 ## Pinch to zoom, and platform-aware drag on the grid
 - **Pinch to zoom** for the grid widget on Android and iOS. `GridView` gained
   `zoom`/`set_zoom`/`zoom_by`/`reset_zoom`/`on_zoom`/`zoom_limits`, and the

@@ -77,8 +77,17 @@ jobs:
         run: cargo +stable build -p rswidgets --no-default-features --features zork
 
       - name: rswidgets zork tests
-        # The 130 model/harness/adapter tests. No X server, no OCR, no GTK.
+        # The 137 model/harness/adapter tests. No X server, no OCR, no GTK.
         run: cargo +stable test -p rswidgets --no-default-features --features zork
+
+      - name: the zork examples build
+        # `--examples` because an example is a compile-only surface that a
+        # library test never touches, and zork-sheet.rs is the executable
+        # documentation of the spreadsheet/timer/gesture surface: it is what
+        # found the REPL's number-resolution bug. An example that no CI job
+        # builds is the same failure mode this file exists to prevent, one
+        # level down.
+        run: cargo +stable build -p rswidgets --no-default-features --features zork --examples
 
       - name: corro builds with zork
         run: cargo +stable build --no-default-features --features zork
