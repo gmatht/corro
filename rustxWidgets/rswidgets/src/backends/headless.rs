@@ -60,6 +60,25 @@ pub enum DrawOp {
         slant: i32,
         weight: i32,
     },
+    /// A blit of a straight-alpha RGBA8 image, at `(x, y)` and scaled.
+    ///
+    /// Recorded with the source geometry, so a test can assert both that a
+    /// blit happened and where it landed. The `r,g,b,a` fields are the
+    /// four channels the loader derived from the image, carried alongside the
+    /// samples so a caller can match an op without re-deriving them.
+    Image {
+        x: f64,
+        y: f64,
+        /// Source width in pixels, before `scale`.
+        src_w: u32,
+        /// Source height in pixels, before `scale`.
+        src_h: u32,
+        /// The `scale` argument, verbatim.
+        scale: f64,
+        /// RGBA8, row-major, 4 bytes per pixel, straight (not premultiplied)
+        /// alpha — exactly the buffer the caller passed in.
+        rgba: Vec<u8>,
+    },
 }
 
 /// A `DrawContext` that records operations for later inspection.
@@ -100,6 +119,11 @@ impl RecordingDrawContext {
                 _ => None,
             })
             .collect()
+    }
+
+    /// All `Image` blits, in draw order.
+    pub fn images(&self) -> Vec<&DrawOp> {
+        self.ops.iter().filter(|o| matches!(o, DrawOp::Image { .. })).collect()
     }
 }
 
@@ -155,6 +179,46 @@ impl DrawContext for RecordingDrawContext {
     fn save(&mut self) {}
     fn restore(&mut self) {}
     fn clip(&mut self, _x: f64, _y: f64, _w: f64, _h: f64) {}
+
+    /// Honour an image blit by recording it.
+    ///
+    /// The trait default does nothing and returns `false`, and six of the
+    /// eight backends take it — a caller that ignores the result then draws
+    /// nothing where GTK would have drawn the image, with no error. A recorder
+    /// has no reason to refuse: it does not rasterise, it *records*, and
+    /// recording the blit is the whole of what it does for every other
+    /// primitive. So it records the op and returns `true`, which is the honest
+    /// answer — the samples really are in `ops` afterwards.
+    ///
+    /// The one case it does refuse is a `pixels` buffer too short for
+    /// `width * height * 4`. There the blit genuinely cannot be recorded
+    /// faithfully, and returning `true` would be the "promised a draw that
+    /// never happened" answer the trait's contract is written to prevent.
+    fn draw_rgba_image(
+        &mut self,
+        x: f64,
+        y: f64,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        scale: f64,
+    ) -> bool {
+        let need = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        if need > pixels.len() {
+            return false;
+        }
+        self.ops.push(DrawOp::Image {
+            x,
+            y,
+            src_w: width,
+            src_h: height,
+            scale,
+            rgba: pixels[..need].to_vec(),
+        });
+        true
+    }
 }
 
 /// Owned view of a `FillRect` op.
@@ -178,6 +242,47 @@ mod tests {
         assert_eq!(dc.ops.len(), 2);
         assert_eq!(dc.ops[0], DrawOp::Line { x1: 0.0, y1: 0.0, x2: 10.0, y2: 10.0, rgba: (1.0, 0.0, 0.0, 1.0), lw: 1.0 });
         assert_eq!(dc.ops[1], DrawOp::Circle { cx: 5.0, cy: 5.0, r: 3.0, rgba: (0.0, 0.0, 1.0, 1.0), lw: 1.0 });
+    }
+
+    #[test]
+    fn image_blit_is_recorded_with_its_geometry() {
+        let mut dc = RecordingDrawContext::new();
+        // Two pixels: opaque red, half-transparent green.
+        let px: Vec<u8> = vec![255, 0, 0, 255, 0, 255, 0, 128];
+        assert!(dc.draw_rgba_image(3.0, 4.0, &px, 2, 1, 2.0));
+        assert_eq!(dc.images().len(), 1);
+        match &dc.ops[0] {
+            DrawOp::Image { x, y, src_w, src_h, scale, rgba } => {
+                assert_eq!((*x, *y), (3.0, 4.0));
+                assert_eq!((*src_w, *src_h), (2, 1));
+                assert_eq!(*scale, 2.0);
+                // The samples must survive verbatim, alpha included: a
+                // recorder that normalised or dropped the alpha byte would
+                // make a translucent-edge assertion vacuous.
+                assert_eq!(rgba, &px);
+            }
+            other => panic!("expected an Image op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_blit_refuses_a_short_buffer() {
+        let mut dc = RecordingDrawContext::new();
+        // 2x2 needs 16 bytes; hand it 8.
+        let px: Vec<u8> = vec![0; 8];
+        assert!(!dc.draw_rgba_image(0.0, 0.0, &px, 2, 2, 1.0));
+        assert!(
+            dc.ops.is_empty(),
+            "a refused blit must not record an op, or it would promise a draw \
+             it never performed"
+        );
+    }
+
+    #[test]
+    fn a_zero_sized_image_is_a_valid_blit() {
+        let mut dc = RecordingDrawContext::new();
+        assert!(dc.draw_rgba_image(1.0, 2.0, &[], 0, 0, 1.0));
+        assert_eq!(dc.images().len(), 1);
     }
 }
 

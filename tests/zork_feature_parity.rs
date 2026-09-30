@@ -830,32 +830,81 @@ mod adapter {
         });
     }
 
-    /// `DrawContext::draw_rgba_image` returns whether the blit happened, and on
-    /// zork it is the trait default -- which does nothing and returns `false`.
+    /// `DrawContext::draw_rgba_image` on a canvas's recording context, end to
+    /// end: a draw callback that blits an image must have that blit in the
+    /// recorded ops, and the call must report that it happened.
     ///
-    /// This is asserted rather than skipped, and the *return value* is the
-    /// point. GTK and wasm override it; zork does not, so a caller that
-    /// ignores the result silently draws nothing where GTK draws an image. The
-    /// trait documents `false` as "fall back to vector drawing", so a backend
-    /// that answers honestly is behaving correctly -- what would be a bug is
-    /// answering `true` without drawing, which is what a stub that records an
-    /// op it cannot honour would do.
+    /// This used to assert the opposite. The trait default does nothing and
+    /// returns `false`, and the recorder took it — so a third-party draw
+    /// callback that drew a screenshot preview, which is what `jautogui` does
+    /// on GTK and NWG, silently drew nothing on zork, and there was no op to
+    /// prove it either way. A recorder has no reason to refuse a blit: it does
+    /// not rasterise, it records, and recording the samples is the whole of
+    /// what it does for every other primitive.
+    ///
+    /// The one thing that must still refuse is a short buffer, because there
+    /// the op could not be recorded faithfully — that is the "answered `true`
+    /// without drawing" failure the trait's contract exists to prevent. It is
+    /// covered here so the two halves of the contract live in one test.
     #[test]
-    fn draw_rgba_image_reports_that_it_did_not_blit() {
+    fn draw_rgba_image_is_recorded_on_the_canvas_context() {
         serial(|| {
             let _w = za::create_window().unwrap();
             let c = za::create_canvas().unwrap();
             c.set_size_request(64, 64);
-            let pixels = vec![0u8; 4 * 4 * 4];
-            let mut ctx =
-                rswidgets::backends::headless::RecordingDrawContext::new();
-            let drew = rswidgets::core::DrawContext::draw_rgba_image(
-                &mut ctx, 0.0, 0.0, &pixels, 4, 4, 1.0,
+            // One opaque red pixel, and the short buffer the test below reuses.
+            let one_pixel: Vec<u8> = vec![255, 0, 0, 255];
+            let blits = std::rc::Rc::new(std::cell::Cell::new(0usize));
+            let seen = blits.clone();
+            c.set_draw_callback(Box::new(move |ctx, _w, _h| {
+                let drew = rswidgets::core::DrawContext::draw_rgba_image(
+                    ctx, 5.0, 6.0, &one_pixel, 1, 1, 1.0,
+                );
+                assert!(drew, "the recorder must honour a blit it can record");
+                seen.set(seen.get() + 1);
+            }));
+            let ops = c.draw();
+            assert_eq!(blits.get(), 1, "the draw callback must have run");
+            let images: Vec<_> = ops
+                .iter()
+                .filter(|o| matches!(o, rswidgets::backends::headless::DrawOp::Image { .. }))
+                .collect();
+            assert_eq!(
+                images.len(),
+                1,
+                "the blit must be in the recorded ops, or a caller cannot tell \
+                 the image was drawn at all"
             );
+            match images[0] {
+                rswidgets::backends::headless::DrawOp::Image { x, y, src_w, src_h, rgba, .. } => {
+                    assert_eq!((*x, *y), (5.0, 6.0), "the blit's position must survive");
+                    assert_eq!((*src_w, *src_h), (1, 1), "so must its extent");
+                    assert_eq!(rgba.as_slice(), &[255, 0, 0, 255], "so must its samples");
+                }
+                _ => unreachable!("filtered to Image"),
+            }
+        });
+    }
+
+    /// A blit whose buffer is too short for the extent it claims must report
+    /// that it did *not* happen, and record nothing.
+    #[test]
+    fn draw_rgba_image_refuses_a_buffer_that_does_not_match_the_extent() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let c = za::create_canvas().unwrap();
+            c.set_size_request(64, 64);
+            // 2x2 needs 16 bytes; give it 8.
+            let pixels = vec![0u8; 8];
+            let mut ctx = rswidgets::backends::headless::RecordingDrawContext::new();
+            let drew = rswidgets::core::DrawContext::draw_rgba_image(
+                &mut ctx, 0.0, 0.0, &pixels, 2, 2, 1.0,
+            );
+            assert!(!drew, "a short buffer cannot be recorded faithfully, so say so");
             assert!(
-                !drew,
-                "zork does not implement image blits, so it must say so: a `true` \
-                 here would promise a draw the backend never performed"
+                ctx.ops.is_empty(),
+                "a refused blit must not leave an op behind: an op here would \
+                 be the `true`-without-drawing failure the contract forbids"
             );
         });
     }
