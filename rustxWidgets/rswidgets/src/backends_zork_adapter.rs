@@ -1364,6 +1364,34 @@ impl Canvas {
         crate::backends::zork::add_key_raw_hook(self.id, cb);
     }
 
+    /// The canonical pointer input: one callback for hover, drag, buttons and
+    /// scroll, as `crate::core::Gesture`.
+    ///
+    /// The recommended way to handle pointer input on a canvas, for the same
+    /// reason as on GTK: a caller that needs a drag has to reassemble one from
+    /// press/motion/release and work out the click-versus-drag threshold
+    /// itself, which is the part that is easy to get subtly wrong.
+    /// [`crate::core::DragTracker`] does that once, from a single stream.
+    ///
+    /// The gestures are synthesised from the same `pointer_*` entry points the
+    /// raw hooks use, so a host that registers both gets both from one event,
+    /// and a drag is only reported while a button is actually held.
+    pub fn on_gesture(&self, cb: Box<dyn FnMut(crate::core::Gesture)>) {
+        crate::backends::zork::add_gesture_hook(self.id, cb);
+    }
+    /// How many gesture handlers this canvas has.
+    pub fn gesture_hook_count(&self) -> usize {
+        crate::backends::zork::gesture_hook_count(self.id)
+    }
+    /// Deliver a scroll as a `Gesture::Scroll`, where `dx`/`dy` are deltas.
+    ///
+    /// Separate from `on_scroll` because that one reports a *position* and this
+    /// one a *movement*; feeding one into the other loses a factor of the
+    /// scroll rate, which is the mistake `ScrollDelta` exists to prevent.
+    pub fn scroll_gesture(&self, dx: f64, dy: f64, x: f64, y: f64, state: u32) {
+        crate::backends::zork::pointer_scroll(self.id, dx, dy, x, y, state);
+    }
+
     /// This canvas's top-left in screen coordinates, or `None` when the backend
     /// cannot report one. Default `None`, matching the old behaviour;
     /// [`Self::set_screen_origin`] lets a test declare one.

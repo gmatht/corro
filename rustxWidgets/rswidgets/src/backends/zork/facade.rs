@@ -427,6 +427,25 @@ pub fn add_key_hook(id: usize, cb: Box<dyn FnMut(u32) -> bool>) {
 pub fn add_key_raw_hook(id: usize, cb: Box<dyn FnMut(u32, u32) -> bool>) {
     with_state(|s| s.add_key_raw_hook(id, cb));
 }
+/// Register a gesture handler, called as `cb(Gesture)`. The canonical pointer
+/// input: one callback for hover, drag, buttons and scroll, which
+/// [`crate::core::DragTracker`] turns into a drag without each caller
+/// reassembling one from three separate hooks.
+pub fn add_gesture_hook(id: usize, cb: Box<dyn FnMut(crate::core::Gesture)>) {
+    with_state(|s| s.add_gesture_hook(id, cb));
+}
+/// How many gesture handlers a node has.
+pub fn gesture_hook_count(id: usize) -> usize {
+    with_state(|s| s.gesture_hook_count(id))
+}
+/// Fire a gesture at `id` with the borrow released, so a handler may re-enter.
+pub fn fire_gesture(id: usize, g: crate::core::Gesture) {
+    let mut cbs = with_callbacks(ZorkState::take_gesture_hooks, id);
+    for cb in cbs.iter_mut() {
+        cb(g);
+    }
+    put_callbacks(ZorkState::put_gesture_hooks, id, cbs);
+}
 pub fn set_screen_origin(id: usize, origin: Option<(i32, i32)>) {
     with_state(|s| s.set_screen_origin(id, origin));
 }
@@ -447,6 +466,19 @@ pub fn pointer_click_button(id: usize, x: f64, y: f64, button: u32, state: u32) 
         cb(x, y, button, state);         // <- model borrow is NOT held here
     }
     put_callbacks(ZorkState::put_click_button_hooks, id, cbs);
+    // A press is the gesture stream's "the drag starts here"; recorded before
+    // the plain click so a gesture handler sees the button already down.
+    with_state(|s| s.node_mut(id).map(|n| n.pointer.down_button = Some(ZorkState::gesture_button(button))));
+    fire_gesture(
+        id,
+        crate::core::Gesture::Button {
+            button: ZorkState::gesture_button(button),
+            pressed: true,
+            x,
+            y,
+            mods: ZorkState::gesture_modifiers(state),
+        },
+    );
     pointer_click(id, x, y);
 }
 pub fn pointer_motion(id: usize, x: f64, y: f64, state: u32) {
@@ -455,6 +487,14 @@ pub fn pointer_motion(id: usize, x: f64, y: f64, state: u32) {
         cb(x, y, state);
     }
     put_callbacks(ZorkState::put_motion_hooks, id, cbs);
+    // Drag when a button is held, hover when none is — the distinction the raw
+    // hook cannot express, and the one `DragTracker` needs.
+    let down = with_state(|s| s.gesture_button_down(id));
+    let g = match down {
+        Some(_) => crate::core::Gesture::Drag { x, y, mods: ZorkState::gesture_modifiers(state) },
+        None => crate::core::Gesture::Hover { x, y, mods: ZorkState::gesture_modifiers(state) },
+    };
+    fire_gesture(id, g);
 }
 pub fn pointer_release(id: usize, x: f64, y: f64, button: u32, state: u32) {
     let mut cbs = with_callbacks(ZorkState::take_release_hooks, id);
@@ -462,6 +502,34 @@ pub fn pointer_release(id: usize, x: f64, y: f64, button: u32, state: u32) {
         cb(x, y, button, state);
     }
     put_callbacks(ZorkState::put_release_hooks, id, cbs);
+    fire_gesture(
+        id,
+        crate::core::Gesture::Button {
+            button: ZorkState::gesture_button(button),
+            pressed: false,
+            x,
+            y,
+            mods: ZorkState::gesture_modifiers(state),
+        },
+    );
+    // Cleared after firing, so a handler inspecting state during the release
+    // still sees which button it was.
+    with_state(|s| s.node_mut(id).map(|n| n.pointer.down_button = None));
+}
+/// Deliver a scroll to the gesture stream as a `Gesture::Scroll`, where `dx`/
+/// `dy` are *deltas*. A widget's own `on_scroll` keeps its `(vertical, pos)`
+/// position shape; the two are separate because conflating them is the mistake
+/// the `ScrollDelta` type exists to prevent.
+pub fn pointer_scroll(id: usize, dx: f64, dy: f64, x: f64, y: f64, state: u32) {
+    fire_gesture(
+        id,
+        crate::core::Gesture::Scroll {
+            delta: crate::core::ScrollDelta { dx, dy },
+            x,
+            y,
+            mods: ZorkState::gesture_modifiers(state),
+        },
+    );
 }
 pub fn key(id: usize, keyval: u32) -> bool {
     with_state(|s| s.key(id, keyval))

@@ -317,6 +317,14 @@ pub struct ZorkNode {
     /// `ScrolledWindow` scroll-notification handlers, called as
     /// `cb(vertical, pos)`.
     pub scroll_cbs: Vec<Box<dyn FnMut(bool, f64)>>,
+    /// Canvas gesture handlers, called as `cb(Gesture)`.
+    ///
+    /// Separate from the four `PointerHooks` lists because a `Gesture` carries
+    /// a button and modifiers where the raw hooks do not, and because GTK
+    /// builds a drag out of motion events that a raw `on_motion` would only
+    /// deliver with no button held. The two coexist: a host may register
+    /// either, or both.
+    pub gesture_cbs: Vec<Box<dyn FnMut(crate::core::Gesture)>>,
     /// `Dialog` response handlers, called as `cb(response_id)`. Separate from
     /// `callbacks` because a response must carry its id.
     pub response_cbs: Vec<Box<dyn FnMut(i32)>>,
@@ -434,6 +442,10 @@ pub struct PointerHooks {
     pub key_raw: Vec<Box<dyn FnMut(u32, u32) -> bool>>,
     /// This canvas's top-left in "screen" coordinates, when known.
     pub screen_origin: Option<(i32, i32)>,
+    /// The button currently held down, set by a press and cleared by a
+    /// release. Read by the gesture stream, which has no other way to know
+    /// which button a following `Drag` belongs to.
+    pub down_button: Option<crate::core::Button>,
     /// Number of queued redraws, so a test can assert `queue_redraw` was called
     /// even though nothing is rasterised.
     pub redraws: u32,
@@ -667,6 +679,7 @@ impl ZorkState {
             draw: None,
             pointer: PointerHooks::default(),
             scroll_cbs: Vec::new(),
+            gesture_cbs: Vec::new(),
             response_cbs: Vec::new(),
             cells: HashMap::new(),
             chrome: SheetChrome::default(),
@@ -1768,6 +1781,64 @@ impl ZorkState {
         }
     }
 
+    /// Register a gesture handler, called as `cb(Gesture)`.
+    pub fn add_gesture_hook(&mut self, id: usize, cb: Box<dyn FnMut(crate::core::Gesture)>) {
+        if let Some(n) = self.node_mut(id) {
+            n.gesture_cbs.push(cb);
+        }
+    }
+
+    /// How many gesture handlers a node has.
+    pub fn gesture_hook_count(&self, id: usize) -> usize {
+        self.node(id).map(|n| n.gesture_cbs.len()).unwrap_or(0)
+    }
+
+    /// The state a gesture is derived from: which button (if any) is down.
+    ///
+    /// A `Gesture::Button { pressed: true }` has to remember its button so the
+    /// `Drag` events that follow can report which one it was — that is the
+    /// whole reason `Gesture` carries one. The raw `on_click`/`on_motion` hooks
+    /// are passed the button by the caller, so they need no state; the gesture
+    /// stream has to derive it.
+    pub fn gesture_button_down(&self, id: usize) -> Option<crate::core::Button> {
+        self.node(id).map(|n| n.pointer.down_button).unwrap_or(None)
+    }
+
+    /// Translate a button number into the [`crate::core::Button`] the gesture
+    /// vocabulary names.
+    ///
+    /// The raw numbering differs between GTK (1 = left), GDI (0 = left) and
+    /// UIKit, which is why `core::Button` exists and why a backend is expected
+    /// to map rather than pass a number through. GTK is the reference here
+    /// because it is the platform whose numbering the other adapters' callers
+    /// were written against; a number outside 1..=3 becomes
+    /// `Button::Other(n - 1)`, and 0 (GDI's left) is treated as left as well,
+    /// so a caller that passes either convention gets a press rather than a
+    /// dropped event.
+    pub fn gesture_button(n: u32) -> crate::core::Button {
+        match n {
+            0 | 1 => crate::core::Button::Primary,
+            2 => crate::core::Button::Middle,
+            3 => crate::core::Button::Secondary,
+            other => crate::core::Button::Other((other - 1) as u8),
+        }
+    }
+
+    /// Translate a GDK-style modifier bitmask into [`crate::core::Modifiers`].
+    ///
+    /// GDK's are 1 = shift, 4 = control (Mod1), 8 = alt (Mod2),
+    /// 64 = super (Mod4). 2 (Mod3, "lock"/alt on some layouts) is
+    /// deliberately ignored: treating it as a modifier would make a Caps Lock
+    /// press look like Alt on the machines where Mod3 is bound to it.
+    pub fn gesture_modifiers(state: u32) -> crate::core::Modifiers {
+        crate::core::Modifiers {
+            shift: state & 1 != 0,
+            ctrl: state & 4 != 0,
+            alt: state & 8 != 0,
+            meta: state & 64 != 0,
+        }
+    }
+
     pub fn set_screen_origin(&mut self, id: usize, origin: Option<(i32, i32)>) {
         if let Some(n) = self.node_mut(id) {
             n.pointer.screen_origin = origin;
@@ -1797,6 +1868,22 @@ impl ZorkState {
         if let Some(n) = self.node_mut(id) {
             n.pointer.click_button = cbs;
         }
+        // A press is the gesture stream's "the drag starts here". Recorded
+        // before the plain click so a gesture handler that inspects the state
+        // already sees the button down.
+        if let Some(n) = self.node_mut(id) {
+            n.pointer.down_button = Some(Self::gesture_button(button));
+        }
+        self.fire_gesture(
+            id,
+            crate::core::Gesture::Button {
+                button: Self::gesture_button(button),
+                pressed: true,
+                x,
+                y,
+                mods: Self::gesture_modifiers(state),
+            },
+        );
         self.pointer_click(id, x, y);
     }
 
@@ -1809,6 +1896,25 @@ impl ZorkState {
         if let Some(n) = self.node_mut(id) {
             n.pointer.motion = cbs;
         }
+        // The gesture stream distinguishes a drag (a button is held) from a
+        // hover (none is), which is exactly the distinction the raw hook cannot
+        // express — GTK delivers plain `motion-notify` only with no button
+        // held, and a host that wanted drags had to add the button-motion mask
+        // and reassemble the events by hand.
+        let down = self.gesture_button_down(id);
+        let gesture = match down {
+            Some(_) => crate::core::Gesture::Drag {
+                x,
+                y,
+                mods: Self::gesture_modifiers(state),
+            },
+            None => crate::core::Gesture::Hover {
+                x,
+                y,
+                mods: Self::gesture_modifiers(state),
+            },
+        };
+        self.fire_gesture(id, gesture);
     }
 
     /// Fire a button release.
@@ -1819,6 +1925,47 @@ impl ZorkState {
         }
         if let Some(n) = self.node_mut(id) {
             n.pointer.release = cbs;
+        }
+        let gesture = crate::core::Gesture::Button {
+            button: Self::gesture_button(button),
+            pressed: false,
+            x,
+            y,
+            mods: Self::gesture_modifiers(state),
+        };
+        self.fire_gesture(id, gesture);
+        // Cleared *after* firing, so a handler that inspects the state during
+        // the release still sees which button it was.
+        if let Some(n) = self.node_mut(id) {
+            n.pointer.down_button = None;
+        }
+    }
+
+    /// Deliver a scroll to the gesture stream as a `Gesture::Scroll`.
+    ///
+    /// A widget's own `on_scroll` keeps its `(vertical, pos)` shape — that is
+    /// a *position*, not a delta, and conflating the two is the mistake the
+    /// `ScrollDelta` type exists to prevent. The gesture stream wants the
+    /// delta, so `dy` is the movement and the two are separate on purpose.
+    pub fn pointer_scroll(&mut self, id: usize, dx: f64, dy: f64, x: f64, y: f64, state: u32) {
+        let gesture = crate::core::Gesture::Scroll {
+            delta: crate::core::ScrollDelta { dx, dy },
+            x,
+            y,
+            mods: Self::gesture_modifiers(state),
+        };
+        self.fire_gesture(id, gesture);
+    }
+
+    /// Fire a gesture at the node's gesture handlers, with the borrow released
+    /// so a handler may re-enter the model.
+    pub fn fire_gesture(&mut self, id: usize, g: crate::core::Gesture) {
+        let mut cbs = self.node_mut(id).map(|n| std::mem::take(&mut n.gesture_cbs)).unwrap_or_default();
+        for cb in cbs.iter_mut() {
+            cb(g);
+        }
+        if let Some(n) = self.node_mut(id) {
+            n.gesture_cbs = cbs;
         }
     }
 
@@ -2414,6 +2561,15 @@ impl ZorkState {
         if let Some(n) = s.node_mut(id) {
             n.pointer.key = key;
             n.pointer.key_raw = raw;
+        }
+    }
+    /// Take a canvas's gesture handlers.
+    pub fn take_gesture_hooks(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut(crate::core::Gesture)>> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.gesture_cbs)).unwrap_or_default()
+    }
+    pub fn put_gesture_hooks(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut(crate::core::Gesture)>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.gesture_cbs = cbs;
         }
     }
     /// Take a scrollable's scroll handlers.

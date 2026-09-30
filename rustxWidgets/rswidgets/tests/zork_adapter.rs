@@ -1372,3 +1372,183 @@ mod global_keys {
         });
     }
 }
+
+/// `Canvas::on_gesture` — the one method GTK and NWG have and zork did not.
+///
+/// The point of the gesture stream is that a caller does not have to
+/// reassemble a drag from three separate hooks, so the tests drive it through
+/// `core::DragTracker` rather than asserting on raw `Gesture` values: a drag
+/// that the tracker does not recognise is a drag a host cannot use.
+mod gestures {
+    use super::*;
+    use std::cell::Cell;
+    use rswidgets::core::{Button, DragTracker, Gesture};
+
+    fn log(seen: &Rc<RefCell<Vec<Gesture>>>) -> impl FnMut(Gesture) + 'static {
+        let s = seen.clone();
+        move |g| s.borrow_mut().push(g)
+    }
+
+    #[test]
+    fn press_motion_release_arrive_as_the_three_gestures() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let c = za::create_canvas().unwrap();
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            c.on_gesture(Box::new(log(&seen)));
+            rswidgets::backends::zork::pointer_click_button(c.id(), 10.0, 20.0, 1, 0);
+            rswidgets::backends::zork::pointer_motion(c.id(), 12.0, 22.0, 0);
+            rswidgets::backends::zork::pointer_release(c.id(), 14.0, 24.0, 1, 0);
+            let got = seen.borrow().clone();
+            assert_eq!(got.len(), 3, "got {got:?}");
+            assert!(matches!(got[0], Gesture::Button { button: Button::Primary, pressed: true, .. }));
+            // The middle one is a *drag*, not a hover: a button is held. This is
+            // the distinction the raw motion hook cannot express.
+            assert!(matches!(got[1], Gesture::Drag { .. }), "got {:?}", got[1]);
+            assert!(matches!(got[2], Gesture::Button { button: Button::Primary, pressed: false, .. }));
+        });
+    }
+
+    #[test]
+    fn motion_with_no_button_is_a_hover() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let c = za::create_canvas().unwrap();
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            c.on_gesture(Box::new(log(&seen)));
+            rswidgets::backends::zork::pointer_motion(c.id(), 5.0, 6.0, 0);
+            assert!(matches!(seen.borrow()[0], Gesture::Hover { .. }));
+        });
+    }
+
+    #[test]
+    fn the_button_is_cleared_after_a_release() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let c = za::create_canvas().unwrap();
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            c.on_gesture(Box::new(log(&seen)));
+            rswidgets::backends::zork::pointer_click_button(c.id(), 0.0, 0.0, 1, 0);
+            rswidgets::backends::zork::pointer_release(c.id(), 5.0, 5.0, 1, 0);
+            rswidgets::backends::zork::pointer_motion(c.id(), 6.0, 6.0, 0);
+            let got = seen.borrow();
+            assert!(matches!(got[2], Gesture::Hover { .. }), "got {:?}", got[2]);
+        });
+    }
+
+    #[test]
+    fn a_drag_is_recognised_by_the_shared_tracker() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let c = za::create_canvas().unwrap();
+            // One tracker fed the whole stream, which is the documented usage:
+            // it accumulates the movement and the press resets it. A fresh
+            // tracker per gesture would never exceed the threshold, because
+            // each Drag would have zero total movement.
+            let tracker = Rc::new(RefCell::new(DragTracker::new()));
+            let drags = Rc::new(RefCell::new(Vec::new()));
+            {
+                let (t, d) = (tracker.clone(), drags.clone());
+                c.on_gesture(Box::new(move |g| {
+                    let mut t = t.borrow_mut();
+                    if let Some(ev) = t.feed(g) {
+                        d.borrow_mut().push((ev.total_dx, ev.total_dy));
+                    }
+                }));
+            }
+            rswidgets::backends::zork::pointer_click_button(c.id(), 100.0, 100.0, 1, 0);
+            rswidgets::backends::zork::pointer_motion(c.id(), 101.0, 100.0, 0);
+            rswidgets::backends::zork::pointer_motion(c.id(), 108.0, 100.0, 0);
+            rswidgets::backends::zork::pointer_release(c.id(), 108.0, 100.0, 1, 0);
+            assert_eq!(
+                *drags.borrow(),
+                vec![(8.0, 0.0)],
+                "an 8px move must clear the 3px threshold and report the total"
+            );
+            // The release ended the drag, so a later motion is a fresh one.
+            rswidgets::backends::zork::pointer_motion(c.id(), 120.0, 100.0, 0);
+            assert_eq!(drags.borrow().len(), 1, "no button held: a hover, not a drag");
+        });
+    }
+
+    #[test]
+    fn modifiers_are_translated_not_passed_through() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let c = za::create_canvas().unwrap();
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            c.on_gesture(Box::new(log(&seen)));
+            // GDK: 1 = shift, 4 = control, 8 = alt, 64 = super.
+            rswidgets::backends::zork::pointer_motion(c.id(), 0.0, 0.0, 1 | 4 | 64);
+            let first = seen.borrow()[0];
+            match first {
+                Gesture::Hover { mods, .. } => {
+                    assert!(mods.shift && mods.ctrl && mods.meta, "got {mods:?}");
+                    assert!(!mods.alt, "bit 8 not set, so alt must be false");
+                }
+                ref other => panic!("expected a hover, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn a_scroll_reaches_the_stream_as_a_delta() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let c = za::create_canvas().unwrap();
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            c.on_gesture(Box::new(log(&seen)));
+            c.scroll_gesture(0.0, -3.0, 40.0, 50.0, 0);
+            let first = seen.borrow()[0];
+            match first {
+                Gesture::Scroll { delta, x, y, .. } => {
+                    // A delta, not a position: a positive dy zooms in.
+                    assert_eq!((delta.dx, delta.dy), (0.0, -3.0));
+                    assert_eq!((x, y), (40.0, 50.0));
+                }
+                ref other => panic!("expected a scroll, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn a_gesture_handler_may_re_enter_the_model() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let c = za::create_canvas().unwrap();
+            let lbl = za::create_label("start").unwrap();
+            let hits = Rc::new(Cell::new(0));
+            {
+                let (h, l) = (hits.clone(), lbl.clone());
+                c.on_gesture(Box::new(move |_| {
+                    h.set(h.get() + 1);
+                    l.set_text("touched");
+                }));
+            }
+            rswidgets::backends::zork::pointer_motion(c.id(), 1.0, 1.0, 0);
+            assert_eq!(hits.get(), 1);
+            assert_eq!(lbl.get_text().as_deref(), Some("touched"));
+            // Still registered afterwards: `on_gesture` is a connect, not a once.
+            assert_eq!(c.gesture_hook_count(), 1);
+            rswidgets::backends::zork::pointer_motion(c.id(), 2.0, 2.0, 0);
+            assert_eq!(hits.get(), 2);
+        });
+    }
+
+    #[test]
+    fn the_raw_hooks_still_fire_alongside_the_gestures() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let c = za::create_canvas().unwrap();
+            let raw = Rc::new(Cell::new(0));
+            let ges = Rc::new(Cell::new(0));
+            {
+                let (r, g) = (raw.clone(), ges.clone());
+                c.on_motion(Box::new(move |_x, _y, _s| r.set(r.get() + 1)));
+                c.on_gesture(Box::new(move |_| g.set(g.get() + 1)));
+            }
+            rswidgets::backends::zork::pointer_motion(c.id(), 3.0, 4.0, 0);
+            assert_eq!((raw.get(), ges.get()), (1, 1), "one event, both callbacks");
+        });
+    }
+}

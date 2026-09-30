@@ -295,19 +295,56 @@ impl Harness {
     }
 
     /// Click with a button/modifier state. Fires the `click_button` hooks first,
-    /// then the plain click hooks (the adapter chain order).
+    /// then the plain click hooks (the adapter chain order), and emits the
+    /// matching `Gesture::Button { pressed: true }`.
     pub fn click_button_at(&self, w: &impl AsId, x: f64, y: f64, button: u32, state: u32) {
         self.state.borrow_mut().pointer_click_button(w.id(), x, y, button, state);
     }
 
-    /// Deliver a pointer-motion event.
+    /// Press a button *without* the click, for a drag test.
+    ///
+    /// [`Self::click_button_at`] is press-and-release in one call, so a drag
+    /// driven through it would have no motion in between with a button held —
+    /// which is exactly the gesture `DragTracker` needs to see. This is the
+    /// press half on its own.
+    pub fn press(&self, w: &impl AsId, x: f64, y: f64, button: u32, state: u32) {
+        self.state.borrow_mut().node_mut(w.id()).map(|n| {
+            n.pointer.down_button = Some(m::ZorkState::gesture_button(button));
+        });
+        m::ZorkState::fire_gesture(
+            &mut self.state.borrow_mut(),
+            w.id(),
+            crate::core::Gesture::Button {
+                button: m::ZorkState::gesture_button(button),
+                pressed: true,
+                x,
+                y,
+                mods: m::ZorkState::gesture_modifiers(state),
+            },
+        );
+    }
+
+    /// Deliver a pointer-motion event, as a `Drag` when a button is held and a
+    /// `Hover` when none is.
     pub fn motion(&self, w: &impl AsId, x: f64, y: f64, state: u32) {
         self.state.borrow_mut().pointer_motion(w.id(), x, y, state);
     }
 
-    /// Deliver a pointer release.
+    /// Deliver a pointer release, clearing any held button.
     pub fn release(&self, w: &impl AsId, x: f64, y: f64, button: u32, state: u32) {
         self.state.borrow_mut().pointer_release(w.id(), x, y, button, state);
+    }
+
+    /// Deliver a scroll to the gesture stream as `Gesture::Scroll`, where `dx`
+    /// and `dy` are *deltas*.
+    ///
+    /// Distinct from [`Self::scroll`], which drives a `ScrolledWindow`'s
+    /// position-reporting hook. A host that wants zoom feeds this into
+    /// `core::ZoomState`; a host that wants a scrollbar uses the other.
+    pub fn scroll_gesture(&self, w: &impl AsId, dx: f64, dy: f64, x: f64, y: f64, state: u32) {
+        self.state
+            .borrow_mut()
+            .pointer_scroll(w.id(), dx, dy, x, y, state);
     }
 
     /// Deliver a key. Returns whether a handler consumed it; a consumed key
@@ -953,6 +990,20 @@ impl Canvas {
     }
     pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
         self.0.state.borrow_mut().add_key_raw_hook(self.0.id, cb);
+    }
+    /// The canonical pointer input: one callback for hover, drag, buttons and
+    /// scroll, as [`crate::core::Gesture`].
+    ///
+    /// Fed by the same `Harness::press` / `motion` / `release` / `scroll`
+    /// actions as the raw hooks, so a test drives one event and both see it.
+    /// Feeding it into a [`crate::core::DragTracker`] is the supported way to
+    /// assert a drag.
+    pub fn on_gesture(&self, cb: impl FnMut(crate::core::Gesture) + 'static) {
+        self.0.state.borrow_mut().add_gesture_hook(self.0.id, Box::new(cb));
+    }
+    /// How many gesture handlers this canvas has.
+    pub fn gesture_hook_count(&self) -> usize {
+        self.0.state.borrow().gesture_hook_count(self.0.id)
     }
     pub fn set_screen_origin(&self, origin: Option<(i32, i32)>) {
         self.0.state.borrow_mut().set_screen_origin(self.0.id, origin);
