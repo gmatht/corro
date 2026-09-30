@@ -7106,6 +7106,14 @@ fn zork_handoff(
     //
     // Opt-in via `CORRO_ZORK_WALKTHROUGH` naming the output path, so an
     // ordinary run is unchanged and the file is only written on request.
+    //
+    // What it writes is a *feature report* -- a [PASS]/[MISS] row per widget --
+    // not a session transcript. Two documents used to share the one filename
+    // `docs/ZORK_WALKTHROUGH.txt`, and whichever ran last won: the report
+    // overwrote the hand-written transcript, which is what commit bd8e326f
+    // spent itself undoing. They are now separate files with separate owners;
+    // this one is the report, and the transcript is written by hand and by
+    // `scripts/zork_walkthrough_cast.sh`.
     if let Some(path) = std::env::var_os("CORRO_ZORK_WALKTHROUGH") {
         match write_zork_walkthrough(&path, &console, &snap, corro_app, shared) {
             Ok(()) => say!("Walkthrough written to {}", path.to_string_lossy()),
