@@ -140,3 +140,16 @@ required-features = ["gtk"]
 [[example]]
 name = "x-sheet"
 required-features = ["gtk"]
+
+# The zork surface needs the zork backend, so it is gated on the feature the
+# way the GTK examples are gated on `gtk`. Without this, `cargo build
+# --examples` under any other feature set fails on an unresolved import — the
+# same "a feature nobody builds" class of rot that backends.yml exists to
+# catch, one level down.
+[[example]]
+name = "zork-sheet"
+required-features = ["zork"]
+
+[[example]]
+name = "zork-demo"
+required-features = ["zork"]

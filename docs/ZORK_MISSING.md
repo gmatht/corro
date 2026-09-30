@@ -282,6 +282,15 @@ faith. `model.rs` is 3889 lines, `harness.rs` 1229, `repl.rs` 1401,
   18 errors, and still not a wasm problem (the default `gtk` feature cfgs
   out the `crate::common::*` types the wasm adapter names). The supported
   invocations are clean at `-D warnings`; see `docs/WASM_MISSING.md`.
+* **`cargo test -p rswidgets --no-default-features --features pancurses`
+  does not compile its two test binaries** — 22 errors, all of them
+  `core::InputEvent` and the `key::*` constants the tests import and a
+  non-pancurses feature set does not provide. Verified byte-identical on
+  `main` (the sorted error lists `comm` to nothing present on only one
+  side), so it is pre-existing and untouched here. `backends.yml`'s
+  pancurses job builds the library and corro and runs corro's `--lib`
+  tests, which do pass; it does not claim the rswidgets test binaries
+  build.
 * CSS-vs-`pdcurses-sys` feature conflicts: a pre-existing, unrelated
   workspace resolution failure (`rustxWidgets/Cargo.lock` has a registry
   `pdcurses-sys 0.7.1` while the repo-root `[patch.crates-io]` points
