@@ -758,3 +758,617 @@ mod spreadsheet {
         });
     }
 }
+
+/// The F9 surface: the fifteen `set_*` calls a pancurses `Spreadsheet` takes,
+/// driven through the adapter and read back off the model.
+///
+/// These exist because the whole point of implementing the surface is that
+/// shared render code can issue the same call on any backend, so the test has
+/// to issue it *through the adapter* and not against the model directly —
+/// otherwise a method that forgot to forward its argument would pass.
+mod sheet_chrome {
+    use super::*;
+
+    #[test]
+    fn every_chrome_field_round_trips() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            ss.set_grid_config(2, 6);
+            ss.set_row_counts(1, 40);
+            ss.set_column_layout(vec![(0, 10, "A".into()), (1, 4, "B".into())]);
+            ss.set_row_labels(vec![(0, "1".into()), (1, "2".into())]);
+            ss.set_border_title("Book1");
+            ss.set_menu_text(" [File]   Edit    Sheet");
+            ss.set_status_text("ready");
+            ss.set_formula_bar_trailing("   ·  saved");
+            ss.set_tab_data(&["Sheet1".to_string(), "Notes".to_string()], 1);
+            ss.set_cursor(3, 4);
+            ss.set_anchor(Some((0, 0)));
+
+            let c = ss.chrome().expect("a spreadsheet has chrome");
+            assert_eq!((c.margin_cols, c.main_cols), (2, 6));
+            assert_eq!((c.header_rows, c.main_rows), (1, 40));
+            assert_eq!(c.column_layout, vec![(0, 10, "A".to_string()), (1, 4, "B".to_string())]);
+            assert_eq!(c.row_labels, vec![(0, "1".to_string()), (1, "2".to_string())]);
+            assert_eq!(c.cursor, (3, 4));
+            assert_eq!(c.anchor, Some((0, 0)));
+            assert_eq!(c.tabs, vec!["Sheet1".to_string(), "Notes".to_string()]);
+            assert_eq!(c.active_tab, 1);
+            assert_eq!(ss.menu_text().as_deref(), Some(" [File]   Edit    Sheet"));
+            assert_eq!(ss.status_text().as_deref(), Some("ready"));
+            assert_eq!(ss.formula_bar_trailing().as_deref(), Some("   ·  saved"));
+            assert_eq!(ss.get_border_title().as_deref(), Some("Book1"));
+        });
+    }
+
+    #[test]
+    fn the_cursor_is_clamped_to_the_sheet() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            ss.set_grid_config(1, 4);
+            ss.set_row_counts(1, 3);
+            // 1 gutter + 4 data columns = 5 addressable; row 1 header + 3 data.
+            ss.set_cursor(99, 99);
+            assert_eq!(ss.cursor_position(), Some((3, 4)), "must not exceed the last cell");
+            // With no geometry configured there is nothing to clamp to, so the
+            // value is kept rather than collapsed to the origin.
+            let bare = za::create_spreadsheet().unwrap();
+            bare.set_cursor(7, 9);
+            assert_eq!(bare.cursor_position(), Some((7, 9)));
+        });
+    }
+
+    #[test]
+    fn tab_index_is_clamped_to_the_list() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            ss.set_tab_data(&["A".to_string(), "B".to_string()], 9);
+            assert_eq!(
+                ss.chrome().unwrap().active_tab,
+                1,
+                "an index past the end must not survive: the widget can only be on a real tab"
+            );
+            ss.set_tab_data(&[], 3);
+            assert!(ss.chrome().unwrap().tabs.is_empty());
+        });
+    }
+
+    #[test]
+    fn formula_bar_takes_the_address_and_entry_widgets() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            let addr = za::create_label("B7").unwrap();
+            let entry = za::create_entry().unwrap();
+            entry.set_text("=SUM(C7:E7)");
+            ss.set_formula_bar(&addr, &entry);
+            assert_eq!(
+                ss.formula_bar(),
+                Some(("B7".to_string(), "=SUM(C7:E7)".to_string()))
+            );
+        });
+    }
+
+    #[test]
+    fn editing_seeds_from_the_cursor_cell_and_commit_writes_it_back() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            ss.set_cell(1, 1, "1200");
+            ss.set_cursor(1, 1);
+            // F2-style start: an empty seed must mean "start from the cell",
+            // not "start blank", or committing destroys the value.
+            ss.set_editing(true, "", 0);
+            let (editing, buf, pos) = ss.edit_state().unwrap();
+            assert!(editing);
+            assert_eq!(buf, "1200");
+            assert_eq!(pos, 0);
+            ss.set_editing(true, "1201", 4);
+            assert_eq!(ss.edit_state().unwrap().1, "1201");
+            assert_eq!(ss.commit_formula_bar(), Some((1, 1, "1201".to_string())));
+            assert_eq!(ss.get_cell(1, 1), Some("1201".to_string()));
+            // Committing again is a no-op: nothing is being edited.
+            assert_eq!(ss.commit_formula_bar(), None);
+            assert!(!ss.edit_state().unwrap().0);
+        });
+    }
+
+    #[test]
+    fn the_caret_is_clamped_to_the_edit_buffer() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            ss.set_editing(true, "abc", 99);
+            assert_eq!(ss.edit_state().unwrap().2, 3, "a stale caret must not survive");
+        });
+    }
+}
+
+/// The F10 surface: the four input hooks, and what they are notified about.
+mod sheet_input {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn setting_the_cursor_notifies_the_move_hook() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            {
+                let s = seen.clone();
+                ss.add_cursor_move_callback(Box::new(move |r, c| s.borrow_mut().push((r, c))));
+            }
+            ss.set_cursor(2, 3);
+            ss.set_cursor(4, 5);
+            assert_eq!(*seen.borrow(), vec![(2, 3), (4, 5)]);
+        });
+    }
+
+    #[test]
+    fn the_move_hook_sees_the_clamped_position() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            ss.set_grid_config(1, 2);
+            ss.set_row_counts(1, 2);
+            let seen = Rc::new(Cell::new((99u32, 99u32)));
+            {
+                let s = seen.clone();
+                ss.add_cursor_move_callback(Box::new(move |r, c| s.set((r, c))));
+            }
+            ss.set_cursor(50, 50);
+            assert_eq!(seen.get(), (2, 2), "the handler must see where the cursor actually went");
+        });
+    }
+
+    #[test]
+    fn commit_notifies_with_the_written_value() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            {
+                let s = seen.clone();
+                ss.add_commit_edit_callback(Box::new(move |r, c, t| s.borrow_mut().push((r, c, t))));
+            }
+            ss.set_cursor(0, 0);
+            ss.set_editing(true, "hello", 5);
+            ss.commit_formula_bar();
+            assert_eq!(*seen.borrow(), vec![(0, 0, "hello".to_string())]);
+            // A second commit fires nothing: the first one ended the edit.
+            ss.commit_formula_bar();
+            assert_eq!(seen.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn a_commit_handler_may_read_the_model_it_just_changed() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            ss.set_cursor(2, 1);
+            // The handler reads the cell through the adapter, which re-enters
+            // the model. If the commit fired under a borrow this would panic.
+            let s2 = ss.clone();
+            let read = Rc::new(RefCell::new(String::new()));
+            {
+                let r = read.clone();
+                ss.add_commit_edit_callback(Box::new(move |_, _, _| {
+                    *r.borrow_mut() = s2.get_cell(2, 1).unwrap_or_default();
+                }));
+            }
+            ss.set_editing(true, "written", 7);
+            ss.commit_formula_bar();
+            assert_eq!(*read.borrow(), "written", "the cell must already hold the value");
+        });
+    }
+
+    #[test]
+    fn goto_and_bare_key_handlers_fire() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let ss = za::create_spreadsheet().unwrap();
+            let gotos = Rc::new(Cell::new(0));
+            let keys = Rc::new(Cell::new(0));
+            {
+                let (g, k) = (gotos.clone(), keys.clone());
+                ss.add_goto_callback(Box::new(move || g.set(g.get() + 1)));
+                ss.add_key_callback(Box::new(move || k.set(k.get() + 1)));
+            }
+            ss.fire_goto();
+            rswidgets::backends::zork::sheet_fire_key(ss.id());
+            assert_eq!((gotos.get(), keys.get()), (1, 1));
+            // Both are persistent: a `connect_*` name promises more than once.
+            ss.fire_goto();
+            rswidgets::backends::zork::sheet_fire_key(ss.id());
+            assert_eq!((gotos.get(), keys.get()), (2, 2));
+            // (key, goto, cursor_move, commit_edit) — this test registered two
+            // of the four.
+            assert_eq!(ss.hook_counts(), Some((1, 1, 0, 0)));
+        });
+    }
+}
+
+/// F4: timers on the model's virtual clock.
+mod timers {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_one_shot_fires_once_and_is_gone() {
+        serial(|| {
+            let ran = Rc::new(Cell::new(0));
+            {
+                let r = ran.clone();
+                za::timeout_add_once(100, Box::new(move || r.set(r.get() + 1))).unwrap();
+            }
+            assert_eq!(za::advance_timers(50), 0, "not due yet");
+            assert_eq!(ran.get(), 0);
+            assert_eq!(za::advance_timers(60), 1, "due at 100ms");
+            assert_eq!(ran.get(), 1);
+            assert_eq!(za::advance_timers(1000), 0, "a one-shot must not re-arm");
+            assert_eq!(ran.get(), 1);
+            assert_eq!(za::timer_count(), 0);
+        });
+    }
+
+    #[test]
+    fn a_repeating_timer_stops_when_its_handler_says_so() {
+        serial(|| {
+            let n = Rc::new(Cell::new(0));
+            {
+                let c = n.clone();
+                za::timeout_add_repeating(50, Box::new(move || {
+                    c.set(c.get() + 1);
+                    c.get() < 3
+                }))
+                .unwrap();
+            }
+            assert_eq!(za::advance_timers(200), 3, "fires every 50ms until the handler returns false");
+            assert_eq!(n.get(), 3);
+            assert_eq!(za::timer_count(), 0, "a timer that said stop must be unregistered");
+        });
+    }
+
+    #[test]
+    fn a_long_jump_fires_a_repeating_timer_once_per_interval() {
+        serial(|| {
+            let n = Rc::new(Cell::new(0));
+            {
+                let c = n.clone();
+                za::timeout_add_repeating(50, Box::new(move || {
+                    c.set(c.get() + 1);
+                    true
+                }))
+                .unwrap();
+            }
+            // Four 50ms intervals inside a 200ms jump. Re-arming from the *end*
+            // of the jump instead of each timer's own deadline would fire it
+            // once and silently skip three — the "catch up, do not replay"
+            // policy. Which is right depends on what the caller means, and for
+            // a main loop reaching successive timeouts the answer is four.
+            assert_eq!(za::advance_timers(200), 4);
+            assert_eq!(n.get(), 4);
+        });
+    }
+
+    #[test]
+    fn a_window_timer_is_cancellable_by_its_handle() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let w2 = za::create_window().unwrap();
+            let n = Rc::new(Cell::new(0));
+            {
+                let c = n.clone();
+                w2.start_repeating_timer(42, 10, Box::new(move || {
+                    c.set(c.get() + 1);
+                    true
+                }))
+                .unwrap();
+            }
+            assert!(za::cancel_timer(42));
+            assert_eq!(za::advance_timers(1000), 0);
+            assert_eq!(n.get(), 0, "a cancelled timer must not fire");
+            assert!(!za::cancel_timer(42), "cancelling twice reports no such handle");
+        });
+    }
+
+    #[test]
+    fn cancelling_one_of_several_leaves_the_others() {
+        serial(|| {
+            let a = Rc::new(Cell::new(0));
+            let b = Rc::new(Cell::new(0));
+            let c = Rc::new(Cell::new(0));
+            {
+                let (x, y, z) = (a.clone(), b.clone(), c.clone());
+                za::timeout_add_repeating(10, Box::new(move || {
+                    x.set(x.get() + 1);
+                    true
+                }))
+                .unwrap();
+                let _w = za::create_window().unwrap();
+                let w = za::create_window().unwrap();
+                w.start_repeating_timer(1, 10, Box::new(move || {
+                    y.set(y.get() + 1);
+                    true
+                }))
+                .unwrap();
+                za::timeout_add_repeating(10, Box::new(move || {
+                    z.set(z.get() + 1);
+                    true
+                }))
+                .unwrap();
+            }
+            assert!(za::cancel_timer(1), "the middle timer, whose removal shifts the later index");
+            za::advance_timers(20);
+            assert!(a.get() >= 1, "the first timer still runs");
+            assert_eq!(b.get(), 0, "the cancelled one does not");
+            assert!(c.get() >= 1, "the last one still runs: its handle must have followed its index");
+        });
+    }
+
+    #[test]
+    fn a_timer_handler_may_touch_the_model() {
+        serial(|| {
+            let _w = za::create_window().unwrap();
+            let lbl = za::create_label("pending").unwrap();
+            let action = za::create_simple_action("app.tick").unwrap();
+            let fired = Rc::new(Cell::new(0));
+            {
+                let f = fired.clone();
+                action.connect_activate(Box::new(move |_| f.set(f.get() + 1))).unwrap();
+            }
+            {
+                let l = lbl.clone();
+                za::timeout_add_once(10, Box::new(move || l.set_text("fired"))).unwrap();
+            }
+            let l2 = lbl.clone();
+            let o = action.clone();
+            za::timeout_add_repeating(
+                20,
+                Box::new(move || {
+                    // Re-entering from inside a timer is what a polling app
+                    // does; a panic here would mean the borrow leaked.
+                    l2.set_text("ticked");
+                    o.activate();
+                    false
+                }),
+            )
+            .unwrap();
+            za::advance_timers(100);
+            assert_eq!(lbl.get_text().as_deref(), Some("ticked"));
+            assert_eq!(fired.get(), 1, "an action fired from inside a timer handler");
+        });
+    }
+}
+
+/// F2: the application action registry.
+mod application {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn an_action_registers_and_activates() {
+        serial(|| {
+            let app = za::create_application().unwrap();
+            let act = za::create_simple_action("app.save").unwrap();
+            let fired = Rc::new(Cell::new(0));
+            {
+                let f = fired.clone();
+                act.connect_activate(Box::new(move |_| f.set(f.get() + 1))).unwrap();
+            }
+            app.add_action(&act).unwrap();
+            assert_eq!(app.actions(), vec!["app.save".to_string()]);
+            act.activate();
+            assert_eq!(fired.get(), 1);
+        });
+    }
+
+    #[test]
+    fn register_refuses_a_non_action() {
+        serial(|| {
+            let app = za::create_application().unwrap();
+            // A non-`SimpleAction` is what the model refuses. The adapter's
+            // `add_action` is typed, so the model is reached directly here:
+            // the point is that the *check* is there, not that the signature
+            // happens to prevent the mistake.
+            let btn = za::create_button("not an action").unwrap();
+            assert_eq!(
+                rswidgets::backends::zork::application_add_action(app.id(), btn.id()),
+                None,
+                "silently accepting a non-action would let a menu item resolve to \
+                 something that can never fire"
+            );
+            assert!(app.actions().is_empty());
+        });
+    }
+
+    #[test]
+    fn two_applications_keep_their_own_action_sets() {
+        serial(|| {
+            let a = za::create_application().unwrap();
+            let b = za::create_application().unwrap();
+            let one = za::create_simple_action("app.one").unwrap();
+            let two = za::create_simple_action("app.two").unwrap();
+            a.add_action(&one).unwrap();
+            b.add_action(&two).unwrap();
+            assert_eq!(a.actions(), vec!["app.one".to_string()]);
+            assert_eq!(b.actions(), vec!["app.two".to_string()]);
+        });
+    }
+
+    #[test]
+    fn register_and_as_ptr_are_answered_not_omitted() {
+        serial(|| {
+            let app = za::create_application().unwrap();
+            assert!(app.register().is_ok(), "a no-op must still report success");
+            assert!(app.as_ptr().is_null(), "there is no GApplication here");
+        });
+    }
+}
+
+/// F8: the tree dump and the redraw cascade.
+mod diagnostics {
+    use super::*;
+
+    #[test]
+    fn the_dump_writes_one_line_per_node() {
+        serial(|| {
+            let w = za::create_window().unwrap();
+            w.set_title("corro");
+            let _bx = za::create_box(za::Orientation::Vertical, 0).unwrap();
+            let lbl = za::create_label("hello").unwrap();
+            lbl.set_size_request(40, 20);
+            let path = std::env::temp_dir().join("zork_dump_test.txt");
+            let path = path.to_str().unwrap();
+            let n = rswidgets::backends::zork::debug_dump_tree(path).expect("dump writes");
+            assert!(n >= 3, "expected the window, box and label, got {n}");
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(text.contains("Window #1 \"corro\""), "got:\n{text}");
+            assert!(text.contains("Label"), "got:\n{text}");
+            // The label is quoted even when empty, so `#3` and a following
+            // word can never run together.
+            assert!(
+                text.lines().all(|l| !l.contains("#2Label")),
+                "a dump line must be splittable by eye:\n{text}"
+            );
+            let _ = std::fs::remove_file(path);
+        });
+    }
+
+    #[test]
+    fn a_dump_of_an_unwritable_path_reports_the_error() {
+        serial(|| {
+            // Reporting this as "0 nodes" would be a lie about a model that has
+            // plenty of nodes in it.
+            let _w = za::create_window().unwrap();
+            let r = rswidgets::backends::zork::debug_dump_tree("/nonexistent-dir-xyz/out.txt");
+            assert!(r.is_err(), "an unwritable path must be an error, not an empty dump");
+        });
+    }
+
+    #[test]
+    fn the_redraw_cascade_reaches_every_descendant() {
+        serial(|| {
+            let w = za::create_window().unwrap();
+            let bx = za::create_box(za::Orientation::Vertical, 0).unwrap();
+            let l1 = za::create_label("one").unwrap();
+            let l2 = za::create_label("two").unwrap();
+            let bx2 = za::create_box(za::Orientation::Vertical, 0).unwrap();
+            let deep = za::create_label("deep").unwrap();
+            bx2.append(&deep);
+            bx.append(&l1);
+            bx.append(&l2);
+            bx.append(&bx2);
+            let n = za::window_queue_redraw_cascades_to_children(w.id());
+            assert_eq!(n, 6, "window, two boxes and three labels");
+            for id in [w.id(), bx.id(), l1.id(), l2.id(), bx2.id(), deep.id()] {
+                assert_eq!(
+                    rswidgets::backends::zork::redraw_count(id),
+                    1,
+                    "every node in the subtree must be marked"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_plain_queue_redraw_marks_only_its_own_node() {
+        serial(|| {
+            let w = za::create_window().unwrap();
+            let lbl = za::create_label("x").unwrap();
+            w.queue_redraw();
+            assert_eq!(rswidgets::backends::zork::redraw_count(w.id()), 1);
+            assert_eq!(
+                rswidgets::backends::zork::redraw_count(lbl.id()),
+                0,
+                "the non-cascading form is documented as marking only itself"
+            );
+        });
+    }
+}
+
+/// F8's other half: `Window::set_layout_cb`, which on NWG hangs off `WM_SIZE`.
+mod layout_callbacks {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn a_layout_callback_receives_the_new_size() {
+        serial(|| {
+            let w = za::create_window().unwrap();
+            let bx = za::create_box(za::Orientation::Horizontal, 0).unwrap();
+            w.set_child(&bx);
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            {
+                let s = seen.clone();
+                w.set_layout_cb(move |width, height| s.borrow_mut().push((width, height)));
+            }
+            rswidgets::backends::zork::layout_box(bx.id(), 0, 0, 320, 240);
+            rswidgets::backends::zork::fire_layout_callbacks(w.id(), 320, 240);
+            assert_eq!(*seen.borrow(), vec![(320, 240)]);
+            // Persistent, like every other `connect_*` on this backend.
+            rswidgets::backends::zork::fire_layout_callbacks(w.id(), 640, 480);
+            assert_eq!(*seen.borrow(), vec![(320, 240), (640, 480)]);
+        });
+    }
+}
+
+/// The process-wide key table that `add_key_callback` needs.
+mod global_keys {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_registered_key_fires_only_its_own_handlers() {
+        serial(|| {
+            let hits = Rc::new(Cell::new(0));
+            {
+                let h = hits.clone();
+                za::add_key_callback('s', Box::new(move || h.set(h.get() + 1)));
+            }
+            assert_eq!(za::key_callback_count('s'), 1);
+            assert_eq!(za::fire_key_callback('q'), 0, "an unregistered key fires nothing");
+            assert_eq!(hits.get(), 0);
+            assert_eq!(za::fire_key_callback('s'), 1);
+            assert_eq!(hits.get(), 1);
+            // Persistent: a `connect_*` name means more than once.
+            za::fire_key_callback('s');
+            assert_eq!(hits.get(), 2);
+        });
+    }
+
+    #[test]
+    fn a_handler_that_registers_another_handler_keeps_it() {
+        serial(|| {
+            let hits = Rc::new(Cell::new(0));
+            {
+                let h = hits.clone();
+                za::add_key_callback(
+                    'x',
+                    Box::new(move || {
+                        h.set(h.get() + 1);
+                    }),
+                );
+            }
+            // Firing takes the handlers out to run them with no borrow held, so
+            // a handler can register more. Putting them back must not clobber
+            // the addition.
+            let more = Rc::new(Cell::new(0));
+            {
+                let (h, m) = (hits.clone(), more.clone());
+                za::add_key_callback('x', Box::new(move || {
+                    let _ = (&h, &m);
+                }));
+            }
+            za::fire_key_callback('x');
+            assert_eq!(hits.get(), 1);
+            assert_eq!(za::key_callback_count('x'), 2, "both handlers survive the round trip");
+            let _ = more;
+        });
+    }
+}

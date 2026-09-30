@@ -802,7 +802,28 @@ pub fn cancel_timer(id: usize) -> bool {
 }
 /// Fire every timer due within `ms` of virtual time. Returns how many fired.
 pub fn advance_timers(ms: u64) -> usize {
-    with_state(|s| s.advance_timers(ms))
+    let mut due = with_state(|s| s.take_due_timers(ms));
+    let mut fired = 0usize;
+    while !due.is_empty() {
+        let mut batch = std::mem::take(&mut due);
+        fired += batch.len();
+        for mut t in batch.drain(..) {
+            let keep = ZorkState::run_timer(&mut t);
+            if keep {
+                // Nothing is borrowed here, so reading the deadline is safe.
+                // It is the time this timer was *due*, not the end of the
+                // jump, so a 50ms timer advanced across 200ms fires four times
+                // as a real main loop would.
+                let at = t.due_at;
+                with_state(|s| s.put_back_timer(t, at));
+            }
+        }
+        // A handler may have registered a zero-delay timer, or re-armed one
+        // that is already due; drain those too rather than stranding them
+        // until the next advance.
+        due = with_state(|s| s.take_due_timers(0));
+    }
+    fired
 }
 pub fn timer_count() -> usize {
     with_state(|s| s.timer_count())

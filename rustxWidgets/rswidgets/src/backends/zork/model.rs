@@ -2659,52 +2659,103 @@ impl ZorkState {
         by_index
     }
 
-    /// Fire every timer due at or before `now + ms`, then leave the clock
-    /// there. Returns how many fired.
+    /// Remove every timer due at or before `now + ms` and return it with the
+    /// clock left at `now + ms`.
     ///
-    /// A handler that returns `false` is unregistered after this firing, and
-    /// one that returns `true` is re-armed `interval_ms` later. Handlers run
-    /// with no `&mut ZorkState` borrow live, so a timer body may touch the
-    /// model — including registering or cancelling another timer, which is why
-    /// the loop re-checks `self.timers.len()` rather than caching a length.
-    pub fn advance_timers(&mut self, ms: u64) -> usize {
+    /// Draining rather than firing is deliberate, and it is the same
+    /// discipline the callback paths use: a timer body routinely touches
+    /// widgets (a poll that redraws, a tick that activates an action), so it
+    /// must not run while a `&mut ZorkState` is live. The facade takes the
+    /// timers, releases the borrow, runs them, and puts back the ones that
+    /// asked to continue — see `facade::advance_timers`.
+    pub fn take_due_timers(&mut self, ms: u64) -> Vec<Timer> {
         let target = self.now_ms + ms;
-        let mut fired = 0usize;
-        // `loop` rather than a snapshot of the timer list: a handler may add a
-        // timer that is already due (`timeout_add_once(0, ..)`), and stopping
-        // at the initial length would leave it unfired forever.
-        loop {
-            let Some(idx) = self
-                .timers
-                .iter()
-                .position(|t| t.due_at <= target)
-            else {
-                break;
-            };
-            let mut timer = self.timers.remove(idx);
-            // Every handle at or above `idx` shifted down by one.
-            for (_, i) in self.timer_ids.iter_mut() {
-                if *i > idx {
-                    *i -= 1;
+        let mut due = Vec::new();
+        // Walk to the end rather than `swap_remove`, so the surviving timers
+        // keep their relative order and `timer_ids` only has to shift the
+        // indices *below* the removal points.
+        let mut i = 0;
+        while i < self.timers.len() {
+            if self.timers[i].due_at <= target {
+                due.push(self.timers.remove(i));
+                // Every index at or above `i` shifted down by one.
+                for (_, idx) in self.timer_ids.iter_mut() {
+                    if *idx >= i {
+                        *idx -= 1;
+                    }
                 }
-            }
-            fired += 1;
-            let mut keep = false;
-            if let Some(mut h) = timer.handler.take() {
-                keep = h();
-            }
-            if let Some(once) = timer.once.take() {
-                once();
-            }
-            if keep {
-                // Re-arm from the *current* clock, not from `due_at`. A
-                // handler that took longer than the interval must not
-                // accumulate a backlog of already-due firings.
-                timer.due_at = target + timer.interval_ms as u64;
-                self.timers.push(timer);
+            } else {
+                i += 1;
             }
         }
         self.now_ms = target;
+        due
+    }
+
+    /// Put a drained timer back, re-armed for its next firing.
+    ///
+    /// `fired_at` is the deadline the timer actually came due at, not the end
+    /// of the jump: re-arming from the end would skip the firings in between,
+    /// so advancing 200ms across a 50ms timer would fire it once where a real
+    /// main loop fires it four times.
+    pub fn put_back_timer(&mut self, mut timer: Timer, fired_at: u64) {
+        timer.due_at = fired_at + timer.interval_ms as u64;
+        self.timers.push(timer);
+    }
+
+    /// Fire a drained timer, and report whether it asked to continue.
+    ///
+    /// Takes `&mut Timer` rather than the timer by value so the caller can put
+    /// the same one back: `Timer` owns its `Box<dyn FnMut>`, and a repeating
+    /// timer that was dropped instead of re-armed would fire exactly once.
+    /// A one-shot's `Box<dyn FnOnce>` is consumed here on purpose — it cannot
+    /// run twice.
+    pub fn run_timer(timer: &mut Timer) -> bool {
+        let keep = match timer.handler.as_mut() {
+            Some(h) => h(),
+            None => false,
+        };
+        if let Some(once) = timer.once.take() {
+            once();
+        }
+        keep
+    }
+
+    /// Fire every timer due within `ms` of model time; returns how many
+    /// fired.
+    ///
+    /// The convenience form for a driver that *owns* the `ZorkState` (the
+    /// REPL) rather than reaching it through the thread-local: it is the same
+    /// take/run/put sequence [`Self::take_due_timers`] splits into, so a timer
+    /// body may touch the model. It cannot be the primary implementation —
+    /// running a handler needs a `&mut ZorkState`, and the borrow is what the
+    /// handler is trying to re-enter — so the primitive is the drain and this
+    /// is the loop around it.
+    ///
+    /// Returns the *total* number of firings, which for a repeating timer is
+    /// more than the number of registered timers: advancing 200ms across a
+    /// 50ms timer fires it four times, because that is what a real main loop
+    /// reaching four timeouts would do. A handler that registers a zero-delay
+    /// timer likewise sees it fire in the same call rather than needing a
+    /// second `advance`.
+    pub fn advance_timers(&mut self, ms: u64) -> usize {
+        let mut due = self.take_due_timers(ms);
+        let mut fired = 0usize;
+        while !due.is_empty() {
+            let mut batch = std::mem::take(&mut due);
+            fired += batch.len();
+            for mut t in batch.drain(..) {
+                let keep = Self::run_timer(&mut t);
+                if keep {
+                    // `Self::run_timer` ran with no other borrow live, so this
+                    // re-arm is safe; `t.due_at` is still the deadline it came
+                    // due at, which is what a re-arm must be measured from.
+                    let at = t.due_at;
+                    self.put_back_timer(t, at);
+                }
+            }
+            due = self.take_due_timers(0);
+        }
         fired
     }
 

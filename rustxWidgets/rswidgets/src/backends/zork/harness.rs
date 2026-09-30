@@ -38,7 +38,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::backends::headless::DrawOp;
-use crate::backends::zork::model::{self as m, MenuItemData, ZorkProps, ZorkState};
+use crate::backends::zork::model::{self as m, MenuItemData, SheetChrome, ZorkProps, ZorkState};
 
 /// Opaque, cloneable handle to a node in the harness model.
 ///
@@ -178,6 +178,12 @@ impl Harness {
     pub fn create_spreadsheet(&self) -> Spreadsheet {
         let id = self.state.borrow_mut().create_spreadsheet();
         Spreadsheet(Widget::new(id, self.state.clone()))
+    }
+    /// An action group, for the F2 surface: `application_add_action` records
+    /// which actions an application holds.
+    pub fn create_application(&self) -> Application {
+        let id = self.state.borrow_mut().create_application();
+        Application(Widget::new(id, self.state.clone()))
     }
     /// Register a named action so a menu item naming it can be dispatched.
     pub fn create_simple_action(&self, name: &str) -> SimpleAction {
@@ -331,8 +337,14 @@ impl Harness {
     }
 
     /// Position a `BoxWidget`'s children along its packing axis.
+    /// Lay a box out, then fire its layout handlers.
+    ///
+    /// Two borrows on purpose, matching `ZorkState::layout_box`'s documented
+    /// contract: positioning is a pure mutation, and the handlers are user
+    /// closures that may re-enter the model.
     pub fn layout_box(&self, w: &impl AsId, x: i32, y: i32, width: i32, height: i32) {
         self.state.borrow_mut().layout_box(w.id(), x, y, width, height);
+        self.fire_layout(w, width, height);
     }
 
     /// Attach a child to a `Grid` cell.
@@ -495,6 +507,170 @@ impl Harness {
     pub fn snapshot_json(&self) -> String {
         serde_json::to_string(&self.state.borrow().snapshot()).expect("snapshot serializes")
     }
+
+    // -- Timers ------------------------------------------------------------
+    //
+    // The model's clock is virtual, so a test advances it explicitly rather
+    // than sleeping. `timeout_add_repeating` returns a handle for
+    // `cancel_timer`; the two `timeout_add_*` free-function forms on the
+    // adapter take no handle because nothing else can cancel them.
+
+    /// Run `f` once, `ms` virtual milliseconds from now.
+    pub fn timeout_add_once<F: FnOnce() + 'static>(&self, ms: u32, f: F) {
+        self.state.borrow_mut().timeout_add_once(ms, Box::new(f));
+    }
+    /// Run `f` every `ms` virtual milliseconds until it returns `false`.
+    pub fn timeout_add_repeating<F: FnMut() -> bool + 'static>(&self, ms: u32, f: F) {
+        self.state.borrow_mut().timeout_add_repeating(ms, Box::new(f));
+    }
+    /// A repeating timer owned by `window`, under a caller-chosen handle.
+    pub fn timeout_add_repeating_for_window<F: FnMut() -> bool + 'static>(
+        &self,
+        window: &impl AsId,
+        id: usize,
+        ms: u32,
+        f: F,
+    ) {
+        self.state.borrow_mut().timeout_add_repeating_for_window(window.id(), id, ms, Box::new(f));
+    }
+    /// Stop the timer registered under `id`. False for an unknown handle.
+    pub fn cancel_timer(&self, id: usize) -> bool {
+        self.state.borrow_mut().cancel_timer(id)
+    }
+    /// Fire every timer due within `ms` of virtual time; returns the count.
+    ///
+    /// The two-phase shape matches the facade's: drain under a borrow, run each
+    /// handler with the `RefCell` **released**, put back the ones that asked to
+    /// continue. A timer body that touches a widget is the normal case, and it
+    /// would panic under a held borrow.
+    pub fn advance_timers(&self, ms: u64) -> usize {
+        let mut due = self.state.borrow_mut().take_due_timers(ms);
+        let mut fired = 0usize;
+        while !due.is_empty() {
+            let mut batch = std::mem::take(&mut due);
+            fired += batch.len();
+            for mut t in batch.drain(..) {
+                let keep = ZorkState::run_timer(&mut t);
+                if keep {
+                    let at = t.due_at;
+                    self.state.borrow_mut().put_back_timer(t, at);
+                }
+            }
+            due = self.state.borrow_mut().take_due_timers(0);
+        }
+        fired
+    }
+    pub fn timer_count(&self) -> usize {
+        self.state.borrow().timer_count()
+    }
+    /// The virtual clock, in milliseconds.
+    pub fn now_ms(&self) -> u64 {
+        self.state.borrow().now_ms()
+    }
+
+    // -- Application -------------------------------------------------------
+
+    /// Register a `SimpleAction` with an `Application`. Returns the action's
+    /// name, or `None` if `action` is not a `SimpleAction`.
+    pub fn application_add_action(
+        &self,
+        app: &impl AsId,
+        action: &impl AsId,
+    ) -> Option<String> {
+        self.state.borrow_mut().application_add_action(app.id(), action.id())
+    }
+    /// The action names registered with an `Application`, in order.
+    pub fn application_actions(&self, app: &impl AsId) -> Vec<String> {
+        self.state.borrow().application_actions(app.id())
+    }
+
+    // -- Process-wide keys -------------------------------------------------
+
+    /// Register a process-wide handler for `key`.
+    pub fn add_key_callback<F: FnMut() + 'static>(&self, key: char, f: F) {
+        self.state.borrow_mut().add_key_callback(key, Box::new(f));
+    }
+    /// Fire the handlers for `key`; returns how many ran.
+    pub fn fire_key(&self, key: char) -> usize {
+        let mut cbs = ZorkState::take_key_callbacks(&mut self.state.borrow_mut(), key);
+        let n = cbs.len();
+        for cb in cbs.iter_mut() {
+            cb();
+        }
+        ZorkState::put_key_callbacks(&mut self.state.borrow_mut(), key, cbs);
+        n
+    }
+    pub fn key_callback_count(&self, key: char) -> usize {
+        self.state.borrow().key_callback_count(key)
+    }
+
+    // -- Layout callbacks --------------------------------------------------
+
+    /// Register a "was (re)laid out" handler, called as `cb(w, h)`.
+    ///
+    /// Fired by [`Harness::layout_box`], not by the model's own method: a
+    /// layout handler is a user closure and must not run under a `&mut
+    /// ZorkState`, which is why the harness sequences the two borrows the same
+    /// way the facade does.
+    pub fn set_layout_callback<F: FnMut(i32, i32) + 'static>(&self, w: &impl AsId, f: F) {
+        self.state.borrow_mut().set_layout_callback(w.id(), Box::new(f));
+    }
+    pub fn layout_callback_count(&self, w: &impl AsId) -> usize {
+        self.state.borrow().layout_callback_count(w.id())
+    }
+    /// Fire `w`'s layout handlers with `(w, h)`.
+    pub fn fire_layout(&self, w: &impl AsId, width: i32, height: i32) {
+        let id = w.id();
+        let mut cbs = ZorkState::take_layout_cbs(&mut self.state.borrow_mut(), id);
+        for cb in cbs.iter_mut() {
+            cb(width, height);
+        }
+        let extra = ZorkState::take_layout_cbs(&mut self.state.borrow_mut(), id);
+        ZorkState::put_layout_cbs(&mut self.state.borrow_mut(), id, cbs);
+        ZorkState::put_layout_cbs_add(&mut self.state.borrow_mut(), id, extra);
+    }
+
+    // -- Redraw cascade ----------------------------------------------------
+
+    /// Bump the redraw counter on `w` and every descendant; returns the count.
+    ///
+    /// GTK's `Window::queue_redraw` invalidates the window and the compositor
+    /// then repaints the subtree; there is no compositor here, so the cascade
+    /// is done explicitly. Without it a host that only expects the window to
+    /// be marked dirty would find nothing happens.
+    pub fn queue_redraw_cascading(&self, w: &impl AsId) -> usize {
+        let mut st = self.state.borrow_mut();
+        let mut stack = vec![w.id()];
+        let mut n = 0usize;
+        while let Some(cur) = stack.pop() {
+            let kids = match st.node_mut(cur) {
+                Some(node) => {
+                    node.pointer.redraws += 1;
+                    n += 1;
+                    node.children.clone()
+                }
+                None => continue,
+            };
+            stack.extend(kids);
+        }
+        n
+    }
+
+    // -- Tree dump ---------------------------------------------------------
+
+    /// Write the widget tree to `path`, one line per node; returns the node
+    /// count, or the `io` error if the path could not be written.
+    ///
+    /// The headless counterpart of NWG's `debug_dump_native_tree`: there is no
+    /// window manager to enumerate, so what gets dumped is the widget tree
+    /// itself — id, kind, label, geometry, visibility, child and callback
+    /// counts. Going through *this* harness's state rather than the
+    /// thread-local singleton is what makes it show the widgets this harness
+    /// built.
+    pub fn debug_dump_tree(&self, path: &str) -> std::io::Result<usize> {
+        let st = self.state.borrow();
+        crate::backends::zork::facade::debug_dump_tree_of(&st, path)
+    }
 }
 
 macro_rules! widget_handle {
@@ -586,6 +762,31 @@ widget_handle!(Fixed);
 widget_handle!(Spreadsheet);
 widget_handle!(SimpleAction);
 widget_handle!(MenuBar);
+widget_handle!(Application);
+
+impl Application {
+    /// Register a `SimpleAction` with this application. Returns the action's
+    /// name, or `None` if it is not a `SimpleAction` — a menu item that
+    /// resolved to a non-action would be a dispatch that can never fire.
+    pub fn add_action(&self, action: &impl AsId) -> Option<String> {
+        self.0.state.borrow_mut().application_add_action(self.0.id, action.id())
+    }
+    /// The action names registered here, in order.
+    pub fn actions(&self) -> Vec<String> {
+        self.0.state.borrow().application_actions(self.0.id)
+    }
+    /// Start a repeating timer owned by this window, under a caller-chosen
+    /// handle. Cancelled with [`Harness::cancel_timer`].
+    pub fn start_repeating_timer<F: FnMut() -> bool + 'static>(
+        &self,
+        harness: &Harness,
+        id: usize,
+        ms: u32,
+        f: F,
+    ) {
+        harness.state.borrow_mut().timeout_add_repeating_for_window(self.0.id, id, ms, Box::new(f));
+    }
+}
 
 impl Window {
     pub fn set_title(&self, title: &str) {
@@ -838,6 +1039,124 @@ impl Spreadsheet {
     }
     pub fn border_title(&self) -> Option<String> {
         self.0.state.borrow().sheet_border_title(self.0.id)
+    }
+
+    // -- Chrome ------------------------------------------------------------
+    //
+    // The F9 surface, on the model rather than through the adapter's free
+    // functions, so a test can drive and read the grid without a thread-local
+    // singleton in the way.
+
+    /// Move the cursor, clamped to the sheet's known extent. Fires the
+    /// cursor-move handlers, so a test can assert the notification.
+    pub fn set_cursor(&self, row: u32, col: u32) {
+        self.0.state.borrow_mut().sheet_set_cursor(self.0.id, row, col);
+    }
+    pub fn cursor(&self) -> Option<(u32, u32)> {
+        self.0.state.borrow().sheet_cursor(self.0.id)
+    }
+    pub fn set_anchor(&self, anchor: Option<(u32, u32)>) {
+        self.0.state.borrow_mut().sheet_set_anchor(self.0.id, anchor);
+    }
+    pub fn set_grid_config(&self, margin_cols: u32, main_cols: u32) {
+        self.0.state.borrow_mut().sheet_set_grid_config(self.0.id, margin_cols, main_cols);
+    }
+    pub fn set_row_counts(&self, header_rows: u32, main_rows: u32) {
+        self.0.state.borrow_mut().sheet_set_row_counts(self.0.id, header_rows, main_rows);
+    }
+    pub fn set_column_layout(&self, layout: Vec<(u32, u32, String)>) {
+        self.0.state.borrow_mut().sheet_set_column_layout(self.0.id, layout);
+    }
+    pub fn set_row_labels(&self, labels: Vec<(u32, String)>) {
+        self.0.state.borrow_mut().sheet_set_row_labels(self.0.id, labels);
+    }
+    pub fn set_menu_text(&self, text: &str) {
+        self.0.state.borrow_mut().sheet_set_menu_text(self.0.id, text);
+    }
+    pub fn set_status_text(&self, text: &str) {
+        self.0.state.borrow_mut().sheet_set_status_text(self.0.id, text);
+    }
+    pub fn set_formula_bar_trailing(&self, text: &str) {
+        self.0.state.borrow_mut().sheet_set_formula_bar_trailing(self.0.id, text);
+    }
+    pub fn set_formula_bar(&self, address: &str, entry: &str) {
+        self.0.state.borrow_mut().sheet_set_formula_bar(self.0.id, address, entry);
+    }
+    pub fn formula_bar(&self) -> Option<(String, String)> {
+        self.0.state.borrow().sheet_formula_bar(self.0.id)
+    }
+    /// The tab strip. `active` is clamped to the list.
+    pub fn set_tab_data(&self, titles: &[String], active: usize) {
+        self.0.state.borrow_mut().sheet_set_tab_data(self.0.id, titles, active);
+    }
+    /// Begin (or end) editing the cursor cell.
+    pub fn set_editing(&self, editing: bool, edit_buf: &str, edit_pos: usize) {
+        self.0.state.borrow_mut().sheet_set_editing(self.0.id, editing, edit_buf, edit_pos);
+    }
+    /// `(editing, buffer, caret)`.
+    pub fn edit_state(&self) -> Option<(bool, String, usize)> {
+        self.0.state.borrow().sheet_edit_state(self.0.id)
+    }
+    /// Commit the in-progress edit, firing the commit handlers. Returns
+    /// `(row, col, text)`, or `None` if nothing was being edited.
+    ///
+    /// The handlers run inside this `borrow_mut`, with the state's own borrow
+    /// *not* held — the same re-entrancy rule the facade follows. A handler
+    /// that re-enters through this harness will panic on the harness's
+    /// `RefCell`, which is the harness's own discipline, not the model's.
+    pub fn commit_edit(&self) -> Option<(u32, u32, String)> {
+        let id = self.0.id;
+        let committed = {
+            let mut st = self.0.state.borrow_mut();
+            st.sheet_commit_edit(id)
+        }?;
+        let mut cbs = ZorkState::take_sheet_commit_hooks(&mut self.0.state.borrow_mut(), id);
+        for cb in cbs.iter_mut() {
+            cb(committed.0, committed.1, committed.2.clone());
+        }
+        ZorkState::put_sheet_commit_hooks(&mut self.0.state.borrow_mut(), id, cbs);
+        Some(committed)
+    }
+    /// The whole chrome, for one assertion over the lot.
+    pub fn chrome(&self) -> Option<SheetChrome> {
+        self.0.state.borrow().sheet_chrome(self.0.id)
+    }
+
+    // -- Input hooks --------------------------------------------------------
+
+    /// `(key, goto, cursor_move, commit_edit)` handler counts.
+    pub fn hook_counts(&self) -> Option<(usize, usize, usize, usize)> {
+        self.0.state.borrow().sheet_hook_counts(self.0.id)
+    }
+    pub fn add_key_callback<F: FnMut() + 'static>(&self, f: F) {
+        self.0.state.borrow_mut().sheet_add_key_callback(self.0.id, Box::new(f));
+    }
+    pub fn add_goto_callback<F: FnMut() + 'static>(&self, f: F) {
+        self.0.state.borrow_mut().sheet_add_goto_callback(self.0.id, Box::new(f));
+    }
+    pub fn add_cursor_move_callback<F: FnMut(u32, u32) + 'static>(&self, f: F) {
+        self.0.state.borrow_mut().sheet_add_cursor_move_callback(self.0.id, Box::new(f));
+    }
+    pub fn add_commit_edit_callback<F: FnMut(u32, u32, String) + 'static>(&self, f: F) {
+        self.0.state.borrow_mut().sheet_add_commit_edit_callback(self.0.id, Box::new(f));
+    }
+    /// Fire the "navigated to a cell" handlers.
+    pub fn fire_goto(&self) {
+        let id = self.0.id;
+        let mut cbs = ZorkState::take_sheet_goto_hooks(&mut self.0.state.borrow_mut(), id);
+        for cb in cbs.iter_mut() {
+            cb();
+        }
+        ZorkState::put_sheet_goto_hooks(&mut self.0.state.borrow_mut(), id, cbs);
+    }
+    /// Fire the bare-keypress handlers.
+    pub fn fire_key(&self) {
+        let id = self.0.id;
+        let mut cbs = ZorkState::take_sheet_key_hooks(&mut self.0.state.borrow_mut(), id);
+        for cb in cbs.iter_mut() {
+            cb();
+        }
+        ZorkState::put_sheet_key_hooks(&mut self.0.state.borrow_mut(), id, cbs);
     }
 }
 
