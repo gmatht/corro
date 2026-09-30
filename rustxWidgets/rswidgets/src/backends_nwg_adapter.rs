@@ -1695,7 +1695,15 @@ mod nwg_adapter {
         r
     }
 
-    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    /// Measures a STATIC control's text, for shrink-to-fit layout.
+    ///
+    /// Split from the public wrapper so the call could be bracketed with the
+    /// ReactOS entry/exit tracing without the wrapper growing a second body.
+    /// Nothing here is toolchain-specific: it is plain Win32 `GetClassNameW` /
+    /// `GetWindowTextW` / `GetTextExtentPoint32W` against the control's own
+    /// `WM_GETFONT`, so it is available on every Windows target. Gating it on
+    /// one toolchain left the (ungated) caller in `layout` uncompilable
+    /// everywhere else.
     fn static_text_width_inner(hwnd: winapi::shared::windef::HWND) -> Option<i32> {
         unsafe {
             let mut cls: [u16; 256] = [0; 256];
