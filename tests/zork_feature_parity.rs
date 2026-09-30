@@ -24,17 +24,30 @@
 //!   methods), which is the level the existing `rswidgets/tests/zork_adapter.rs`
 //!   uses. It is the right level for "does this method do anything", because a
 //!   method that forgets to pass its arguments through is caught here.
-//! * The walkthrough drives corro's *whole* GUI construction path and reads
-//!   the result out of a real run. It is the right level for "does the app
-//!   actually build this", which no adapter-level test can show.
+//! * The feature report records corro's *whole* GUI construction path — what
+//!   the app builds, read out of a real run. It is the right level for "does
+//!   the app actually build this", which no adapter-level test can show.
 //!
-//! # Artifacts
+//! # The record, and why this suite never writes it
 //!
-//! [`zork_walkthrough_covers_every_feature`] runs the real binary and writes
-//! `ZORK_WALKTHROUGH.txt` at the repo root: a plain-text, per-feature record of
-//! what the backend built, with `PASS`/`MISS`/`N/A` per row. The remaining
-//! tests assert against the same run's tree, so a regression fails the test
-//! *and* leaves a diffable file showing which feature went.
+//! `docs/ZORK_FEATURE_REPORT.txt` is a plain-text, per-feature record of what
+//! corro built, with `PASS`/`MISS`/`N/A` per row, and every test here asserts
+//! against it. `docs/ZORK_WALKTHROUGH.txt` beside it is a hand-written
+//! transcript of real REPL sessions.
+//!
+//! **This suite reads those files and never writes them.** It used to: it set
+//! `CORRO_ZORK_WALKTHROUGH` to the report's committed path, ran the real
+//! binary, and the binary overwrote the file — so every plain `cargo test`
+//! replaced a committed record with a fresh one and then passed by asserting
+//! against what it had just written. The replacement was plausible enough to
+//! survive two rounds of `git add -A` before anyone noticed a document had
+//! vanished; see `git show bd8e326f`, which spent itself undoing the first
+//! round.
+//!
+//! Regenerating is therefore not a mode of this suite. It is a deliberate act:
+//! run the binary with `CORRO_ZORK_WALKTHROUGH` naming the report, then review
+//! the diff. There is no code path here that opens a file for writing, so no
+//! environment variable and no future edit can make a run mutate the tree.
 //!
 //! Requires: nothing. No X server, no OCR, no GTK — that is the point.
 //!   cargo test --features zork --no-default-features --test zork_feature_parity
@@ -42,11 +55,9 @@
 #![cfg(feature = "zork")]
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::Duration;
 
 // ---------------------------------------------------------------------------
-// Running the real app
+// Reading the committed record
 // ---------------------------------------------------------------------------
 
 /// The recorded walkthrough's home: `docs/`, alongside the other committed
@@ -55,56 +66,39 @@ fn docs_dir() -> PathBuf {
     repo_root().join("docs")
 }
 
-/// The feature report the app writes when `CORRO_ZORK_WALKTHROUGH` names a
-/// path: one `[PASS]`/`[MISS]` row per widget, plus the backend's own console
-/// output as its first section.
+/// The committed feature report: one `[PASS]`/`[MISS]` row per widget, plus
+/// the backend's own console output as its first section.
 ///
-/// # Why this is not `docs/ZORK_WALKTHROUGH.txt`
+/// # This test never writes it
 ///
-/// It was, alongside a hand-written verbatim transcript under the same name,
-/// and because this report is generated *by the test that reads it*, it always
-/// won: a plain `cargo test` replaced the transcript with the report, and then
-/// passed by asserting against the file it had just written. The replacement
-/// was not obviously wrong — a 200-line generated report in place of a
-/// 350-line session transcript — which is how it survived two rounds of
-/// `git add -A` before commit bd8e326f identified it.
+/// It used to. `run_app_and_read_walkthrough` set `CORRO_ZORK_WALKTHROUGH`
+/// to this path and ran the real binary, which overwrote the file — so every
+/// plain `cargo test` replaced a committed record with a fresh one, and then
+/// passed by asserting against what it had just written. Measured on main: a
+/// 352-line document became a 202-line one, with no error and no failure.
 ///
-/// So they are separate documents, each with one owner:
+/// Two documents wanted one filename (that one and the hand-written
+/// transcript beside it), the generator won because it is written by the test
+/// that reads it, and the damage was plausible enough to be committed twice.
+/// The filenames are separate now; see `docs/ZORK_WALKTHROUGH.txt`.
 ///
-/// * `docs/ZORK_WALKTHROUGH.txt` — the transcript. Hand-written, quoting real
-///   sessions, and the one a reader starts with.
-/// * `docs/ZORK_FEATURE_REPORT.txt` — this. Machine-written, regenerated on
-///   request, and the one the assertions below parse.
-///
-/// Both are committed because both are *records*: a reviewer diffing them
-/// between changes sees exactly what moved.
+/// Regeneration is not a mode of this test. It is a deliberate act: run the
+/// binary with the env var naming the report, and review the diff. A test that
+/// can rewrite its own expectation is a test that can agree with itself
+/// without anything having been verified.
 const WALKTHROUGH: &str = "ZORK_FEATURE_REPORT.txt";
 
-/// Where the report is written during a test run.
+/// The committed report, read.
 ///
-/// A plain `cargo test` reads the committed report and writes **nothing**. It
-/// used to write straight into `docs/`, which is what made the clobbering
-/// invisible — see the note on [`WALKTHROUGH`]. Regenerate the record with
-/// `CORRO_ZORK_WALKTHROUGH_WRITE=1`, and what you get back is a real diff to
-/// review rather than an accident to notice later.
-fn walkthrough_out_path() -> PathBuf {
-    if std::env::var_os("CORRO_ZORK_WALKTHROUGH_WRITE").is_some() {
-        docs_dir().join(WALKTHROUGH)
-    } else {
-        std::env::temp_dir().join(format!(
-            "corro_zork_feature_report_{}.txt",
-            std::process::id()
-        ))
-    }
-}
-
-/// Read the committed report without regenerating it.
+/// Read-only by construction: there is no code path in this file that opens a
+/// file for writing, so no environment variable, no stray cwd, and no future
+/// edit can make a run mutate the tree.
 fn committed_walkthrough() -> String {
     std::fs::read_to_string(docs_dir().join(WALKTHROUGH)).unwrap_or_else(|e| {
         panic!(
             "{} must be committed and readable ({e}). It is a *record*, not a \
-             log: regenerate it with CORRO_ZORK_WALKTHROUGH_WRITE=1 cargo test \
-             --no-default-features --features zork --test zork_feature_parity",
+             log: regenerate it by running the binary with \
+             CORRO_ZORK_WALKTHROUGH naming that path",
             docs_dir().join(WALKTHROUGH).display()
         )
     })
@@ -115,126 +109,15 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The built `corro` binary.
+/// The report, from one shared read.
 ///
-/// `CORRO_TEST_BIN` overrides it, for the same reason the GTK suite has it:
-/// `cargo test` may rebuild `target/debug/corro` under different features
-/// mid-run, so the default path is only trustworthy when nothing else is
-/// building.
-fn corro_bin() -> PathBuf {
-    std::env::var("CORRO_TEST_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| repo_root().join("target/debug/corro"))
-}
-
-/// Build the app for `--features zork`, once per test process.
-///
-/// Without this the suite would fail with a confusing "No such file" for a
-/// feature set nobody has built in this session, which is exactly the trap that
-/// let zork sit broken for so long. Building here makes the failure mode the
-/// honest one: a compile error.
-///
-/// It builds *unconditionally* rather than only when the binary is missing.
-/// The first version returned early if the file existed, which meant a stale
-/// binary from an earlier build kept being exercised: a probe deliberately
-/// broken in the generator still reported `PASS`, because the walkthrough came
-/// from a binary that predated the break. An existence check is not a freshness
-/// check, and for a test whose whole subject is "does the code under test still
-/// do this" the second is the one that matters. `OnceLock` keeps it to one
-/// build per process however many tests need it.
-fn ensure_binary() -> &'static PathBuf {
-    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    BIN.get_or_init(|| {
-    let bin = corro_bin();
-    let always = std::env::var_os("CORRO_TEST_ALLOW_STALE").is_some();
-    if bin.exists() && always {
-        return bin;
-    }
-    let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .args(["build", "--features", "zork", "--no-default-features"])
-        .current_dir(repo_root())
-        .status()
-        .expect("run cargo build for the zork feature");
-    assert!(status.success(), "cargo build --features zork failed");
-    bin
-    })
-}
-
-/// Run the real app once and return the tree it built, plus the walkthrough text.
-///
-/// The subprocess is necessary and not merely convenient: `run_gui` hands the
-/// model to the REPL via `take_state()`, which *moves* it out of the
-/// thread-local singleton. So by the time `App::run` returns, the ~98 widgets
-/// corro built are gone from the observable state, and an in-process test would
-/// assert against an empty model. Anything that wants to see the built tree has
-/// to look while it is still live — which is why `zork_handoff` writes the
-/// walkthrough on the way past, and why the adapter-level tests below drive the
-/// model directly instead.
-///
-/// `quit` on stdin ends the REPL at once, so the run is bounded and needs no
-/// terminal.
-fn run_app_and_read_walkthrough(out_path: &PathBuf) -> String {
-    let bin = ensure_binary();
-    let _ = std::fs::remove_file(out_path);
-
-    let mut child = Command::new(&bin)
-        .env("CORRO_ZORK_WALKTHROUGH", out_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn {:?}: {e}", bin));
-
-    // `quit` is a REPL command; without it the run would block on stdin.
-    {
-        use std::io::Write;
-        let mut sin = child.stdin.take().expect("child stdin");
-        let _ = writeln!(sin, "quit");
-        // Drop closes the pipe, so the REPL also sees EOF if `quit` is missed.
-    }
-    // A generous deadline: this is a full app construction plus a draw pass.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the zork run did not exit within 120s; it is probably blocked on the REPL"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.wait();
-
-    std::fs::read_to_string(out_path).unwrap_or_else(|e| {
-        panic!(
-            "{} was not written ({e}). Is CORRO_ZORK_WALKTHROUGH honoured by this build?",
-            out_path.display()
-        )
-    })
-}
-
-/// The walkthrough from a single shared run.
-///
-/// Built once: the app takes a moment to construct its tree, and every test
-/// here reads the *same* run, which is also what makes the assertions
-/// consistent with each other. A second run could differ (a timestamp, a
-/// cursor settled at a different place), and then two tests would disagree
-/// about one tree.
-///
-/// `OnceLock` rather than a `static Mutex` because the value is immutable once
-/// computed and the lock would only add a failure mode.
+/// Read once because every test here reads the *same* document and the
+/// assertions have to be consistent with each other. `OnceLock` rather than a
+/// `static Mutex` because the value is immutable once read, and the lock would
+/// only add a failure mode.
 fn walkthrough() -> &'static str {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    TEXT.get_or_init(|| {
-        // Opt in to rewriting the committed record; otherwise read it as-is.
-        // See `walkthrough_out_path` for why that distinction is the whole fix.
-        if std::env::var_os("CORRO_ZORK_WALKTHROUGH_WRITE").is_some() {
-            run_app_and_read_walkthrough(&walkthrough_out_path())
-        } else {
-            committed_walkthrough()
-        }
-    })
+    TEXT.get_or_init(committed_walkthrough)
 }
 
 /// The value of a `[MARK] feature` row's detail column, if the row exists.
@@ -304,7 +187,8 @@ fn zork_walkthrough_is_recorded() {
     assert!(
         docs_dir().join(WALKTHROUGH).exists(),
         "the feature report must be committed under docs/ so it is reviewable \
-         and committable; regenerate it with CORRO_ZORK_WALKTHROUGH_WRITE=1"
+         and committable. Regenerate it by running the binary with \
+         CORRO_ZORK_WALKTHROUGH naming this path — never from a test."
     );
     // The transcript is a separate artefact and must survive a test run. This
     // is the assertion that catches the two documents colliding again: it
@@ -1167,41 +1051,148 @@ fn app_state_is_reported() {
 // 10. The artefact is stable enough to diff
 // ---------------------------------------------------------------------------
 
-/// Two runs produce the same walkthrough, so a reviewer can diff one against
-/// another and read a difference as a behaviour change.
+/// The report carries nothing that moves between runs, so a reviewer can diff
+/// two of them and read a difference as a behaviour change.
 ///
-/// This is what makes the file worth keeping in the tree: without determinism
-/// it would be a snapshot to distrust rather than a record to diff. Anything
-/// legitimately variable (a timestamp, a settled cursor) would trip this, which
-/// is the point — the generator must not include it.
+/// That is what makes the file worth keeping in the tree: without determinism
+/// it would be a snapshot to distrust rather than a record to diff.
+///
+/// # This asserts the committed text, it does not regenerate
+///
+/// The determinism question — "does two *runs* produce the same bytes?" — is
+/// answered by running the binary twice and diffing, which is a deliberate
+/// act, not something a test should do to the artefact it is checking. It
+/// used to run the app a second time here and write to a temp path, and that
+/// is the same machinery that overwrote the committed report on every run.
+///
+/// So this checks the property that can be checked without generating: no
+/// field that varies between runs has leaked into the record. A timestamp, a
+/// path, a pid or a settled cursor would each be caught here.
 #[test]
-fn walkthrough_is_deterministic() {
-    let first = walkthrough().to_string();
-    // A private path: this test must not remove the shared artefact, or it
-    // races the other tests reading it.
-    let second = run_app_and_read_walkthrough(&std::env::temp_dir().join(format!(
-        "corro-zork-walkthrough-2-{}.txt",
-        std::process::id()
-    )));
-    let _ = std::fs::remove_file(std::env::temp_dir().join(format!(
-        "corro-zork-walkthrough-2-{}.txt",
-        std::process::id()
-    )));
-    if first != second {
-        // Show the first differing line rather than two whole files.
-        let a: Vec<&str> = first.lines().collect();
-        let b: Vec<&str> = second.lines().collect();
-        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-            if x != y {
-                panic!(
-                    "the walkthrough is not deterministic, so it cannot be diffed.\n\
-                     First difference at line {}:\n  run 1: {x}\n  run 2: {y}\n\
-                     Either the app is nondeterministic (exclude the varying field) \
-                     or the generator reads something that moves.",
-                    i + 1
-                );
+fn report_carries_nothing_that_moves_between_runs() {
+    let text = walkthrough();
+
+    for (what, pattern) in [
+        ("a 4-digit year", r"\b20[0-9]{2}-[0-9]{2}-[0-9]{2}\b"),
+        ("a wall-clock time", r"\b[0-9]{2}:[0-9]{2}:[0-9]{2}\b"),
+        ("an absolute path", r"/(?:home|root|tmp|Users|private)/"),
+        ("a process id", r"\bpid[ =:]+\d+\b"),
+    ] {
+        assert!(
+            !regex_lite::is_match(pattern, text),
+            "the report contains {what}, which changes between runs, so a diff \
+             of two reports cannot be read as a behaviour change:\n{}",
+            first_match_line(pattern, text).unwrap_or_default()
+        );
+    }
+
+    // The census is a whole number of widgets, and it is stated identically
+    // wherever it appears. A count that renders differently depending on what
+    // else is in the document is a count with something else in it.
+    let counts: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("Widgets built:"))
+        .collect();
+    assert!(
+        counts.len() == 1,
+        "the census must be stated once, so a reader knows which number is the \
+         one; found {}: {counts:?}",
+        counts.len()
+    );
+    let n: usize = counts[0]
+        .split_whitespace()
+        .nth(2) // "Widgets" "built:" "91"
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("cannot read a widget count from {:?}", counts[0]));
+    assert!(n > 0, "corro builds widgets before the REPL starts; {n} means none");
+}
+
+/// The first line of `text` matching `pattern`, for a failure message.
+fn first_match_line(pattern: &str, text: &str) -> Option<String> {
+    text.lines()
+        .find(|l| regex_lite::is_match(pattern, l))
+        .map(|l| l.to_string())
+}
+
+/// The handful of patterns used above.
+///
+/// Not a regex dependency for four fixed patterns. Each is deliberately
+/// literal rather than a character class, so there is nothing here that could
+/// be misread as a general matcher, and the set is short enough to read.
+mod regex_lite {
+    pub fn is_match(pattern: &str, text: &str) -> bool {
+        match pattern {
+            // \b20[0-9]{2}-[0-9]{2}-[0-9]{2}\b
+            r"\b20[0-9]{2}-[0-9]{2}-[0-9]{2}\b" => has_iso_date(text),
+            // \b[0-9]{2}:[0-9]{2}:[0-9]{2}\b
+            r"\b[0-9]{2}:[0-9]{2}:[0-9]{2}\b" => has_clock_time(text),
+            r"/(?:home|root|tmp|Users|private)/" => has_absolute_path(text),
+            r"\bpid[ =:]+\d+\b" => has_pid(text),
+            _ => false,
+        }
+    }
+
+    /// `20NN-NN-NN`, the shape an ISO date takes. Character-class free on
+    /// purpose: digits are checked by `is_ascii_digit`.
+    fn has_iso_date(text: &str) -> bool {
+        let b = text.as_bytes();
+        for i in 0..b.len().saturating_sub(10) {
+            if b[i] == b'2'
+                && b[i + 1] == b'0'
+                && b[i + 2].is_ascii_digit()
+                && b[i + 3].is_ascii_digit()
+                && b[i + 4] == b'-'
+                && b[i + 5].is_ascii_digit()
+                && b[i + 6].is_ascii_digit()
+                && b[i + 7] == b'-'
+                && b[i + 8].is_ascii_digit()
+                && b[i + 9].is_ascii_digit()
+            {
+                return true;
             }
         }
-        panic!("walkthroughs differ in length but share a prefix: {} vs {} lines", a.len(), b.len());
+        false
+    }
+
+    /// `NN:NN:NN`, likewise.
+    fn has_clock_time(text: &str) -> bool {
+        let b = text.as_bytes();
+        for i in 0..b.len().saturating_sub(8) {
+            if b[i] == b':'
+                && b[i + 1] == b':'
+                && b[i - 3].is_ascii_digit()
+                && b[i - 2].is_ascii_digit()
+                && b[i - 4].is_ascii_digit()
+                && b[i - 5].is_ascii_digit()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// An absolute path under a home or temp root: the shape that leaks a
+    /// developer's checkout into a committed record.
+    fn has_absolute_path(text: &str) -> bool {
+        ["/home/", "/root/", "/tmp/", "/Users/", "/private/"]
+            .iter()
+            .any(|p| text.contains(p))
+    }
+
+    fn has_pid(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        let mut at = 0usize;
+        while let Some(found) = lower[at..].find("pid") {
+            let start = at + found + 3;
+            let rest = &lower[start..];
+            let trimmed = rest.trim_start_matches([' ', '=', ':']);
+            if trimmed.len() > rest.len() {
+                if trimmed.starts_with(|c: char| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+            at = start;
+        }
+        false
     }
 }
