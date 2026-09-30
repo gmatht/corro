@@ -211,6 +211,92 @@ pub struct SheetCell {
     pub raw: bool,
 }
 
+/// The spreadsheet's chrome: everything a `Spreadsheet` shows *around* the
+/// cells.
+///
+/// A cell grid is the data; this is the rest of the widget — the cursor, the
+/// in-progress edit, the column layout, the row labels, the tab strip, the
+/// status line, the formula bar. GTK's and pancurses' `Spreadsheet` all take
+/// these through `set_*` calls, and corro's render path issues every one of
+/// them on each frame, so a model without them can only answer "no" or
+/// "silently ignore it". Holding them here makes each `set_*` answerable and
+/// the whole state snapshot-comparable.
+///
+/// Every field defaults to the "nothing configured" value, so a spreadsheet
+/// created and immediately snapshotted is identical to one that has never been
+/// touched — the same discipline [`ZorkProps`] follows.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SheetChrome {
+    /// The cursor cell, 0-based `(row, col)`. Defaults to the origin.
+    pub cursor: (u32, u32),
+    /// The drag anchor, 0-based. `None` until a selection starts.
+    pub anchor: Option<(u32, u32)>,
+    /// Whether the cursor cell is being edited.
+    pub editing: bool,
+    /// The in-progress edit buffer and the caret inside it.
+    pub edit_buf: String,
+    pub edit_pos: usize,
+    /// `margin_cols` = the width of the row-label gutter; `main_cols` = the
+    /// number of data columns.
+    pub margin_cols: u32,
+    pub main_cols: u32,
+    /// `header_rows` (the frozen header band) and `main_rows` (data rows).
+    pub header_rows: u32,
+    pub main_rows: u32,
+    /// Per-column layout as `(index, width_chars, title)`, in display order.
+    pub column_layout: Vec<(u32, u32, String)>,
+    /// Row labels as `(row_index, label)`.
+    pub row_labels: Vec<(u32, String)>,
+    /// The tab strip: titles plus the active tab's index.
+    pub tabs: Vec<String>,
+    pub active_tab: usize,
+    /// The menu-bar line drawn along the top of the sheet.
+    pub menu_text: String,
+    /// The status line.
+    pub status_text: String,
+    /// The trailing part of the formula bar (e.g. a "· ready" note).
+    pub formula_bar_trailing: String,
+    /// The formula bar's address cell and entry text, set by `set_formula_bar`.
+    pub formula_address: String,
+    pub formula_entry: String,
+}
+
+/// The four input events a `Spreadsheet` accepts, as the other backends
+/// define them.
+///
+/// This mirrors `backends_pancurses`' `add_key_callback` /
+/// `add_goto_callback` / `add_cursor_move_callback` /
+/// `add_commit_edit_callback` group, which is the one spreadsheet input model
+/// in this crate that is not a set of bare setter calls. Each field is the list
+/// of handlers for that event; every one is fired with the model's borrow
+/// released, so a handler may call back into the widget.
+#[allow(clippy::type_complexity)]
+#[derive(Default)]
+pub struct SheetInput {
+    /// Fired for a bare keypress with no cell argument — a function key, a
+    /// shortcut, anything that is not a cursor move.
+    pub key: Vec<Box<dyn FnMut()>>,
+    /// Fired when the user navigates to a cell (arrow keys, Tab, a name typed
+    /// into the name box) *without* editing it.
+    pub goto: Vec<Box<dyn FnMut()>>,
+    /// Fired when the cursor lands on a new cell, as `(row, col)`.
+    pub cursor_move: Vec<Box<dyn FnMut(u32, u32)>>,
+    /// Fired when an in-progress edit is committed to a cell, as
+    /// `(row, col, text)`.
+    pub commit_edit: Vec<Box<dyn FnMut(u32, u32, String)>>,
+}
+
+impl std::fmt::Debug for SheetInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SheetInput")
+            .field("key", &self.key.len())
+            .field("goto", &self.goto.len())
+            .field("cursor_move", &self.cursor_move.len())
+            .field("commit_edit", &self.commit_edit.len())
+            .finish()
+    }
+}
+
 pub struct ZorkNode {
     pub id: usize,
     pub kind: ZorkKind,
@@ -236,6 +322,14 @@ pub struct ZorkNode {
     pub response_cbs: Vec<Box<dyn FnMut(i32)>>,
     /// Spreadsheet cell contents, keyed 1-based by `(row, col)`.
     pub cells: HashMap<(u32, u32), SheetCell>,
+    /// Spreadsheet chrome: cursor, edit state, column layout, labels, tabs,
+    /// status and formula bar. See [`SheetChrome`].
+    pub chrome: SheetChrome,
+    /// The spreadsheet's *input* hooks — the four ways a driver tells a
+    /// spreadsheet what the user did. Kept out of `cells`/`chrome` because they
+    /// are behaviours, not state: GTK and pancurses route them through
+    /// `on_key`/`on_gesture` signal handlers, and corro registers one of each.
+    pub sheet_input: SheetInput,
     /// Dialog buttons as `(label, response_id)`, and the default response id.
     pub dialog_buttons: Vec<(String, i32)>,
     pub dialog_default_response: Option<i32>,
@@ -259,6 +353,73 @@ pub struct ZorkNode {
     /// lists are untouched, because an earlier attempt to also de-duplicate
     /// the re-materialised submenu nodes cost 53 menu items (132 -> 79).
     pub menu_label: Option<String>,
+}
+
+impl ZorkKind {
+    /// The kind's name, as the REPL and the snapshot both call it.
+    ///
+    /// One definition rather than a `match` in each place: the snapshot's
+    /// `kind` string and `debug_dump_tree`'s prefix must not be able to drift
+    /// apart, because a snapshot test that asserts `"Spreadsheet"` would then
+    /// pass against a dump that prints something else.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ZorkKind::Window { .. } => "Window",
+            ZorkKind::Button { .. } => "Button",
+            ZorkKind::Label { .. } => "Label",
+            ZorkKind::BoxWidget { .. } => "BoxWidget",
+            ZorkKind::Grid { .. } => "Grid",
+            ZorkKind::Entry { .. } => "Entry",
+            ZorkKind::CheckButton { .. } => "CheckButton",
+            ZorkKind::RadioButton { .. } => "RadioButton",
+            ZorkKind::Dialog { .. } => "Dialog",
+            ZorkKind::Menu => "Menu",
+            ZorkKind::MenuBar => "MenuBar",
+            ZorkKind::SimpleAction => "SimpleAction",
+            ZorkKind::DropDown { .. } => "DropDown",
+            ZorkKind::TextView { .. } => "TextView",
+            ZorkKind::Canvas { .. } => "Canvas",
+            ZorkKind::Overlay => "Overlay",
+            ZorkKind::ScrolledWindow => "ScrolledWindow",
+            ZorkKind::Fixed => "Fixed",
+            ZorkKind::Application => "Application",
+            ZorkKind::Spreadsheet { .. } => "Spreadsheet",
+        }
+    }
+}
+
+/// A pending timer, as `timeout_add_once` / `timeout_add_repeating` register
+/// one.
+///
+/// `due_at` is *virtual* elapsed milliseconds, not wall-clock: the model has
+/// no clock, because a test that waits 200 ms of real time to observe a timer
+/// is a slow test that can still flake. Instead the driver advances the clock
+/// explicitly with [`ZorkState::advance_timers`], which is the headless
+/// equivalent of the main loop reaching the timeout.
+pub struct Timer {
+    /// Virtual milliseconds since model creation when this fires next.
+    pub due_at: u64,
+    pub interval_ms: u32,
+    /// The handler. `Some` for a repeating timer (it decides whether to stay
+    /// registered); `None` for a one-shot, whose handler has already been
+    /// consumed.
+    pub handler: Option<Box<dyn FnMut() -> bool>>,
+    /// The one-shot handler, consumed on the first firing.
+    pub once: Option<Box<dyn FnOnce()>>,
+    /// The window that owns this timer, when it was started through
+    /// `Window::start_repeating_timer`. `None` for a process-wide timer.
+    pub window_id: Option<usize>,
+}
+
+impl std::fmt::Debug for Timer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Timer")
+            .field("due_at", &self.due_at)
+            .field("interval_ms", &self.interval_ms)
+            .field("repeating", &self.handler.is_some())
+            .field("window_id", &self.window_id)
+            .finish()
+    }
 }
 
 /// The pointer and key callbacks a `Canvas`/`Entry` can carry.
@@ -345,6 +506,13 @@ pub struct SnapshotNode {
     pub redraws: u32,
     /// Spreadsheet cells as `(row, col, text, style, raw)`.
     pub cells: Vec<SheetCellEntry>,
+    /// The spreadsheet's chrome. `None` for a node that is not a spreadsheet,
+    /// so a non-spreadsheet node does not carry an all-defaults bag that
+    /// would read as "configured" in a snapshot diff.
+    pub chrome: Option<SheetChrome>,
+    /// Spreadsheet input hook counts, as `(key, goto, cursor_move,
+    /// commit_edit)`. `None` for a non-spreadsheet node.
+    pub sheet_hooks: Option<(usize, usize, usize, usize)>,
     /// Dialog buttons as `(label, response_id)`.
     pub dialog_buttons: Vec<(String, i32)>,
     pub overlays: Vec<usize>,
@@ -373,6 +541,25 @@ pub struct Snapshot {
     pub cells: HashMap<(u32, u32), SheetCell>,
     /// Whether the dungeon is dark.
     pub night_mode: bool,
+    /// Pending timers, for assertions on registration and (via `now_ms`)
+    /// on what has fired.
+    pub timers: Vec<TimerInfo>,
+    /// The virtual clock in milliseconds.
+    pub now_ms: u64,
+    /// `Application` node id -> the action names registered with it.
+    pub app_actions: HashMap<usize, Vec<String>>,
+}
+
+/// The serializable half of a [`Timer`]: the closure cannot be serialized, so
+/// a snapshot reports what a timer *is* (when it is due, how often) and not
+/// what it would do.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TimerInfo {
+    pub due_at: u64,
+    pub interval_ms: u32,
+    /// True for a repeating timer, false for a one-shot.
+    pub repeating: bool,
+    pub window_id: Option<usize>,
 }
 
 pub struct ZorkState {
@@ -388,6 +575,23 @@ pub struct ZorkState {
     /// Named actions, so `MenuBar` dispatch can resolve an action name to the
     /// `SimpleAction` node that registered it.
     pub action_names: HashMap<String, usize>,
+    /// Registered timers, in registration order. See [`ZorkState::timeout_add_*`].
+    pub timers: Vec<Timer>,
+    /// Caller-supplied timer handle -> index into `timers`. NWG's
+    /// `start_repeating_timer` returns an id the caller cancels with, so the
+    /// same handle space exists here; it is kept separately from the `Timer`
+    /// list because removing a timer shifts every later index.
+    pub timer_ids: HashMap<usize, usize>,
+    /// Process-wide key handlers, keyed by the character they fire on. This is
+    /// the one widget-independent input table a spreadsheet has: `add_key_callback`
+    /// on the other backends takes a bare `char` and no widget, so it cannot be
+    /// per-node and is keyed here instead.
+    pub key_callbacks: HashMap<char, Vec<Callback>>,
+    /// `Application` nodes and the actions registered with them, keyed by the
+    /// application node id.
+    pub app_actions: HashMap<usize, Vec<String>>,
+    /// Per-node "was (re)laid out" callbacks, called as `cb(w, h)`.
+    pub layout_cbs: HashMap<usize, Vec<Box<dyn FnMut(i32, i32)>>>,
     /// Whether the dungeon is dark. Starts `true` — a Zork dungeon with no
     /// light source is dark by definition, and the REPL warns about the Grue
     /// while it is. See [`ZorkState::set_night_mode`].
@@ -396,6 +600,9 @@ pub struct ZorkState {
     /// light last changed, so a repeated `look` does not print the same line
     /// forever.
     pub grue_warned: bool,
+    /// Virtual clock, advanced only by [`ZorkState::advance_timers`]. Timers
+    /// compare against this rather than the wall clock.
+    pub now_ms: u64,
 }
 
 impl Default for ZorkState {
@@ -415,9 +622,15 @@ impl ZorkState {
             menu_items: HashMap::new(),
             focused: None,
             action_names: HashMap::new(),
+            timers: Vec::new(),
+            timer_ids: HashMap::new(),
+            key_callbacks: HashMap::new(),
+            app_actions: HashMap::new(),
+            layout_cbs: HashMap::new(),
             // A dungeon is dark until lit.
             night_mode: true,
             grue_warned: false,
+            now_ms: 0,
         }
     }
 
@@ -456,6 +669,8 @@ impl ZorkState {
             scroll_cbs: Vec::new(),
             response_cbs: Vec::new(),
             cells: HashMap::new(),
+            chrome: SheetChrome::default(),
+            sheet_input: SheetInput::default(),
             dialog_buttons: Vec::new(),
             dialog_default_response: None,
             dialog_transient_for: None,
@@ -1195,6 +1410,13 @@ impl ZorkState {
     /// a child with no size request advances by nothing. Each child keeps its
     /// own size request — this is a positioning pass, not a resize pass; use
     /// [`Self::set_size_request`] to size children first.
+    ///
+    /// A layout handler registered with [`Self::set_layout_callback`] fires at
+    /// the end, with this box's new size. It is *not* fired here: the handler
+    /// is a user closure and must not run under a `&mut ZorkState`, so the
+    /// caller (the facade) lifts it out first. Use
+    /// [`crate::backends::zork::layout_box`] rather than this method when
+    /// driving a live model, and it will fire the handler for you.
     pub fn layout_box(&mut self, id: usize, x: i32, y: i32, w: i32, h: i32) {
         let (horizontal, spacing) = match self.node(id) {
             Some(n) => match n.kind {
@@ -1380,6 +1602,39 @@ impl ZorkState {
     pub fn set_can_focus(&mut self, id: usize, can: bool) {
         if let Some(n) = self.node_mut(id) {
             n.can_focus = can;
+        }
+    }
+
+    // -- Layout callbacks --
+
+    /// Register a "was (re)laid out" handler, called as `cb(w, h)`.
+    pub fn set_layout_callback(&mut self, id: usize, cb: Box<dyn FnMut(i32, i32)>) {
+        self.layout_cbs.entry(id).or_default().push(cb);
+    }
+
+    /// How many layout handlers a node has.
+    pub fn layout_callback_count(&self, id: usize) -> usize {
+        self.layout_cbs.get(&id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Take a node's layout handlers, for running with no borrow held.
+    pub fn take_layout_cbs(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut(i32, i32)>> {
+        s.layout_cbs.remove(&id).unwrap_or_default()
+    }
+
+    /// Put a node's layout handlers back. They are persistent, so this is a
+    /// plain re-insert rather than the `append` the sheet key table needs.
+    pub fn put_layout_cbs(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut(i32, i32)>>) {
+        if !cbs.is_empty() {
+            s.layout_cbs.insert(id, cbs);
+        }
+    }
+
+    /// Append layout handlers, for a handler that registered more while the
+    /// previous set was being fired.
+    pub fn put_layout_cbs_add(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut(i32, i32)>>) {
+        if !cbs.is_empty() {
+            s.layout_cbs.entry(id).or_default().extend(cbs);
         }
     }
 
@@ -1787,6 +2042,245 @@ impl ZorkState {
         })
     }
 
+    // -- Spreadsheet chrome -------------------------------------------------
+    //
+    // One setter per field of `SheetChrome`. They are deliberately separate
+    // functions rather than a single `set_chrome` taking the whole struct: the
+    // other backends' `Spreadsheet` surface is a list of narrow setters, and
+    // the point of implementing them is that shared render code can issue the
+    // same call on any backend.
+
+    /// The whole chrome in one read, for a test or a draw callback.
+    pub fn sheet_chrome(&self, id: usize) -> Option<SheetChrome> {
+        self.node(id).map(|n| n.chrome.clone())
+    }
+
+    pub fn sheet_set_menu_text(&mut self, id: usize, text: &str) {
+        if let Some(n) = self.node_mut(id) {
+            n.chrome.menu_text = text.to_string();
+        }
+    }
+
+    pub fn sheet_menu_text(&self, id: usize) -> Option<String> {
+        self.node(id).map(|n| n.chrome.menu_text.clone())
+    }
+
+    pub fn sheet_set_status_text(&mut self, id: usize, text: &str) {
+        if let Some(n) = self.node_mut(id) {
+            n.chrome.status_text = text.to_string();
+        }
+    }
+
+    pub fn sheet_status_text(&self, id: usize) -> Option<String> {
+        self.node(id).map(|n| n.chrome.status_text.clone())
+    }
+
+    pub fn sheet_set_formula_bar_trailing(&mut self, id: usize, text: &str) {
+        if let Some(n) = self.node_mut(id) {
+            n.chrome.formula_bar_trailing = text.to_string();
+        }
+    }
+
+    pub fn sheet_formula_bar_trailing(&self, id: usize) -> Option<String> {
+        self.node(id).map(|n| n.chrome.formula_bar_trailing.clone())
+    }
+
+    /// The formula bar as a whole: the address cell and the entry text.
+    ///
+    /// One call rather than two, because the address and the entry are not
+    /// independently meaningful — they describe the same cell. Taking them
+    /// separately would let a caller set an address and an entry for two
+    /// different cells, which is the state the widget can never be in.
+    pub fn sheet_set_formula_bar(&mut self, id: usize, address: &str, entry: &str) {
+        if let Some(n) = self.node_mut(id) {
+            n.chrome.formula_address = address.to_string();
+            n.chrome.formula_entry = entry.to_string();
+        }
+    }
+
+    pub fn sheet_formula_bar(&self, id: usize) -> Option<(String, String)> {
+        self.node(id).map(|n| (n.chrome.formula_address.clone(), n.chrome.formula_entry.clone()))
+    }
+
+    pub fn sheet_set_grid_config(&mut self, id: usize, margin_cols: u32, main_cols: u32) {
+        if let Some(n) = self.node_mut(id) {
+            n.chrome.margin_cols = margin_cols;
+            n.chrome.main_cols = main_cols;
+        }
+    }
+
+    pub fn sheet_set_row_counts(&mut self, id: usize, header_rows: u32, main_rows: u32) {
+        if let Some(n) = self.node_mut(id) {
+            n.chrome.header_rows = header_rows;
+            n.chrome.main_rows = main_rows;
+        }
+    }
+
+    /// Replace the column layout wholesale, which is what every frame does:
+    /// column widths change as the user resizes, so an incremental setter
+    /// would need a diff the callers have no reason to write.
+    pub fn sheet_set_column_layout(&mut self, id: usize, layout: Vec<(u32, u32, String)>) {
+        if let Some(n) = self.node_mut(id) {
+            n.chrome.column_layout = layout;
+        }
+    }
+
+    pub fn sheet_set_row_labels(&mut self, id: usize, labels: Vec<(u32, String)>) {
+        if let Some(n) = self.node_mut(id) {
+            n.chrome.row_labels = labels;
+        }
+    }
+
+    /// The tab strip. `active` is clamped to the tab list so a caller that
+    /// removed the active tab gets the last tab rather than an index that
+    /// points past the end — the same reason [`Self::set_dropdown_selected`]
+    /// drops an out-of-range selection.
+    pub fn sheet_set_tab_data(&mut self, id: usize, titles: &[String], active: usize) {
+        if let Some(n) = self.node_mut(id) {
+            n.chrome.tabs = titles.to_vec();
+            n.chrome.active_tab = if titles.is_empty() {
+                0
+            } else {
+                active.min(titles.len() - 1)
+            };
+        }
+    }
+
+    /// Move the cursor, clamped to the sheet's known extent.
+    ///
+    /// The clamp is the load-bearing part: `set_cursor` is called with
+    /// whatever the caller computed, and a cursor one row past the last row
+    /// is a state the widget can never be in. When the extent is unknown
+    /// (`main_rows == 0`, i.e. the caller never said) the value is kept as-is
+    /// rather than collapsed to the origin, so a spreadsheet driven before its
+    /// geometry is configured still remembers where it was put.
+    pub fn sheet_set_cursor(&mut self, id: usize, row: u32, col: u32) {
+        let (mut r, mut c) = (row, col);
+        if let Some(n) = self.node_mut(id) {
+            if n.chrome.main_rows > 0 && n.chrome.header_rows > 0 {
+                let last = n.chrome.main_rows + n.chrome.header_rows - 1;
+                r = r.min(last);
+            }
+            if n.chrome.main_cols > 0 && n.chrome.margin_cols > 0 {
+                let last = n.chrome.main_cols + n.chrome.margin_cols - 1;
+                c = c.min(last);
+            }
+            n.chrome.cursor = (r, c);
+        }
+    }
+
+    pub fn sheet_cursor(&self, id: usize) -> Option<(u32, u32)> {
+        self.node(id).map(|n| n.chrome.cursor)
+    }
+
+    /// Set the selection anchor, which the drag handlers extend from.
+    pub fn sheet_set_anchor(&mut self, id: usize, anchor: Option<(u32, u32)>) {
+        if let Some(n) = self.node_mut(id) {
+            n.chrome.anchor = anchor;
+        }
+    }
+
+    /// Begin (or end) editing the cursor cell.
+    ///
+    /// `edit_buf` seeds the in-progress text and `edit_pos` the caret inside
+    /// it. Passing an empty buffer with `editing = true` starts an edit from
+    /// the cell's current value, which is what a real "press F2" does — the
+    /// alternative is a blank that silently destroys the cell's contents if
+    /// the user types nothing and commits.
+    pub fn sheet_set_editing(&mut self, id: usize, editing: bool, edit_buf: &str, edit_pos: usize) {
+        let seed = {
+            let Some(n) = self.node(id) else { return };
+            n.cells.get(&n.chrome.cursor).map(|c| c.text.clone())
+        };
+        if let Some(n) = self.node_mut(id) {
+            n.chrome.editing = editing;
+            if editing {
+                let buf = if edit_buf.is_empty() {
+                    seed.unwrap_or_default()
+                } else {
+                    edit_buf.to_string()
+                };
+                n.chrome.edit_buf = buf;
+                n.chrome.edit_pos = edit_pos.min(n.chrome.edit_buf.chars().count());
+            } else {
+                n.chrome.edit_buf.clear();
+                n.chrome.edit_pos = 0;
+            }
+        }
+    }
+
+    pub fn sheet_edit_state(&self, id: usize) -> Option<(bool, String, usize)> {
+        self.node(id).map(|n| (n.chrome.editing, n.chrome.edit_buf.clone(), n.chrome.edit_pos))
+    }
+
+    /// Commit the in-progress edit into the cursor cell.
+    ///
+    /// Writes both the display cell and the raw cell, because the raw cell is
+    /// what the model saves and the display cell is what it paints; leaving
+    /// them out of step is how a formula ends up rendering differently from
+    /// what it evaluates to. A no-op when not editing, matching
+    /// `core::Grid::commit_edit`.
+    ///
+    /// Does **not** fire the commit hook: this is the mutation, and
+    /// [`Self::sheet_fire_commit_edit`] is the notification, so a caller that
+    /// commits without a handler and a caller whose handler is absent take the
+    /// same path through the model.
+    pub fn sheet_commit_edit(&mut self, id: usize) -> Option<(u32, u32, String)> {
+        let Some(n) = self.node_mut(id) else { return None };
+        if !n.chrome.editing {
+            return None;
+        }
+        let (row, col) = n.chrome.cursor;
+        let text = n.chrome.edit_buf.clone();
+        n.cells.insert((row, col), SheetCell { text: text.clone(), style: 0, raw: false });
+        n.chrome.editing = false;
+        n.chrome.edit_buf.clear();
+        n.chrome.edit_pos = 0;
+        Some((row, col, text))
+    }
+
+    // -- Spreadsheet input hooks -------------------------------------------
+
+    /// Register a bare-keypress handler (a function key, a shortcut).
+    pub fn sheet_add_key_callback(&mut self, id: usize, cb: Box<dyn FnMut()>) {
+        if let Some(n) = self.node_mut(id) {
+            n.sheet_input.key.push(cb);
+        }
+    }
+
+    /// Register a "navigate to a cell" handler.
+    pub fn sheet_add_goto_callback(&mut self, id: usize, cb: Box<dyn FnMut()>) {
+        if let Some(n) = self.node_mut(id) {
+            n.sheet_input.goto.push(cb);
+        }
+    }
+
+    /// Register a cursor-moved handler, called as `cb(row, col)`.
+    pub fn sheet_add_cursor_move_callback(&mut self, id: usize, cb: Box<dyn FnMut(u32, u32)>) {
+        if let Some(n) = self.node_mut(id) {
+            n.sheet_input.cursor_move.push(cb);
+        }
+    }
+
+    /// Register a commit handler, called as `cb(row, col, text)`.
+    pub fn sheet_add_commit_edit_callback(&mut self, id: usize, cb: Box<dyn FnMut(u32, u32, String)>) {
+        if let Some(n) = self.node_mut(id) {
+            n.sheet_input.commit_edit.push(cb);
+        }
+    }
+
+    /// How many handlers each of the four input events has, for assertions.
+    pub fn sheet_hook_counts(&self, id: usize) -> Option<(usize, usize, usize, usize)> {
+        self.node(id).map(|n| {
+            (
+                n.sheet_input.key.len(),
+                n.sheet_input.goto.len(),
+                n.sheet_input.cursor_move.len(),
+                n.sheet_input.commit_edit.len(),
+            )
+        })
+    }
+
     // -- Menu / action dispatch --
 
     /// Fire the `SimpleAction` a menu item names, if the action was created
@@ -1940,6 +2434,42 @@ impl ZorkState {
             n.response_cbs = cbs;
         }
     }
+    /// Take a spreadsheet's bare-key handlers.
+    pub fn take_sheet_key_hooks(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut()>> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.sheet_input.key)).unwrap_or_default()
+    }
+    pub fn put_sheet_key_hooks(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut()>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.sheet_input.key = cbs;
+        }
+    }
+    /// Take a spreadsheet's "navigate to a cell" handlers.
+    pub fn take_sheet_goto_hooks(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut()>> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.sheet_input.goto)).unwrap_or_default()
+    }
+    pub fn put_sheet_goto_hooks(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut()>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.sheet_input.goto = cbs;
+        }
+    }
+    /// Take a spreadsheet's cursor-moved handlers.
+    pub fn take_sheet_cursor_move_hooks(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut(u32, u32)>> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.sheet_input.cursor_move)).unwrap_or_default()
+    }
+    pub fn put_sheet_cursor_move_hooks(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut(u32, u32)>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.sheet_input.cursor_move = cbs;
+        }
+    }
+    /// Take a spreadsheet's commit handlers.
+    pub fn take_sheet_commit_hooks(s: &mut ZorkState, id: usize) -> Vec<Box<dyn FnMut(u32, u32, String)>> {
+        s.node_mut(id).map(|n| std::mem::take(&mut n.sheet_input.commit_edit)).unwrap_or_default()
+    }
+    pub fn put_sheet_commit_hooks(s: &mut ZorkState, id: usize, cbs: Vec<Box<dyn FnMut(u32, u32, String)>>) {
+        if let Some(n) = s.node_mut(id) {
+            n.sheet_input.commit_edit = cbs;
+        }
+    }
     /// Whether a dialog has a response handler for `response_id` registered by
     /// `dialog_add_button`.
     pub fn dialog_has_response(&self, id: usize, response_id: i32) -> bool {
@@ -2043,6 +2573,228 @@ impl ZorkState {
          surely eat you. Light the lantern with 'light' before you go further."
     }
 
+    // -- Timers ------------------------------------------------------------
+    //
+    // GTK's `g_timeout_add` hands the closure to the main context and the loop
+    // calls it when the time comes; NWG's `SetTimer` posts `WM_TIMER`. Zork
+    // has no main context, so the closure is registered here and fired by
+    // [`Self::advance_timers`] — the driver *is* the loop. A caller that never
+    // advances the clock registers a timer that never fires, which is the same
+    // situation as registering one and then exiting the loop.
+
+    /// Run `f` once, `ms` virtual milliseconds from now.
+    pub fn timeout_add_once(&mut self, ms: u32, f: Box<dyn FnOnce()>) {
+        let due = self.now_ms + ms as u64;
+        self.timers.push(Timer {
+            due_at: due,
+            interval_ms: ms,
+            handler: None,
+            once: Some(f),
+            window_id: None,
+        });
+    }
+
+    /// Run `f` every `ms` virtual milliseconds until it returns `false`.
+    pub fn timeout_add_repeating(&mut self, ms: u32, f: Box<dyn FnMut() -> bool>) {
+        let due = self.now_ms + ms as u64;
+        self.timers.push(Timer {
+            due_at: due,
+            interval_ms: ms,
+            handler: Some(f),
+            once: None,
+            window_id: None,
+        });
+    }
+
+    /// A repeating timer owned by `window_id` — `Window::start_repeating_timer`.
+    pub fn timeout_add_repeating_for_window(
+        &mut self,
+        window_id: usize,
+        id: usize,
+        ms: u32,
+        f: Box<dyn FnMut() -> bool>,
+    ) {
+        let due = self.now_ms + ms as u64;
+        self.timers.push(Timer {
+            due_at: due,
+            interval_ms: ms,
+            handler: Some(f),
+            once: None,
+            window_id: Some(window_id),
+        });
+        // `id` is the *caller's* handle. NWG returns the handler id so the
+        // caller can cancel the timer, and conflating it with the window would
+        // make two timers on one window indistinguishable; record it so
+        // [`Self::cancel_timer`] can find the right one.
+        self.timer_ids.insert(id, self.timers.len() - 1);
+    }
+
+    /// Stop the timer the caller registered under `id`.
+    pub fn cancel_timer(&mut self, id: usize) -> bool {
+        let Some(idx) = self.timer_ids.remove(&id) else {
+            return false;
+        };
+        // Indices shift when a timer is dropped, so rebuild the map rather than
+        // decrementing the survivors: a stale index would cancel the wrong
+        // timer, which is worse than failing to cancel one.
+        self.timer_ids.clear();
+        if idx < self.timers.len() {
+            self.timers.remove(idx);
+            for (handle, i) in (0..self.timers.len()).zip(self.handles_by_index()) {
+                self.timer_ids.insert(handle, i);
+            }
+        }
+        true
+    }
+
+    fn handles_by_index(&self) -> Vec<usize> {
+        // Reverse of `timer_ids`, so a rebuilt map keeps each surviving
+        // timer's handle pointing at its own new index.
+        let mut by_index = vec![usize::MAX; self.timers.len()];
+        for (handle, idx) in &self.timer_ids {
+            if *idx < by_index.len() {
+                by_index[*idx] = *handle;
+            }
+        }
+        by_index
+    }
+
+    /// Fire every timer due at or before `now + ms`, then leave the clock
+    /// there. Returns how many fired.
+    ///
+    /// A handler that returns `false` is unregistered after this firing, and
+    /// one that returns `true` is re-armed `interval_ms` later. Handlers run
+    /// with no `&mut ZorkState` borrow live, so a timer body may touch the
+    /// model — including registering or cancelling another timer, which is why
+    /// the loop re-checks `self.timers.len()` rather than caching a length.
+    pub fn advance_timers(&mut self, ms: u64) -> usize {
+        let target = self.now_ms + ms;
+        let mut fired = 0usize;
+        // `loop` rather than a snapshot of the timer list: a handler may add a
+        // timer that is already due (`timeout_add_once(0, ..)`), and stopping
+        // at the initial length would leave it unfired forever.
+        loop {
+            let Some(idx) = self
+                .timers
+                .iter()
+                .position(|t| t.due_at <= target)
+            else {
+                break;
+            };
+            let mut timer = self.timers.remove(idx);
+            // Every handle at or above `idx` shifted down by one.
+            for (_, i) in self.timer_ids.iter_mut() {
+                if *i > idx {
+                    *i -= 1;
+                }
+            }
+            fired += 1;
+            let mut keep = false;
+            if let Some(mut h) = timer.handler.take() {
+                keep = h();
+            }
+            if let Some(once) = timer.once.take() {
+                once();
+            }
+            if keep {
+                // Re-arm from the *current* clock, not from `due_at`. A
+                // handler that took longer than the interval must not
+                // accumulate a backlog of already-due firings.
+                timer.due_at = target + timer.interval_ms as u64;
+                self.timers.push(timer);
+            }
+        }
+        self.now_ms = target;
+        fired
+    }
+
+    /// How many timers are registered, for assertions.
+    pub fn timer_count(&self) -> usize {
+        self.timers.len()
+    }
+
+    /// The virtual clock, in milliseconds since model creation.
+    pub fn now_ms(&self) -> u64 {
+        self.now_ms
+    }
+
+    // -- Application -------------------------------------------------------
+
+    /// Register an action with an `Application` node.
+    ///
+    /// GTK's `GApplication` holds an action map that a menu bar reads to
+    /// resolve an item's action name. Zork's model already resolves names
+    /// through `action_names`, so this records *which application* an action
+    /// belongs to — which is what makes "does this action exist" answerable
+    /// per-application rather than globally.
+    ///
+    /// Returns the action's name, or `None` if the id is not a
+    /// `SimpleAction` node: registering an arbitrary widget as an action would
+    /// let a menu item resolve to something that can never fire.
+    pub fn application_add_action(&mut self, app_id: usize, action_id: usize) -> Option<String> {
+        let name = match self.node(action_id) {
+            Some(n) if matches!(n.kind, ZorkKind::SimpleAction) => self
+                .action_names
+                .iter()
+                .find(|(_, id)| **id == action_id)
+                .map(|(name, _)| name.clone()),
+            _ => None,
+        }?;
+        self.app_actions.entry(app_id).or_default().push(name.clone());
+        Some(name)
+    }
+
+    /// The action names registered with `app_id`, in registration order.
+    pub fn application_actions(&self, app_id: usize) -> Vec<String> {
+        self.app_actions.get(&app_id).cloned().unwrap_or_default()
+    }
+
+    // -- Global key callbacks ----------------------------------------------
+
+    /// Register a process-wide handler for a keypress, as
+    /// `add_key_callback` does on the other backends.
+    ///
+    /// Stored on the state rather than a node because the signature takes no
+    /// widget: there is nowhere else for it to live.
+    pub fn add_key_callback(&mut self, key: char, cb: Callback) {
+        self.key_callbacks.entry(key).or_default().push(cb);
+    }
+
+    /// How many handlers are registered for `key`.
+    pub fn key_callback_count(&self, key: char) -> usize {
+        self.key_callbacks.get(&key).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Take the handlers for `key`, leaving none registered.
+    ///
+    /// The `take`/`put` pair is what lets [`Self::key_callback_fired`] fire
+    /// them with no borrow held; the handlers are persistent, so they are put
+    /// straight back rather than consumed the way a one-shot is.
+    pub fn take_key_callbacks(s: &mut ZorkState, key: char) -> Vec<Callback> {
+        s.key_callbacks.remove(&key).unwrap_or_default()
+    }
+
+    pub fn put_key_callbacks(s: &mut ZorkState, key: char, cbs: Vec<Callback>) {
+        if !cbs.is_empty() {
+            s.key_callbacks.entry(key).or_default().extend(cbs);
+        }
+    }
+
+    /// [`Self::take_key_callbacks`] paired with [`Self::put_key_callbacks`]:
+    /// the facade calls them as two `with_state` borrows rather than through
+    /// `with_callbacks`, which is shaped around a node id.
+
+    /// Fire the handlers for `key`. Returns how many ran.
+    pub fn key_callback_fired(&mut self, key: char) -> usize {
+        let mut cbs = Self::take_key_callbacks(self, key);
+        let n = cbs.len();
+        for cb in cbs.iter_mut() {
+            cb();
+        }
+        Self::put_key_callbacks(self, key, cbs);
+        n
+    }
+
     pub fn quit(&mut self) {
         self.running = false;
     }
@@ -2060,29 +2812,7 @@ impl ZorkState {
             .map(|n| {
                 let mut s = SnapshotNode {
                     id: n.id,
-                    kind: match n.kind {
-                        ZorkKind::Window { .. } => "Window",
-                        ZorkKind::Button { .. } => "Button",
-                        ZorkKind::Label { .. } => "Label",
-                        ZorkKind::BoxWidget { .. } => "BoxWidget",
-                        ZorkKind::Grid { .. } => "Grid",
-                        ZorkKind::Entry { .. } => "Entry",
-                        ZorkKind::CheckButton { .. } => "CheckButton",
-                        ZorkKind::RadioButton { .. } => "RadioButton",
-                        ZorkKind::Dialog { .. } => "Dialog",
-                        ZorkKind::Menu => "Menu",
-                        ZorkKind::MenuBar => "MenuBar",
-                        ZorkKind::SimpleAction => "SimpleAction",
-                        ZorkKind::DropDown { .. } => "DropDown",
-                        ZorkKind::TextView { .. } => "TextView",
-                        ZorkKind::Canvas { .. } => "Canvas",
-                        ZorkKind::Overlay => "Overlay",
-                        ZorkKind::ScrolledWindow => "ScrolledWindow",
-                        ZorkKind::Fixed => "Fixed",
-                        ZorkKind::Application => "Application",
-                        ZorkKind::Spreadsheet { .. } => "Spreadsheet",
-                    }
-                    .to_string(),
+                    kind: n.kind.name().to_string(),
                     parent: n.parent,
                     children: n.children.clone(),
                     title: None,
@@ -2109,6 +2839,15 @@ impl ZorkState {
                         .collect(),
                     dialog_buttons: n.dialog_buttons.clone(),
                     overlays: n.overlays.clone(),
+                    chrome: matches!(n.kind, ZorkKind::Spreadsheet { .. }).then(|| n.chrome.clone()),
+                    sheet_hooks: matches!(n.kind, ZorkKind::Spreadsheet { .. }).then(|| {
+                        (
+                            n.sheet_input.key.len(),
+                            n.sheet_input.goto.len(),
+                            n.sheet_input.cursor_move.len(),
+                            n.sheet_input.commit_edit.len(),
+                        )
+                    }),
                 };
                 match &n.kind {
                     ZorkKind::Window { title } | ZorkKind::Dialog { title } => s.title = Some(title.clone()),
@@ -2153,6 +2892,18 @@ impl ZorkState {
             overlay_pass_through,
             cells,
             night_mode: self.night_mode,
+            timers: self
+                .timers
+                .iter()
+                .map(|t| TimerInfo {
+                    due_at: t.due_at,
+                    interval_ms: t.interval_ms,
+                    repeating: t.handler.is_some(),
+                    window_id: t.window_id,
+                })
+                .collect(),
+            now_ms: self.now_ms,
+            app_actions: self.app_actions.clone(),
         }
     }
 }

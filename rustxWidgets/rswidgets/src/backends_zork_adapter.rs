@@ -291,6 +291,30 @@ impl Window {
     pub fn queue_redraw(&self) {
         crate::backends::zork::queue_redraw(self.id);
     }
+
+    /// Start a repeating timer owned by this window, under `id`.
+    ///
+    /// NWG's version returns the NWG handler id so the caller can cancel it
+    /// with `KillTimer`; here the id is the caller's own handle and
+    /// [`cancel_timer`] takes it. The timer fires when the driver advances the
+    /// model's clock (the REPL does this each turn), so `ms` is model time
+    /// rather than wall time — a headless backend has no clock to wait on.
+    pub fn start_repeating_timer(&self, id: usize, ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), Error> {
+        crate::backends::zork::timeout_add_repeating_for_window(self.id, id, ms, f);
+        Ok(())
+    }
+
+    /// A callback to run whenever the window is (re)laid out, as
+    /// `(w, h)`.
+    ///
+    /// NWG hooks this to `WM_SIZE`; zork has no size events, but a `Fixed`
+    /// container's children *are* positioned by a layout pass, and a host that
+    /// wants to react to that has no other hook. The callback is stored rather
+    /// than dropped, so `Harness::layout_box` can invoke it — see
+    /// [`crate::backends::zork::fire_layout_callbacks`].
+    pub fn set_layout_cb<F: FnMut(i32, i32) + 'static>(&self, f: F) {
+        crate::backends::zork::set_layout_callback(self.id, Box::new(f));
+    }
 }
 
 // -- Button --
@@ -1621,6 +1645,125 @@ impl Spreadsheet {
     pub fn set_vexpand(&self, expand: bool) {
         crate::backends::zork::set_vexpand(self.id, expand);
     }
+
+    // -- Chrome (the F9 surface) --
+    //
+    // Every one of these is the counterpart of a `pancurses` call
+    // `src/gui/pnc_backend.rs` already issues, so shared render code can now
+    // target zork without a per-backend `#if`.
+
+    /// The cursor, 0-based. Setting it notifies the cursor-move handlers, so
+    /// a host that drives the cursor from Rust gets the same notification a
+    /// keypress would produce.
+    pub fn set_cursor(&self, row: u32, col: u32) {
+        crate::backends::zork::sheet_set_cursor(self.id, row, col);
+    }
+    pub fn cursor_position(&self) -> Option<(u32, u32)> {
+        crate::backends::zork::sheet_cursor(self.id)
+    }
+    /// The selection anchor a drag extends from.
+    pub fn set_anchor(&self, anchor: Option<(u32, u32)>) {
+        crate::backends::zork::sheet_set_anchor(self.id, anchor);
+    }
+    /// Begin/end editing the cursor cell.
+    pub fn set_editing(&self, editing: bool, edit_buf: &str, edit_pos: usize) {
+        crate::backends::zork::sheet_set_editing(self.id, editing, edit_buf, edit_pos);
+    }
+    pub fn edit_state(&self) -> Option<(bool, String, usize)> {
+        crate::backends::zork::sheet_edit_state(self.id)
+    }
+    /// Commit the in-progress edit and notify the commit handlers. Returns the
+    /// committed `(row, col, text)`, or `None` when nothing was being edited.
+    pub fn commit_formula_bar(&self) -> Option<(u32, u32, String)> {
+        crate::backends::zork::sheet_commit_edit(self.id)
+    }
+    /// The gutter width and the number of data columns.
+    pub fn set_grid_config(&self, margin_cols: u32, main_cols: u32) {
+        crate::backends::zork::sheet_set_grid_config(self.id, margin_cols, main_cols);
+    }
+    /// The frozen header band and the number of data rows.
+    pub fn set_row_counts(&self, header_rows: u32, main_rows: u32) {
+        crate::backends::zork::sheet_set_row_counts(self.id, header_rows, main_rows);
+    }
+    /// Per-column `(index, width_chars, title)`, in display order.
+    pub fn set_column_layout(&self, layout: Vec<(u32, u32, String)>) {
+        crate::backends::zork::sheet_set_column_layout(self.id, layout);
+    }
+    pub fn set_row_labels(&self, labels: Vec<(u32, String)>) {
+        crate::backends::zork::sheet_set_row_labels(self.id, labels);
+    }
+    /// The menu-bar line drawn along the top of the sheet.
+    pub fn set_menu_text(&self, text: &str) {
+        crate::backends::zork::sheet_set_menu_text(self.id, text);
+    }
+    pub fn menu_text(&self) -> Option<String> {
+        crate::backends::zork::sheet_menu_text(self.id)
+    }
+    /// The status line.
+    pub fn set_status_text(&self, text: &str) {
+        crate::backends::zork::sheet_set_status_text(self.id, text);
+    }
+    pub fn status_text(&self) -> Option<String> {
+        crate::backends::zork::sheet_status_text(self.id)
+    }
+    /// The trailing part of the formula bar, kept separate from the entry so a
+    /// status note never ends up in the cell the user is editing.
+    pub fn set_formula_bar_trailing(&self, text: &str) {
+        crate::backends::zork::sheet_set_formula_bar_trailing(self.id, text);
+    }
+    pub fn formula_bar_trailing(&self) -> Option<String> {
+        crate::backends::zork::sheet_formula_bar_trailing(self.id)
+    }
+    /// The formula bar's address cell and entry text.
+    pub fn set_formula_bar(&self, address_label: &Label, entry: &Entry) {
+        let address = address_label.get_text().unwrap_or_default();
+        let text = entry.get_text().unwrap_or_default();
+        crate::backends::zork::sheet_set_formula_bar(self.id, &address, &text);
+    }
+    pub fn formula_bar(&self) -> Option<(String, String)> {
+        crate::backends::zork::sheet_formula_bar(self.id)
+    }
+    /// The tab strip, and which tab is active. The active index is clamped to
+    /// the list, so removing the active tab cannot leave a dangling index.
+    pub fn set_tab_data(&self, titles: &[String], active: usize) {
+        crate::backends::zork::sheet_set_tab_data(self.id, titles, active);
+    }
+    /// The whole chrome in one read.
+    pub fn chrome(&self) -> Option<crate::backends::zork::model::SheetChrome> {
+        crate::backends::zork::sheet_chrome(self.id)
+    }
+
+    // -- Input (the F10 surface) --
+
+    /// Register a bare-keypress handler. The free `add_key_callback` below is
+    /// the process-wide form every backend has; this is the per-spreadsheet
+    /// form, because the model has a table for it and a spreadsheet is the
+    /// only widget that has one.
+    pub fn add_key_callback(&self, cb: Box<dyn FnMut()>) {
+        crate::backends::zork::sheet_add_key_callback(self.id, cb);
+    }
+    /// Register a "navigated to a cell" handler.
+    pub fn add_goto_callback(&self, cb: Box<dyn FnMut()>) {
+        crate::backends::zork::sheet_add_goto_callback(self.id, cb);
+    }
+    /// Register a cursor-moved handler, called as `cb(row, col)`.
+    pub fn add_cursor_move_callback(&self, cb: Box<dyn FnMut(u32, u32)>) {
+        crate::backends::zork::sheet_add_cursor_move_callback(self.id, cb);
+    }
+    /// Register a commit handler, called as `cb(row, col, text)`.
+    pub fn add_commit_edit_callback(&self, cb: Box<dyn FnMut(u32, u32, String)>) {
+        crate::backends::zork::sheet_add_commit_edit_callback(self.id, cb);
+    }
+    /// `(key, goto, cursor_move, commit_edit)` handler counts.
+    pub fn hook_counts(&self) -> Option<(usize, usize, usize, usize)> {
+        crate::backends::zork::sheet_hook_counts(self.id)
+    }
+    /// Fire the "navigated to a cell" handlers, for a host that navigates
+    /// without going through [`Self::set_cursor`] (a name typed into the
+    /// address box, a jump-to-cell menu action).
+    pub fn fire_goto(&self) {
+        crate::backends::zork::sheet_fire_goto(self.id);
+    }
 }
 
 // -- Factory functions --
@@ -1751,6 +1894,239 @@ pub fn create_spreadsheet() -> Result<Spreadsheet, Error> {
     crate::backends::zork::create_spreadsheet()
         .map(|id| Spreadsheet { id })
         .map_err(|e| Error::Backend(format!("{}", e)))
+}
+
+// -- Application (the action group a menu bar resolves names against) --
+
+/// An action group host, the counterpart of GTK's `GApplication`.
+///
+/// Zork has no GActionGroup: `create_simple_action` already registers each
+/// action's name in the model, which is what a menu item needs in order to
+/// dispatch. This type exists so a host that creates an application and adds
+/// actions to it — the GTK pattern in `create_application`/`add_action` — has
+/// something to call, and so "is this action registered *here*" is answerable.
+#[derive(Clone)]
+pub struct Application {
+    pub(crate) id: usize,
+}
+
+impl Widget for Application {
+    fn raw_handle(&self) -> *mut c_void {
+        &self.id as *const usize as *mut c_void
+    }
+}
+
+impl AsRef<*mut c_void> for Application {
+    fn as_ref(&self) -> &*mut c_void {
+        unsafe { &*(&self.id as *const usize as *const *mut c_void) }
+    }
+}
+
+impl Application {
+    /// The node id, for a driver that addresses widgets numerically.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    /// No-op, as on GTK: there is no D-Bus or GApplication registration to
+    /// perform, and the model's action registry is already live. It exists
+    /// because a host that skips it on GTK and calls it on zork should not
+    /// have to be written twice.
+    pub fn register(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// GTK returns a `GApplication*` for D-Bus/DBus integration. There is no
+    /// such object here, so this is the null handle, which every caller that
+    /// passes it onward already has to tolerate.
+    pub fn as_ptr(&self) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    /// Register `action` with this application.
+    ///
+    /// Errors rather than silently ignoring, because GTK errors and a caller
+    /// may be relying on that to notice a mistyped action name. The only
+    /// refusal is a non-`SimpleAction` argument.
+    pub fn add_action(&self, action: &SimpleAction) -> Result<(), Error> {
+        crate::backends::zork::application_add_action(self.id, action.id)
+            .map(|_| ())
+            .ok_or_else(|| Error::Backend(format!("add_action: node {} is not a SimpleAction", action.id)))
+    }
+
+    /// The action names registered with this application, in order.
+    pub fn actions(&self) -> Vec<String> {
+        crate::backends::zork::application_actions(self.id)
+    }
+}
+
+pub fn create_application() -> Result<Application, Error> {
+    crate::backends::zork::create_application()
+        .map(|id| Application { id })
+        .map_err(|e| Error::Backend(format!("{}", e)))
+}
+
+// -- Timers --
+
+/// Run `f` once after `ms` milliseconds of *model* time.
+///
+/// The headless answer to `g_timeout_add`: the model has no wall clock, so
+/// "after `ms` milliseconds" means "when the driver advances the clock past
+/// the deadline" — see [`advance_timers`]. A host that never advances the
+/// clock registers a timer that never fires, which is the same situation as
+/// registering one and then leaving the main loop before it elapses.
+pub fn timeout_add_once(ms: u32, f: Box<dyn FnOnce()>) -> Result<(), Error> {
+    crate::backends::zork::timeout_add_once(ms, f);
+    Ok(())
+}
+
+/// Run `f` every `ms` model-milliseconds until it returns `false`.
+pub fn timeout_add_repeating(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), Error> {
+    crate::backends::zork::timeout_add_repeating(ms, f);
+    Ok(())
+}
+
+/// Fire every timer due within `ms` of model time; returns how many fired.
+///
+/// The model's stand-in for a main loop reaching its timeouts. Called
+/// automatically at the top of each REPL turn, so a host that installs a
+/// timer and hands off to the REPL sees it fire without writing a loop.
+pub fn advance_timers(ms: u64) -> usize {
+    crate::backends::zork::advance_timers(ms)
+}
+
+/// Stop the timer registered under `id`. Returns false for an unknown id.
+pub fn cancel_timer(id: usize) -> bool {
+    crate::backends::zork::cancel_timer(id)
+}
+
+/// How many timers are pending.
+pub fn timer_count() -> usize {
+    crate::backends::zork::timer_count()
+}
+
+// -- Spreadsheet input, the process-wide half (the F10 free functions) --
+
+/// Register a process-wide handler for a keypress.
+///
+/// The signature matches `pancurses`' free `add_key_callback`, which is also
+/// widget-free: a key table cannot be per-widget when the call site has no
+/// widget to pass. [`Spreadsheet::add_key_callback`] is the per-spreadsheet
+/// form for hosts that do have one.
+pub fn add_key_callback(key: char, cb: Box<dyn FnMut()>) {
+    crate::backends::zork::add_key_callback(key, cb);
+}
+
+/// Fire the handlers registered for `key`; returns how many ran.
+pub fn fire_key_callback(key: char) -> usize {
+    crate::backends::zork::fire_key_callback(key)
+}
+
+/// How many handlers are registered for `key`.
+pub fn key_callback_count(key: char) -> usize {
+    crate::backends::zork::key_callback_count(key)
+}
+
+pub fn spreadsheet_add_goto_callback(id: usize, cb: Box<dyn FnMut()>) {
+    crate::backends::zork::sheet_add_goto_callback(id, cb);
+}
+pub fn spreadsheet_add_cursor_move_callback(id: usize, cb: Box<dyn FnMut(u32, u32)>) {
+    crate::backends::zork::sheet_add_cursor_move_callback(id, cb);
+}
+pub fn spreadsheet_add_commit_edit_callback(id: usize, cb: Box<dyn FnMut(u32, u32, String)>) {
+    crate::backends::zork::sheet_add_commit_edit_callback(id, cb);
+}
+pub fn spreadsheet_fire_goto(id: usize) {
+    crate::backends::zork::sheet_fire_goto(id);
+}
+pub fn spreadsheet_set_cell(id: usize, r: u32, c: u32, text: &str) {
+    crate::backends::zork::sheet_set_cell(id, r, c, text, 0);
+}
+pub fn spreadsheet_set_cell_style(id: usize, r: u32, c: u32, style: u8) {
+    // Preserve the text: a style change must not blank the cell. The model's
+    // `set_cell` overwrites both text and style together, so the text has to
+    // be read back and written again.
+    let text = crate::backends::zork::sheet_get_cell(id, r, c).unwrap_or_default();
+    crate::backends::zork::sheet_set_cell(id, r, c, &text, style);
+}
+pub fn spreadsheet_set_column_layout(id: usize, layout: Vec<(u32, u32, String)>) {
+    crate::backends::zork::sheet_set_column_layout(id, layout);
+}
+pub fn spreadsheet_set_border_title(id: usize, text: &str) {
+    crate::backends::zork::sheet_set_border_title(id, text);
+}
+pub fn spreadsheet_set_row_labels(id: usize, labels: Vec<(u32, String)>) {
+    crate::backends::zork::sheet_set_row_labels(id, labels);
+}
+pub fn spreadsheet_set_grid_config(id: usize, margin_cols: u32, main_cols: u32) {
+    crate::backends::zork::sheet_set_grid_config(id, margin_cols, main_cols);
+}
+pub fn spreadsheet_set_row_counts(id: usize, header_rows: u32, main_rows: u32) {
+    crate::backends::zork::sheet_set_row_counts(id, header_rows, main_rows);
+}
+pub fn spreadsheet_set_edit_state(id: usize, editing: bool, edit_buf: &str, edit_pos: usize) {
+    crate::backends::zork::sheet_set_editing(id, editing, edit_buf, edit_pos);
+}
+pub fn spreadsheet_set_cursor(id: usize, row: u32, col: u32) {
+    crate::backends::zork::sheet_set_cursor(id, row, col);
+}
+pub fn spreadsheet_set_status_text(id: usize, text: &str) {
+    crate::backends::zork::sheet_set_status_text(id, text);
+}
+pub fn spreadsheet_set_menu_text(id: usize, text: &str) {
+    crate::backends::zork::sheet_set_menu_text(id, text);
+}
+pub fn spreadsheet_set_tab_data(id: usize, titles: &[String], active: usize) {
+    crate::backends::zork::sheet_set_tab_data(id, titles, active);
+}
+pub fn spreadsheet_set_formula_bar_trailing(id: usize, text: &str) {
+    crate::backends::zork::sheet_set_formula_bar_trailing(id, text);
+}
+pub fn spreadsheet_commit_formula_bar(id: usize) -> Option<(u32, u32, String)> {
+    crate::backends::zork::sheet_commit_edit(id)
+}
+pub fn spreadsheet_cursor_position(id: usize) -> Option<(u32, u32)> {
+    crate::backends::zork::sheet_cursor(id)
+}
+pub fn spreadsheet_edit_state(id: usize) -> Option<(bool, String, usize)> {
+    crate::backends::zork::sheet_edit_state(id)
+}
+
+// -- Diagnostics --
+
+/// Write the widget tree to `path`. See
+/// [`crate::backends::zork::debug_dump_tree`]; returns the node count written,
+/// or 0 if the path could not be written.
+pub fn debug_dump_native_tree(root: *mut c_void, path: &str) {
+    // The NWG signature takes a root HWND because that is what it walks. Zork
+    // addresses widgets by an integer id in a `usize` handed out through
+    // `raw_handle`, so the pointer is read back as the node id and only used
+    // when it names a real node. Passing null dumps the whole tree from its
+    // roots, which is what a caller that has no particular node in mind wants.
+    let root_id = if root.is_null() {
+        None
+    } else {
+        Some(root as usize)
+    };
+    if let Some(id) = root_id {
+        if crate::backends::zork::node_exists(id) {
+            crate::backends::zork::debug_dump_tree_from(id, path);
+            return;
+        }
+    }
+    let _ = crate::backends::zork::debug_dump_tree(path);
+}
+
+/// Mark `id` and every descendant as needing a redraw. Returns how many nodes
+/// were reached.
+pub fn window_queue_redraw_cascades_to_children(id: usize) -> usize {
+    crate::backends::zork::queue_redraw_cascading(id)
+}
+
+/// Whether `id` names a live node. Used by [`debug_dump_native_tree`] to tell
+/// a real root pointer from a null one.
+pub fn node_exists(id: usize) -> bool {
+    crate::backends::zork::node_exists(id)
 }
 
 // -- Event-loop control --

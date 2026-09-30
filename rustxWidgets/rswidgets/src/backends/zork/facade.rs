@@ -13,7 +13,7 @@
 
 use std::os::raw::c_void;
 
-pub use super::model::{MenuItemData, MenuItemKind};
+pub use super::model::{MenuItemData, MenuItemKind, ZorkKind};
 use super::model::{put_callbacks, with_callbacks, with_state, ZorkState};
 
 pub type Callback = Box<dyn FnMut()>;
@@ -211,8 +211,35 @@ pub fn append_child(parent_id: usize, child_id: usize) {
 pub fn remove_child(parent_id: usize, child_id: usize) {
     with_state(|s| s.remove_child(parent_id, child_id));
 }
+/// Lay a box out at `(x, y, w, h)`, then fire its layout handlers.
+///
+/// Two borrows on purpose: the positioning pass is a pure mutation, and the
+/// handlers are user closures that may re-enter the model (a layout callback
+/// that resizes a child is ordinary). See [`ZorkState::layout_box`].
 pub fn layout_box(id: usize, x: i32, y: i32, w: i32, h: i32) {
     with_state(|s| s.layout_box(id, x, y, w, h));
+    fire_layout_callbacks(id, w, h);
+}
+/// Fire `id`'s layout handlers with `(w, h)`.
+pub fn fire_layout_callbacks(id: usize, w: i32, h: i32) {
+    let mut cbs = with_state(|s| ZorkState::take_layout_cbs(s, id));
+    for cb in cbs.iter_mut() {
+        cb(w, h);
+    }
+    // `put_layout_cbs` *replaces*, so re-insert the same set. A handler that
+    // registered a new one during the call would be lost — put the originals
+    // back first and re-add the extra.
+    let extra = with_state(|s| ZorkState::take_layout_cbs(s, id));
+    with_state(|s| ZorkState::put_layout_cbs(s, id, cbs));
+    with_state(|s| ZorkState::put_layout_cbs_add(s, id, extra));
+}
+/// Register a "was (re)laid out" handler, called as `cb(w, h)`.
+pub fn set_layout_callback(id: usize, cb: Box<dyn FnMut(i32, i32)>) {
+    with_state(|s| s.set_layout_callback(id, cb));
+}
+/// How many layout handlers a node has.
+pub fn layout_callback_count(id: usize) -> usize {
+    with_state(|s| s.layout_callback_count(id))
 }
 pub fn measure_box(id: usize) -> Option<(i32, i32)> {
     with_state(|s| s.measure_box(id))
@@ -588,6 +615,327 @@ pub fn sheet_set_border_title(id: usize, title: &str) {
 }
 pub fn sheet_border_title(id: usize) -> Option<String> {
     with_state(|s| s.sheet_border_title(id))
+}
+
+// -- Spreadsheet chrome --
+//
+// Plain model mutations, so `with_state` is right: none of them fires a user
+// closure. Only `sheet_commit_edit` needs the two-phase dance, because it
+// notifies the commit handlers afterwards.
+
+pub fn sheet_chrome(id: usize) -> Option<super::model::SheetChrome> {
+    with_state(|s| s.sheet_chrome(id))
+}
+pub fn sheet_set_menu_text(id: usize, text: &str) {
+    with_state(|s| s.sheet_set_menu_text(id, text));
+}
+pub fn sheet_menu_text(id: usize) -> Option<String> {
+    with_state(|s| s.sheet_menu_text(id))
+}
+pub fn sheet_set_status_text(id: usize, text: &str) {
+    with_state(|s| s.sheet_set_status_text(id, text));
+}
+pub fn sheet_status_text(id: usize) -> Option<String> {
+    with_state(|s| s.sheet_status_text(id))
+}
+pub fn sheet_set_formula_bar_trailing(id: usize, text: &str) {
+    with_state(|s| s.sheet_set_formula_bar_trailing(id, text));
+}
+pub fn sheet_formula_bar_trailing(id: usize) -> Option<String> {
+    with_state(|s| s.sheet_formula_bar_trailing(id))
+}
+pub fn sheet_set_formula_bar(id: usize, address: &str, entry: &str) {
+    with_state(|s| s.sheet_set_formula_bar(id, address, entry));
+}
+pub fn sheet_formula_bar(id: usize) -> Option<(String, String)> {
+    with_state(|s| s.sheet_formula_bar(id))
+}
+pub fn sheet_set_grid_config(id: usize, margin_cols: u32, main_cols: u32) {
+    with_state(|s| s.sheet_set_grid_config(id, margin_cols, main_cols));
+}
+pub fn sheet_set_row_counts(id: usize, header_rows: u32, main_rows: u32) {
+    with_state(|s| s.sheet_set_row_counts(id, header_rows, main_rows));
+}
+pub fn sheet_set_column_layout(id: usize, layout: Vec<(u32, u32, String)>) {
+    with_state(|s| s.sheet_set_column_layout(id, layout));
+}
+pub fn sheet_set_row_labels(id: usize, labels: Vec<(u32, String)>) {
+    with_state(|s| s.sheet_set_row_labels(id, labels));
+}
+pub fn sheet_set_tab_data(id: usize, titles: &[String], active: usize) {
+    with_state(|s| s.sheet_set_tab_data(id, titles, active));
+}
+/// Move the cursor **and** notify the cursor-move handlers.
+///
+/// Two steps, two borrows: the clamp is a pure mutation, and the notification
+/// runs with nothing held so a handler may read the new cursor, write a cell,
+/// or move the cursor again without tripping over the cell. Doing both inside
+/// one `with_state` would make the handler see the model already borrowed.
+pub fn sheet_set_cursor(id: usize, row: u32, col: u32) {
+    with_state(|s| s.sheet_set_cursor(id, row, col));
+    sheet_fire_cursor_move(id);
+}
+pub fn sheet_cursor(id: usize) -> Option<(u32, u32)> {
+    with_state(|s| s.sheet_cursor(id))
+}
+pub fn sheet_set_anchor(id: usize, anchor: Option<(u32, u32)>) {
+    with_state(|s| s.sheet_set_anchor(id, anchor));
+}
+pub fn sheet_set_editing(id: usize, editing: bool, edit_buf: &str, edit_pos: usize) {
+    with_state(|s| s.sheet_set_editing(id, editing, edit_buf, edit_pos));
+}
+pub fn sheet_edit_state(id: usize) -> Option<(bool, String, usize)> {
+    with_state(|s| s.sheet_edit_state(id))
+}
+
+/// Commit the in-progress edit and notify the commit handlers.
+///
+/// The mutation happens first, under one borrow; the notification under a
+/// second, released one. A handler therefore reads a model that is already
+/// consistent — which is what `add_commit_edit_callback` promises, and what
+/// `core::Grid::commit_edit` does (it writes the cells and the app reads them
+/// afterwards).
+pub fn sheet_commit_edit(id: usize) -> Option<(u32, u32, String)> {
+    let committed = with_state(|s| s.sheet_commit_edit(id))?;
+    let mut cbs = with_callbacks(ZorkState::take_sheet_commit_hooks, id);
+    for cb in cbs.iter_mut() {
+        cb(committed.0, committed.1, committed.2.clone());
+    }
+    put_callbacks(ZorkState::put_sheet_commit_hooks, id, cbs);
+    Some(committed)
+}
+
+// -- Spreadsheet input hooks --
+
+pub fn sheet_add_key_callback(id: usize, cb: Box<dyn FnMut()>) {
+    with_state(|s| s.sheet_add_key_callback(id, cb));
+}
+pub fn sheet_add_goto_callback(id: usize, cb: Box<dyn FnMut()>) {
+    with_state(|s| s.sheet_add_goto_callback(id, cb));
+}
+pub fn sheet_add_cursor_move_callback(id: usize, cb: Box<dyn FnMut(u32, u32)>) {
+    with_state(|s| s.sheet_add_cursor_move_callback(id, cb));
+}
+pub fn sheet_add_commit_edit_callback(id: usize, cb: Box<dyn FnMut(u32, u32, String)>) {
+    with_state(|s| s.sheet_add_commit_edit_callback(id, cb));
+}
+/// `(key, goto, cursor_move, commit_edit)` handler counts.
+pub fn sheet_hook_counts(id: usize) -> Option<(usize, usize, usize, usize)> {
+    with_state(|s| s.sheet_hook_counts(id))
+}
+
+/// Fire the "navigated to a cell" handlers.
+pub fn sheet_fire_goto(id: usize) {
+    let mut cbs = with_callbacks(ZorkState::take_sheet_goto_hooks, id);
+    for cb in cbs.iter_mut() {
+        cb();
+    }
+    put_callbacks(ZorkState::put_sheet_goto_hooks, id, cbs);
+}
+
+/// Fire the bare-keypress handlers.
+pub fn sheet_fire_key(id: usize) {
+    let mut cbs = with_callbacks(ZorkState::take_sheet_key_hooks, id);
+    for cb in cbs.iter_mut() {
+        cb();
+    }
+    put_callbacks(ZorkState::put_sheet_key_hooks, id, cbs);
+}
+
+/// Fire the cursor-moved handlers at the cursor's current position.
+pub fn sheet_fire_cursor_move(id: usize) {
+    let pos = with_state(|s| s.sheet_cursor(id));
+    let Some((row, col)) = pos else { return };
+    let mut cbs = with_callbacks(ZorkState::take_sheet_cursor_move_hooks, id);
+    for cb in cbs.iter_mut() {
+        cb(row, col);
+    }
+    put_callbacks(ZorkState::put_sheet_cursor_move_hooks, id, cbs);
+}
+
+// -- Global key callbacks --
+//
+// `add_key_callback` on the other backends is process-wide and takes no
+// widget, so zork's lives here rather than on a node.
+
+pub fn add_key_callback(key: char, cb: Box<dyn FnMut()>) {
+    with_state(|s| s.add_key_callback(key, cb));
+}
+pub fn key_callback_count(key: char) -> usize {
+    with_state(|s| s.key_callback_count(key))
+}
+/// Fire the handlers for `key`; returns how many ran.
+///
+/// Uses `with_state` twice rather than `with_callbacks`, because the key table
+/// is keyed by `char` and not by node id — `with_callbacks` is shaped around a
+/// node. The borrow is still released across the call, which is the part that
+/// matters: a handler may register another handler or touch any widget.
+pub fn fire_key_callback(key: char) -> usize {
+    let mut cbs = with_state(|s| ZorkState::take_key_callbacks(s, key));
+    let n = cbs.len();
+    for cb in cbs.iter_mut() {
+        cb();
+    }
+    // `put_key_callbacks` *extends* rather than replaces, so a handler that
+    // registered a new callback for this key during the call keeps it.
+    with_state(|s| ZorkState::put_key_callbacks(s, key, cbs));
+    n
+}
+
+// -- Timers --
+
+/// Register a one-shot timer. The model has no wall clock, so it fires when
+/// the driver calls [`advance_timers`] past its deadline.
+pub fn timeout_add_once(ms: u32, f: Box<dyn FnOnce()>) {
+    with_state(|s| s.timeout_add_once(ms, f));
+}
+/// Register a repeating timer; fires until its handler returns `false`.
+pub fn timeout_add_repeating(ms: u32, f: Box<dyn FnMut() -> bool>) {
+    with_state(|s| s.timeout_add_repeating(ms, f));
+}
+/// A repeating timer owned by a window, under a caller-chosen handle.
+pub fn timeout_add_repeating_for_window(window_id: usize, id: usize, ms: u32, f: Box<dyn FnMut() -> bool>) {
+    with_state(|s| s.timeout_add_repeating_for_window(window_id, id, ms, f));
+}
+pub fn cancel_timer(id: usize) -> bool {
+    with_state(|s| s.cancel_timer(id))
+}
+/// Fire every timer due within `ms` of virtual time. Returns how many fired.
+pub fn advance_timers(ms: u64) -> usize {
+    with_state(|s| s.advance_timers(ms))
+}
+pub fn timer_count() -> usize {
+    with_state(|s| s.timer_count())
+}
+/// The virtual clock, in milliseconds since model creation.
+pub fn now_ms() -> u64 {
+    with_state(|s| s.now_ms())
+}
+
+// -- Application --
+
+pub fn application_add_action(app_id: usize, action_id: usize) -> Option<String> {
+    with_state(|s| s.application_add_action(app_id, action_id))
+}
+pub fn application_actions(app_id: usize) -> Vec<String> {
+    with_state(|s| s.application_actions(app_id))
+}
+
+// -- Diagnostics --
+
+/// Whether `id` names a live node.
+pub fn node_exists(id: usize) -> bool {
+    with_state(|s| s.node(id).is_some())
+}
+
+/// Write the model as a human-readable tree to `path`, one line per node.
+///
+/// The zork counterpart of NWG's `debug_dump_native_tree`, which walks
+/// Win32 windows. There is no window manager here, so what exists to dump is
+/// the widget tree itself: id, kind, label/title/text, geometry, visibility
+/// and the child's ids. That is the thing worth inspecting when a layout bug
+/// needs ground truth, and on a headless backend it is the *only* thing that
+/// can be ground truth.
+///
+/// Returns the number of nodes written. An unwritable path is reported as 0
+/// rather than panicking, so a diagnostic that cannot run does not take the
+/// process with it.
+pub fn debug_dump_tree(path: &str) -> usize {
+    with_state(|s| dump_tree(s, None, path))
+}
+
+/// [`debug_dump_tree`] rooted at one node instead of at the tree's roots.
+/// Returns 0 when `id` is not a node.
+pub fn debug_dump_tree_from(id: usize, path: &str) -> usize {
+    with_state(|s| dump_tree(s, Some(id), path))
+}
+
+/// The shared walk behind both entry points. `from` of `None` means "start at
+/// every parentless node", `Some(id)` means "start at that node".
+fn dump_tree(s: &ZorkState, from: Option<usize>, path: &str) -> usize {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let roots: Vec<usize> = match from {
+        Some(id) => vec![id],
+        // Roots are nodes with no parent. Walking from them gives each node
+        // one line and one place in the tree; a walk over `nodes` would print
+        // orphans out of order and lose the nesting the reader needs.
+        None => s.nodes.iter().filter(|n| n.parent.is_none()).map(|n| n.id).collect(),
+    };
+    let mut written = 0usize;
+    for root in roots {
+        let mut stack = vec![(root, 0usize)];
+        while let Some((id, depth)) = stack.pop() {
+            let Some(n) = s.node(id) else { continue };
+            let label = match &n.kind {
+                ZorkKind::Window { title } | ZorkKind::Dialog { title } => title.clone(),
+                ZorkKind::Label { text } | ZorkKind::TextView { text } => text.clone(),
+                ZorkKind::Button { label }
+                | ZorkKind::CheckButton { label, .. }
+                | ZorkKind::RadioButton { label, .. } => label.clone(),
+                ZorkKind::DropDown { items, .. } => format!("{} items", items.len()),
+                ZorkKind::Menu => n.menu_label.clone().unwrap_or_default(),
+                ZorkKind::Spreadsheet { border_title } => border_title.clone(),
+                _ => String::new(),
+            };
+            let geo = format!(
+                "at ({},{}) {}x{}",
+                n.props.offset_x.unwrap_or(0),
+                n.props.offset_y.unwrap_or(0),
+                n.props.width.unwrap_or(0),
+                n.props.height.unwrap_or(0),
+            );
+            let vis = if n.props.visible { "visible" } else { "hidden" };
+            let _ = writeln!(
+                out,
+                "{:indent$}{} #{}{} {} {} [{} child(ren), {} callback(s)]",
+                "",
+                n.kind.name(),
+                n.id,
+                label,
+                geo,
+                vis,
+                n.children.len(),
+                n.callbacks.len(),
+                indent = depth * 2,
+            );
+            written += 1;
+            // Push in reverse so the children come out in sibling order.
+            for c in n.children.iter().rev() {
+                stack.push((*c, depth + 1));
+            }
+        }
+    }
+    if std::fs::write(path, out).is_err() {
+        return 0;
+    }
+    written
+}
+
+/// Bump the queued-redraw counter on `id` **and every descendant**.
+///
+/// `Window::queue_redraw` on GTK invalidates the window and GTK then
+/// repaints the subtree; a caller that only expected the window to be marked
+/// dirty would find nothing happens on a backend with no compositor. Doing the
+/// cascade explicitly is what makes the same call meaningful here, and the
+/// return value says how many nodes it reached.
+pub fn queue_redraw_cascading(id: usize) -> usize {
+    with_state(|s| {
+        let mut stack = vec![id];
+        let mut n = 0usize;
+        while let Some(cur) = stack.pop() {
+            let kids = match s.node_mut(cur) {
+                Some(node) => {
+                    node.pointer.redraws += 1;
+                    n += 1;
+                    node.children.clone()
+                }
+                None => continue,
+            };
+            stack.extend(kids);
+        }
+        n
+    })
 }
 
 // -- Lifecycle --
