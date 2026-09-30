@@ -743,6 +743,14 @@ pub fn sheet_set_cursor(id: usize, row: u32, col: u32) {
     with_state(|s| s.sheet_set_cursor(id, row, col));
     sheet_fire_cursor_move(id);
 }
+/// Every set cell as `(row, col, text)`, in address order.
+pub fn sheet_cells(id: usize) -> Vec<(u32, u32, String)> {
+    with_state(|s| s.sheet_cells(id))
+}
+/// How many cells are set on a spreadsheet.
+pub fn sheet_cell_count(id: usize) -> usize {
+    with_state(|s| s.sheet_cell_count(id))
+}
 pub fn sheet_cursor(id: usize) -> Option<(u32, u32)> {
     with_state(|s| s.sheet_cursor(id))
 }

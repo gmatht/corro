@@ -2378,6 +2378,27 @@ impl ZorkState {
         }
     }
 
+    /// Every set cell as `(row, col, text)`, in address order.
+    ///
+    /// Sorted, so a reader that renders or diffs the sheet gets the same order
+    /// every time — a `HashMap` iteration order would make the grid reshuffle
+    /// between runs, which defeats the point of printing it.
+    pub fn sheet_cells(&self, id: usize) -> Vec<(u32, u32, String)> {
+        let Some(n) = self.node(id) else { return Vec::new() };
+        let mut out: Vec<(u32, u32, String)> = n
+            .cells
+            .iter()
+            .map(|((r, c), cell)| (*r, *c, cell.text.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        out
+    }
+
+    /// How many cells are set on a spreadsheet.
+    pub fn sheet_cell_count(&self, id: usize) -> usize {
+        self.node(id).map(|n| n.cells.len()).unwrap_or(0)
+    }
+
     pub fn sheet_cursor(&self, id: usize) -> Option<(u32, u32)> {
         self.node(id).map(|n| n.chrome.cursor)
     }

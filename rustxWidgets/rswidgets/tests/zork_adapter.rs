@@ -1605,3 +1605,77 @@ mod gestures {
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// The `grid` verb renders a sheet's cells.
+//
+// The verb prints the *cells the model holds*, so the test asserts on the
+// cells themselves — the rendering is the REPL's business, and these are the
+// inputs it reads.
+// ---------------------------------------------------------------------------
+
+/// The cells must come back in address order.
+///
+/// A `HashMap` iteration order would make the grid reshuffle between two runs
+/// of the same session, which is exactly what a printed table must not do.
+#[test]
+fn sheet_cells_are_returned_in_address_order() {
+    serial(|| {
+        let _w = za::create_window().unwrap();
+        let ss = za::create_spreadsheet().unwrap();
+        // Written back-to-front and out of column order on purpose.
+        za::spreadsheet_set_cell(ss.id(), 3, 2, "d2");
+        za::spreadsheet_set_cell(ss.id(), 1, 2, "b2");
+        za::spreadsheet_set_cell(ss.id(), 2, 1, "c1");
+        za::spreadsheet_set_cell(ss.id(), 1, 1, "a1");
+        let cells = rswidgets::backends::zork::sheet_cells(ss.id());
+        let addr: Vec<(u32, u32)> = cells.iter().map(|(r, c, _)| (*r, *c)).collect();
+        assert_eq!(
+            addr,
+            vec![(1, 1), (1, 2), (2, 1), (3, 2)],
+            "cells must be sorted by row then column"
+        );
+        assert_eq!(rswidgets::backends::zork::sheet_cell_count(ss.id()), 4);
+    });
+}
+
+/// A 0-based sheet is not an empty sheet.
+///
+/// The examples address cells from 0, corro's own pnc backend addresses them
+/// from 1, and the model stores whichever it was given. A grid that assumed
+/// one index space printed an empty band of rows above the real cells — three
+/// blank lines and then the values, with the cursor marking nothing. Reading
+/// from the minimum finds them wherever they start.
+#[test]
+fn sheet_cells_are_read_from_whichever_index_they_start_at() {
+    serial(|| {
+        let _w = za::create_window().unwrap();
+        let ss = za::create_spreadsheet().unwrap();
+        za::spreadsheet_set_cell(ss.id(), 0, 0, "Revenue");
+        za::spreadsheet_set_cell(ss.id(), 1, 1, "1201");
+        za::spreadsheet_set_cell(ss.id(), 2, 1, "800");
+        let cells = rswidgets::backends::zork::sheet_cells(ss.id());
+        assert_eq!(cells[0], (0, 0, "Revenue".to_string()));
+        assert_eq!(cells[1], (1, 1, "1201".to_string()));
+        assert_eq!(cells[2], (2, 1, "800".to_string()));
+        // The cursor is 1-based (it shares the cells' space, since corro sets
+        // both from one index), so it lands on the `1201` above.
+        za::spreadsheet_set_cursor(ss.id(), 1, 1);
+        assert_eq!(
+            rswidgets::backends::zork::sheet_cursor(ss.id()),
+            Some((1, 1)),
+            "the cursor must address the same cell `sheet cell 1 1` reads"
+        );
+    });
+}
+
+/// An unwritten sheet is empty, not a table of blank rows.
+#[test]
+fn an_empty_spreadsheet_reports_no_cells() {
+    serial(|| {
+        let _w = za::create_window().unwrap();
+        let ss = za::create_spreadsheet().unwrap();
+        assert!(rswidgets::backends::zork::sheet_cells(ss.id()).is_empty());
+        assert_eq!(rswidgets::backends::zork::sheet_cell_count(ss.id()), 0);
+    });
+}

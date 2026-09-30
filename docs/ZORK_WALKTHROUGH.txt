@@ -395,3 +395,67 @@ once the same file, and the generated one -- being written by the test that
 reads it -- always won, silently replacing this transcript on any `cargo
 test`. `git show bd8e326f` is the commit that spent itself undoing that; they
 are separate files now, and the test regenerates neither unless asked.
+
+10. THE GRID -- the cells themselves
+
+Everything above showed the sheet's *chrome*: which menu, which tab, where the
+cursor sat. This section shows what is in the cells.
+
+The `grid` verb was added for exactly this: `sheet cell 1 1` reads one cell,
+and without a verb for the whole sheet the REPL could describe a spreadsheet's
+chrome in detail and never print its contents. The demo builds the F9/F10
+surface -- cursor, labels, tabs, status line, formula bar -- and three cells:
+
+    za::spreadsheet_set_cell(ss.id(), 0, 0, "Revenue");
+    za::spreadsheet_set_cell(ss.id(), 1, 1, "1200");
+    za::spreadsheet_set_cell(ss.id(), 2, 1, "800");
+    ss.set_editing(true, "1201", 4);      // so the commit below lands on 1201
+
+And here it is being driven. Every line below is real output:
+
+    $ printf 'sheet cursor 1 1\nsheet edit 1500\nsheet commit\nsheet cursor 2 2\ngrid\nquit\n' \
+        | ./target/debug/examples/zork-sheet
+    (You are not standing on it; using spreadsheet #2. Move there to aim at a different one.)
+    Cursor at R1C1.
+    Editing R1C1
+    Committed "1500" to R1C1.
+    Cursor at R2C2.
+    1   Revenue     |        |        |
+    2               |1500    |        |
+    3               |800     |[]|
+      cursor at (2,2); 3 row(s) x 3 col(s) from (0,0); 3 cell(s) set
+
+Reading that table:
+
+- `Revenue` is at (0,0). The demo wrote it at row 0, column 0 -- see the
+  `spreadsheet_set_cell` calls above. corro's own pancurses backend addresses
+  cells from 1, because `src/gui/pnc_backend.rs` passes one
+  `cursor_display_ri` to both `set_cursor` and `set_cell`. So there is no single
+  index space here, and `grid` prints the cells the model holds, starting from
+  whichever index they begin at. Reading from a hard-coded 1 printed an empty
+  band of rows above the real values with the cursor marking nothing, which is
+  what the first version of this verb did.
+
+- The row numbers `1`, `2`, `3` in the gutter are the sheet's own row labels,
+  not the cell addresses. They come from the demo's `set_row_labels`, and they
+  are stored 0-indexed while the cells are addressed as given -- the two spaces
+  are deliberately not merged, which is why the first row of values sits
+  against label `2` and not `1`.
+
+- `1500` is what the edit wrote. The cell held `1201` when the demo started; the
+  `sheet edit 1500` / `sheet commit` pair is the F10 half of the surface being
+  driven end to end, and the grid is what proves the write landed.
+
+- The cursor is marked in the text as `[...]`, not by colour, so the table
+  survives a pipe and a log. At (2,2) there is no cell, so it prints as `[]` --
+  a cursor is a position, and an unwritten position is still a position. The
+  table grew to three columns because the cursor sits outside the written
+  cells; a cursor past the last cell would otherwise be invisible.
+
+The verb also serves corro itself. It reads through
+`ZorkState::sheet_cells` / `sheet_cell_count`, sorted by row then column -- a
+`HashMap` iteration order would reshuffle the table between two runs of the
+same session, which is the one thing a printed table must not do. Those, and
+the index-space rule above, are asserted in
+`tests/zork_adapter.rs::sheet_cells_are_returned_in_address_order` and
+`::sheet_cells_are_read_from_whichever_index_they_start_at`.

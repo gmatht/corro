@@ -1035,6 +1035,114 @@ fn execute_command(state: &mut ZorkState, aim_notice: &mut Vec<usize>, line: &st
                 other => println!("Unknown sheet command \"{}\". Try 'sheet'.", other),
             }
         }
+        "grid" => {
+            // Render a Spreadsheet's cells as a table, with the cursor marked.
+            //
+            // `sheet cell 1 1` reads one cell; this reads the *sheet*, which is
+            // the thing a reader actually wants to see. It exists because the
+            // REPL could otherwise describe a spreadsheet's chrome in detail
+            // and never show what was in it — the `docs/ZORK_WALKTHROUGH.txt`
+            // section on the grid needed this verb to exist.
+            let id = match resolve_spreadsheet(state, args.first().copied(), aim_notice) {
+                Some(id) => id,
+                None => return,
+            };
+            let Some(chrome) = state.sheet_chrome(id) else {
+                println!("That is not a Spreadsheet.");
+                return;
+            };
+            // The cells themselves decide the extent, because there is no one
+            // index space: a caller may address a sheet 0-based (the examples
+            // do) or 1-based (corro's own pnc backend does), and the model
+            // stores whatever it was given. Reading from the minimum and taking
+            // the maximum prints what is *there* instead of an empty band of
+            // rows above it, which is what assuming 1-based printed.
+            let cells = state.sheet_cells(id);
+            if cells.is_empty() {
+                println!("The sheet is empty.");
+                return;
+            }
+            let (min_r, max_r) = cells.iter().fold((u32::MAX, 0), |(lo, hi), (r, _, _)| {
+                (lo.min(*r), hi.max(*r))
+            });
+            let (min_c, max_c) = cells.iter().fold((u32::MAX, 0), |(lo, hi), (_, c, _)| {
+                (lo.min(*c), hi.max(*c))
+            });
+            // One extra row/col when the cursor sits outside the written cells,
+            // so a moved cursor is visible instead of silently off the table.
+            let (cr, cc) = chrome.cursor;
+            let max_r = max_r.max(cr);
+            let max_c = max_c.max(cc);
+            let at = |r: u32, c: u32| {
+                cells
+                    .iter()
+                    .find(|(rr, ccc, _)| *rr == r && *ccc == c)
+                    .map(|(_, _, t)| t.as_str())
+                    .unwrap_or("")
+            };
+            let widths: Vec<usize> = (min_c..=max_c)
+                .map(|c| {
+                    let from_cells = cells
+                        .iter()
+                        .filter(|(_, cc, _)| *cc == c)
+                        .map(|(_, _, t)| t.chars().count())
+                        .max()
+                        .unwrap_or(0);
+                    // `column_layout` is 0-indexed and may name a column this
+                    // sheet never writes; take it as a floor only.
+                    let from_layout = chrome
+                        .column_layout
+                        .iter()
+                        .find(|(i, _, _)| *i + min_c == c)
+                        .map(|(_, w, _)| *w as usize)
+                        .unwrap_or(0);
+                    from_cells.max(from_layout).max(1)
+                })
+                .collect();
+            // The label gutter is as wide as its widest label, so columns start
+            // in the same place on every line. Labels are 0-indexed, cells are
+            // addressed as given — the two spaces are deliberately not merged.
+            let gutter = chrome
+                .row_labels
+                .iter()
+                .map(|(_, l)| l.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(4);
+            for r in min_r..=max_r {
+                let mut line = String::new();
+                match chrome.row_labels.iter().find(|(i, _)| *i == r) {
+                    Some((_, l)) => line.push_str(&format!("{:<width$}", l, width = gutter)),
+                    None => line.push_str(&" ".repeat(gutter)),
+                }
+                for (i, c) in (min_c..=max_c).enumerate() {
+                    let w = widths[i];
+                    let mut v = at(r, c).to_string();
+                    if v.chars().count() > w {
+                        v = v.chars().take(w.saturating_sub(1)).collect::<String>() + "\u{2026}";
+                    }
+                    v = format!("{:<width$}", v, width = w);
+                    // The cursor is marked in the text, not by colour, so the
+                    // output survives a pipe and a log.
+                    line.push_str(&if chrome.cursor == (r, c) {
+                        format!("[{}]", v.trim_end())
+                    } else {
+                        v
+                    });
+                    line.push('|');
+                }
+                println!("{line}");
+            }
+            println!(
+                "  cursor at ({cr},{cc}); {} row(s) x {} col(s) from ({min_r},{min_c}); {} cell(s) set",
+                max_r - min_r + 1,
+                max_c - min_c + 1,
+                cells.len()
+            );
+            if chrome.editing {
+                println!("  editing \"{}\" (caret {})", chrome.edit_buf, chrome.edit_pos);
+            }
+        }
         "timers" => {
             // Timers fire on a *virtual* clock, so a REPL user has to be told
             // how to move it — otherwise `timers` looks like a list of things
@@ -1128,6 +1236,7 @@ fn execute_command(state: &mut ZorkState, aim_notice: &mut Vec<usize>, line: &st
             println!("  focus                 - take keyboard focus");
             println!("  layout                - lay out a Box's children");
             println!("  sheet [n]             - show a Spreadsheet's chrome (cursor, tabs, status)");
+            println!("  grid [n]              - print a Spreadsheet's cells as a table");
             println!("  sheet cursor <r> <c>  - move the spreadsheet cursor");
             println!("  sheet cell <r> <c> [text] - read or write a cell");
             println!("  sheet edit <text>     - start editing the cursor cell");
@@ -1157,6 +1266,34 @@ fn execute_command(state: &mut ZorkState, aim_notice: &mut Vec<usize>, line: &st
             }
         }
     }
+}
+
+/// The spreadsheet to aim at: the named one, the one you are standing on, or
+/// the one the host built.
+///
+/// Prints a note the first time it substitutes for where you are standing, so
+/// a session that starts on the Window — which is where every corro session
+/// starts — can still reach the grid.
+fn resolve_spreadsheet(state: &ZorkState, target: Option<&str>, aim_notice: &mut Vec<usize>) -> Option<usize> {
+    if let Some(t) = target {
+        return resolve_arg_to_id(state, t);
+    }
+    let here = state.current_id;
+    if matches!(state.node(here).map(|n| &n.kind), Some(ZorkKind::Spreadsheet { .. })) {
+        return Some(here);
+    }
+    let n = state
+        .nodes
+        .iter()
+        .find(|n| matches!(n.kind, ZorkKind::Spreadsheet { .. }))?;
+    if !aim_notice.contains(&here) {
+        aim_notice.push(here);
+        println!(
+            "(You are not standing on it; using spreadsheet #{}. Move there to aim at a different one.)",
+            n.id
+        );
+    }
+    Some(n.id)
 }
 
 /// Parse `"<a> <b>"` as a pair of `i32`, for `set size` / `set offset`.
