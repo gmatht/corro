@@ -436,12 +436,14 @@ rather than a corro bug.
 
 The zork backend has since grown a spreadsheet surface the REPL drives
 directly -- `sheet` shows and moves the cursor, reads and writes cells, and
-commits an edit; `timers` and `wait` move the model's virtual clock. None of
-it is demonstrable in *this* file, and implying otherwise would be wrong:
-corro builds no `Spreadsheet` node, so `sheet` has nothing to aim at here. It
-needs a model that has one, which is what
-`cargo run -p rswidgets --no-default-features --features zork --example zork-sheet`
-builds. `timers` and `wait` work on any model, so try them here:
+commits an edit; `timers` and `wait` move the model's virtual clock. The
+spreadsheet half needs a model that has a `Spreadsheet` in it, and corro's own
+build does not: `grid` and `sheet` have nothing to aim at here, which is why
+`printf 'grid\n' | ./target/debug/corro` answers `There is no Spreadsheet in
+this model.` Section 10 is that surface driven, against the example that does
+build one --
+`cargo run -p rswidgets --no-default-features --features zork --example zork-sheet`.
+`timers` and `wait` work on any model, so try them here:
 
     $ printf 'timers\nwait 200\ntimers\nquit\n' | ./target/debug/corro
     No timers are pending.
