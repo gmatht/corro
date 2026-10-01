@@ -160,3 +160,10 @@ required-features = ["zork"]
 [[example]]
 name = "zork-edit"
 required-features = ["zork"]
+
+# A sheet-less model handed to the REPL, used as a fixture by
+# `tests/zork_repl_says_why.rs`. Gated on `zork` like the rest: the adapter
+# and the REPL it hands off to do not exist without the feature.
+[[example]]
+name = "zork-repl"
+required-features = ["zork"]

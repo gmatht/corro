@@ -17,6 +17,25 @@ use crate::backends::zork::model::{ZorkKind, ZorkNode, ZorkState};
 /// session and a test see the same deadlines.
 const REPL_TICK_MS: u64 = 50;
 
+/// What a spreadsheet verb says when the model holds no `Spreadsheet`.
+///
+/// corro's own build never makes one, and that is the model this REPL starts
+/// with, so this is the first thing a reader of `sheet` or `grid` meets. The
+/// two verbs did not agree: `grid` returned on an unresolved target without
+/// printing, so `grid` on corro's tree was silent where `sheet` explained
+/// itself. Silence is the worst of the three possible answers -- it reads as
+/// an empty sheet, a hang, or a verb that does not exist. One constant, so the
+/// second verb written cannot quietly re-acquire the bug.
+const NO_SPREADSHEET: &str = "There is no Spreadsheet in this model.";
+
+/// What a spreadsheet verb says when the target named something else.
+///
+/// A distinct answer from [`NO_SPREADSHEET`]: `grid 1` on corro's tree names
+/// the Window, which exists. "No Spreadsheet" would blame the model for a
+/// target the reader chose, and "the sheet is empty" would blame the sheet
+/// for a sheet that was never there.
+const NOT_A_SPREADSHEET: &str = "That is not a Spreadsheet.";
+
 pub struct ZorkApp {
     state: ZorkState,
     /// Standees already told that a `sheet` command aimed at a spreadsheet
@@ -910,29 +929,22 @@ fn execute_command(state: &mut ZorkState, aim_notice: &mut Vec<usize>, line: &st
                 // spreadsheet is a child of the window you start in. The note
                 // is printed once per standee, not once per command, so
                 // driving the grid does not scroll the explanation away.
-                None => {
-                    let here = state.current_id;
-                    if matches!(state.node(here).map(|n| &n.kind), Some(ZorkKind::Spreadsheet { .. })) {
-                        here
-                    } else {
-                        match state.nodes.iter().find(|n| matches!(n.kind, ZorkKind::Spreadsheet { .. })) {
-                            Some(n) => {
-                                if !aim_notice.contains(&here) {
-                                    aim_notice.push(here);
-                                    println!("(You are not standing on it; using spreadsheet #{}. Move there to aim at a different one.)", n.id);
-                                }
-                                n.id
-                            }
-                            None => {
-                                println!("There is no Spreadsheet in this model.");
-                                return;
-                            }
-                        }
+                //
+                // `resolve_spreadsheet` does exactly this, and returns the
+                // sentence to print when there is nothing to aim at. It used
+                // to be inlined here, so the untargeted path was written
+                // twice and the two copies could disagree -- and did, once
+                // `grid` was added and had no copy at all.
+                None => match resolve_spreadsheet(state, None, aim_notice) {
+                    Ok(id) => id,
+                    Err(why) => {
+                        println!("{why}");
+                        return;
                     }
-                }
+                },
             };
             if !matches!(state.node(id).map(|n| &n.kind), Some(ZorkKind::Spreadsheet { .. })) {
-                println!("That is not a Spreadsheet.");
+                println!("{NOT_A_SPREADSHEET}");
                 return;
             }
             match sub {
@@ -1044,11 +1056,21 @@ fn execute_command(state: &mut ZorkState, aim_notice: &mut Vec<usize>, line: &st
             // and never show what was in it — the `docs/ZORK_WALKTHROUGH.txt`
             // section on the grid needed this verb to exist.
             let id = match resolve_spreadsheet(state, args.first().copied(), aim_notice) {
-                Some(id) => id,
-                None => return,
+                Ok(id) => id,
+                // `sheet` reports the absence; `grid` used to `return` here
+                // bare, so on corro's own tree -- which builds no Spreadsheet,
+                // and is the model this REPL starts with -- `grid` printed
+                // nothing at all, and the reader could not tell an absent
+                // sheet from an empty one. A named target (`grid 1`) lands
+                // here too, so it is silent on the same model unless the
+                // message is printed from this one arm.
+                Err(why) => {
+                    println!("{why}");
+                    return;
+                }
             };
             let Some(chrome) = state.sheet_chrome(id) else {
-                println!("That is not a Spreadsheet.");
+                println!("{NOT_A_SPREADSHEET}");
                 return;
             };
             // The cells themselves decide the extent, because there is no one
@@ -1268,24 +1290,39 @@ fn execute_command(state: &mut ZorkState, aim_notice: &mut Vec<usize>, line: &st
     }
 }
 
-/// The spreadsheet to aim at: the named one, the one you are standing on, or
-/// the one the host built.
+/// The spreadsheet to aim at, or the sentence explaining that there is none.
 ///
-/// Prints a note the first time it substitutes for where you are standing, so
-/// a session that starts on the Window — which is where every corro session
-/// starts — can still reach the grid.
-fn resolve_spreadsheet(state: &ZorkState, target: Option<&str>, aim_notice: &mut Vec<usize>) -> Option<usize> {
+/// Both spreadsheet verbs resolve their target through here, so the absence is
+/// reported from one place and the two verbs cannot answer it differently.
+/// Returning the message rather than printing it keeps the answer assertable:
+/// `grid` printing nothing is precisely the bug this exists to rule out, and
+/// a test that cannot see stdout would pass again on the next regression.
+fn resolve_spreadsheet(
+    state: &ZorkState,
+    target: Option<&str>,
+    aim_notice: &mut Vec<usize>,
+) -> Result<usize, &'static str> {
+    let is_sheet = |id: usize| {
+        matches!(state.node(id).map(|n| &n.kind), Some(ZorkKind::Spreadsheet { .. }))
+    };
     if let Some(t) = target {
-        return resolve_arg_to_id(state, t);
+        // A named target that resolves to something real must still be *the
+        // right kind of thing*. This check cannot be left to the caller: the
+        // cell reads on a non-spreadsheet all answer "no such cell", so a
+        // verb that asked first would answer "The sheet is empty." for a sheet
+        // that does not exist.
+        let id = resolve_arg_to_id(state, t).ok_or(NO_SPREADSHEET)?;
+        return if is_sheet(id) { Ok(id) } else { Err(NOT_A_SPREADSHEET) };
     }
     let here = state.current_id;
-    if matches!(state.node(here).map(|n| &n.kind), Some(ZorkKind::Spreadsheet { .. })) {
-        return Some(here);
+    if is_sheet(here) {
+        return Ok(here);
     }
     let n = state
         .nodes
         .iter()
-        .find(|n| matches!(n.kind, ZorkKind::Spreadsheet { .. }))?;
+        .find(|n| matches!(n.kind, ZorkKind::Spreadsheet { .. }))
+        .ok_or(NO_SPREADSHEET)?;
     if !aim_notice.contains(&here) {
         aim_notice.push(here);
         println!(
@@ -1293,7 +1330,7 @@ fn resolve_spreadsheet(state: &ZorkState, target: Option<&str>, aim_notice: &mut
             n.id
         );
     }
-    Some(n.id)
+    Ok(n.id)
 }
 
 /// Parse `"<a> <b>"` as a pair of `i32`, for `set size` / `set offset`.
@@ -1534,5 +1571,114 @@ mod menu_label_tests {
         assert_eq!(menu_label_plain("ASCII table"), "ASCII table");
         assert_eq!(menu_label_plain(""), "");
         assert_eq!(menu_label_plain("Trailing_"), "Trailing_");
+    }
+}
+
+/// A spreadsheet verb must answer when there is no spreadsheet to aim at.
+///
+/// corro's own build never makes a `Spreadsheet` node, and that is the model
+/// this REPL starts with, so `grid` is typed into exactly this situation by
+/// anyone following the walkthrough. It used to `return` on an unresolved
+/// target without printing, so on corro's tree it produced no output at all --
+/// silence that reads equally as an empty sheet, a hang, or a verb that does
+/// not exist, while `sheet` on the same model explained itself.
+#[cfg(test)]
+mod no_spreadsheet_tests {
+    use super::{resolve_arg_to_id, resolve_spreadsheet, NO_SPREADSHEET, NOT_A_SPREADSHEET};
+    use crate::backends::zork::model::{ZorkKind, ZorkState};
+
+    /// A model holding a window and nothing else -- no `Spreadsheet`, which is
+    /// corro's own situation.
+    fn bare_model() -> ZorkState {
+        let mut s = ZorkState::new();
+        s.add_node(ZorkKind::Window { title: "corro".into() }, None);
+        s
+    }
+
+    /// The premise, asserted so a change to `bare_model` cannot quietly turn
+    /// these tests into ones that pass for the wrong reason.
+    fn assert_bare(s: &ZorkState) {
+        assert!(
+            !s.nodes
+                .iter()
+                .any(|n| matches!(n.kind, ZorkKind::Spreadsheet { .. })),
+            "this model must hold no Spreadsheet: that is what these tests are about"
+        );
+    }
+
+    /// With no spreadsheet, resolution fails *with the reason*.
+    ///
+    /// This is the assertion the bug would fail: `grid` reached this same
+    /// function and discarded its answer, so the absence was reported
+    /// nowhere. An untargeted `grid` and a target that resolves to nothing
+    /// are both the model's absence; they are checked apart because they
+    /// leave the function by different routes.
+    #[test]
+    fn a_model_without_a_spreadsheet_says_which_thing_is_missing() {
+        for target in [None, Some("nope")] {
+            let s = bare_model();
+            assert_bare(&s);
+            let mut notice = Vec::new();
+            assert_eq!(
+                resolve_spreadsheet(&s, target, &mut notice),
+                Err(NO_SPREADSHEET),
+                "grid {target:?} must be told the sheet is absent, not left silent"
+            );
+        }
+    }
+
+    /// A target that names a real node which is not a spreadsheet must be
+    /// told *that*, not that the sheet is empty and not that there is none.
+    ///
+    /// `grid 1` on corro's own tree names the Window, which exists. The
+    /// tempting wrong answer is "The sheet is empty.": every cell read on a
+    /// non-spreadsheet returns `None`, so asking first and reporting the
+    /// emptiness second blames a sheet that was never built. The other wrong
+    /// answer is `NO_SPREADSHEET`, which blames the model for a target the
+    /// reader chose. Both are ruled out here, and the premise is asserted so
+    /// the test cannot pass because the target stopped resolving.
+    #[test]
+    fn a_target_that_is_not_a_spreadsheet_is_named_as_such() {
+        let mut s = bare_model();
+        // A child, so the numbered target `1` names something real.
+        s.add_node(ZorkKind::Label { text: "not a sheet".into() }, Some(s.current_id));
+        let mut notice = Vec::new();
+        let resolved = resolve_arg_to_id(&s, "1");
+        assert!(resolved.is_some(), "premise: `1` must name the label");
+        assert_eq!(
+            resolve_spreadsheet(&s, Some("1"), &mut notice),
+            Err(NOT_A_SPREADSHEET),
+            "a target that exists but is the wrong kind has its own answer"
+        );
+        assert_ne!(
+            NOT_A_SPREADSHEET, NO_SPREADSHEET,
+            "the two failures are distinguishable, or the reader is guessing"
+        );
+    }
+
+    /// The same model with a spreadsheet in it must still resolve, so the
+    /// failure above is about the absence and not about a resolver that
+    /// never works. The spreadsheet is parented to the window so the numbered
+    /// target `1` names it, which is the route `grid 1` takes.
+    #[test]
+    fn a_model_with_a_spreadsheet_still_resolves() {
+        let mut s = bare_model();
+        let window = s.current_id;
+        let id = s.add_node(
+            ZorkKind::Spreadsheet { border_title: String::new() },
+            Some(window),
+        );
+        let mut notice = Vec::new();
+        assert_eq!(resolve_spreadsheet(&s, None, &mut notice), Ok(id));
+        assert_eq!(resolve_spreadsheet(&s, Some("1"), &mut notice), Ok(id));
+    }
+
+    /// The wording is pinned because `docs/ZORK_WALKTHROUGH.txt` quotes this
+    /// sentence verbatim, as the answer `grid` gives on corro's own tree. If
+    /// the message is reworded, that transcript is stale and this test is
+    /// what says so.
+    #[test]
+    fn the_message_is_the_one_the_walkthrough_quotes() {
+        assert_eq!(NO_SPREADSHEET, "There is no Spreadsheet in this model.");
     }
 }
