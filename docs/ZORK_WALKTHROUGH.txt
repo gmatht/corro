@@ -350,53 +350,8 @@ so `Expor_t` hangs off `_File` rather than being flattened beside it.
 Both were checked to fail when the duplication is put back.
 
 ------------------------------------------------------------------------
-WHAT THIS IS, AND WHAT IT IS NOT
-------------------------------------------------------------------------
-
-This is a **model driver**. corro builds its real widget tree and its real
-menu model; the REPL lets you walk the tree and fire real menu actions.
-
-It is **not** an interactive spreadsheet. There is no display, so there is
-no key routing to the grid, no clicking cells, no scrolling with a wheel.
-`docs/ZORK_MISSING.md` enumerates what the backend genuinely lacks, and
-what it deliberately does not do (`[-]` rows).
-
-Features that are absent from *every* backend are listed there too. One has
-since been closed on the headless side: `DrawContext::draw_rgba_image` now
-records on zork's recording context, so a draw callback that blits an image
-leaves an op a test can assert on. The other backends still take the trait
-default, and corro never calls it either way, so it was backend completeness
-rather than a corro bug.
-
-The zork backend has since grown a spreadsheet surface the REPL drives
-directly -- `sheet` shows and moves the cursor, reads and writes cells, and
-commits an edit; `timers` and `wait` move the model's virtual clock. None of
-it is demonstrable in *this* file, and implying otherwise would be wrong:
-corro builds no `Spreadsheet` node, so `sheet` has nothing to aim at here. It
-needs a model that has one, which is what
-`cargo run -p rswidgets --no-default-features --features zork --example zork-sheet`
-builds. `timers` and `wait` work on any model, so try them here:
-
-    $ printf 'timers\nwait 200\ntimers\nquit\n' | ./target/debug/corro
-    No timers are pending.
-    ...
-    200ms later, 0 timer(s) fired; clock at 300ms.
-
-The clock reads 300ms rather than 200ms because every REPL prompt advances it
-by 50ms before reading, so `wait 200` lands on the ticks the two prompts
-already contributed. That is deliberate: a host that installs a timer and
-hands off to the REPL sees it come due across turns, with no loop of its own.
-
-There is also a second, machine-written document,
-`docs/ZORK_FEATURE_REPORT.txt`: a [PASS]/[MISS] row per widget, regenerated
-by `tests/zork_feature_parity.rs` with `CORRO_ZORK_WALKTHROUGH_WRITE=1`. This
-file is the one to read; that one is what the assertions parse. They were
-once the same file, and the generated one -- being written by the test that
-reads it -- always won, silently replacing this transcript on any `cargo
-test`. `git show bd8e326f` is the commit that spent itself undoing that; they
-are separate files now, and the test regenerates neither unless asked.
-
 10. THE GRID -- the cells themselves
+------------------------------------------------------------------------
 
 Everything above showed the sheet's *chrome*: which menu, which tab, where the
 cursor sat. This section shows what is in the cells.
@@ -459,3 +414,50 @@ same session, which is the one thing a printed table must not do. Those, and
 the index-space rule above, are asserted in
 `tests/zork_adapter.rs::sheet_cells_are_returned_in_address_order` and
 `::sheet_cells_are_read_from_whichever_index_they_start_at`.
+
+------------------------------------------------------------------------
+WHAT THIS IS, AND WHAT IT IS NOT
+------------------------------------------------------------------------
+
+This is a **model driver**. corro builds its real widget tree and its real
+menu model; the REPL lets you walk the tree and fire real menu actions.
+
+It is **not** an interactive spreadsheet. There is no display, so there is
+no key routing to the grid, no clicking cells, no scrolling with a wheel.
+`docs/ZORK_MISSING.md` enumerates what the backend genuinely lacks, and
+what it deliberately does not do (`[-]` rows).
+
+Features that are absent from *every* backend are listed there too. One has
+since been closed on the headless side: `DrawContext::draw_rgba_image` now
+records on zork's recording context, so a draw callback that blits an image
+leaves an op a test can assert on. The other backends still take the trait
+default, and corro never calls it either way, so it was backend completeness
+rather than a corro bug.
+
+The zork backend has since grown a spreadsheet surface the REPL drives
+directly -- `sheet` shows and moves the cursor, reads and writes cells, and
+commits an edit; `timers` and `wait` move the model's virtual clock. None of
+it is demonstrable in *this* file, and implying otherwise would be wrong:
+corro builds no `Spreadsheet` node, so `sheet` has nothing to aim at here. It
+needs a model that has one, which is what
+`cargo run -p rswidgets --no-default-features --features zork --example zork-sheet`
+builds. `timers` and `wait` work on any model, so try them here:
+
+    $ printf 'timers\nwait 200\ntimers\nquit\n' | ./target/debug/corro
+    No timers are pending.
+    ...
+    200ms later, 0 timer(s) fired; clock at 300ms.
+
+The clock reads 300ms rather than 200ms because every REPL prompt advances it
+by 50ms before reading, so `wait 200` lands on the ticks the two prompts
+already contributed. That is deliberate: a host that installs a timer and
+hands off to the REPL sees it come due across turns, with no loop of its own.
+
+There is also a second, machine-written document,
+`docs/ZORK_FEATURE_REPORT.txt`: a [PASS]/[MISS] row per widget, regenerated
+by `tests/zork_feature_parity.rs` with `CORRO_ZORK_WALKTHROUGH_WRITE=1`. This
+file is the one to read; that one is what the assertions parse. They were
+once the same file, and the generated one -- being written by the test that
+reads it -- always won, silently replacing this transcript on any `cargo
+test`. `git show bd8e326f` is the commit that spent itself undoing that; they
+are separate files now, and the test regenerates neither unless asked.
