@@ -968,6 +968,11 @@ pub enum InterColumnTrailing {
 /// The range always starts at 0 (the first main column) so that columns
 /// between the left-margin anchor and the cursor are never skipped.
 /// `hi` extends at least to the cursor's main column.
+///
+/// Costs one `next_back()` on the grid's occupancy index, not a scan of
+/// `0..main_cols`: this runs on the per-frame viewport path
+/// (`visible_col_indices`), and a sheet-wide loop here made a 9-column
+/// viewport cost time proportional to the sheet's width.
 pub fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (u32, u32) {
     let g = &state.grid;
     let lm = MARGIN_COLS;
@@ -986,15 +991,27 @@ pub fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (u32, u32) {
         mc_u32.saturating_sub(1)
     };
 
-    let mut lo = mc_u32;
-    let mut hi = 0u32;
+    // The window is a range of *addressable* main columns (`0..mc`), so the
+    // index answer — which may name a `Main(c)` column past the current
+    // extent, because a header/footer can spell one — is clamped to the sheet
+    // first. The emptiness test must look at the *unclamped* answer: a single
+    // header on `Main(500)` of a 4-column sheet names no column inside
+    // `0..4`, and clamping before the test would make it look like column 3.
+    let index_last = g.last_main_col_with_content();
+    let index_first = g.first_main_col_with_content();
 
-    for c in 0..mc_u32 {
-        if g.logical_col_has_content(lm + c as usize) {
-            lo = lo.min(c);
-            hi = hi.max(c);
+    // `lo` is the first content column minus one, `hi` the last plus one.
+    // Every caller uses only `hi`; `lo` is kept exact for the contract.
+    let (mut lo, mut hi) = match (index_first, index_last) {
+        (Some(first), Some(last)) if last < mc_u32 => {
+            debug_assert!(first <= last);
+            (first, last)
         }
-    }
+        // Either the main band is empty, or the only content it names lies
+        // past the extent — neither leaves a column inside `0..mc`.
+        _ => (mc_u32, 0),
+    };
+
     if lo <= hi {
         lo = lo.saturating_sub(1);
         hi = (hi + 1).min(mc_u32.saturating_sub(1));
@@ -1717,16 +1734,19 @@ pub fn cursor_display_col_index(state: &SheetState, cursor: SheetCursor) -> usiz
     // content window from the body origin through main_hi, plus the
     // left-margin border.
     let (_, main_hi) = main_col_window(state, cursor);
-    let mut reserved: Vec<usize> = (0..=main_hi).map(|ci| lm + ci as usize).collect();
-    if lm > 0 {
-        reserved.push(lm - 1);
-    }
-    reserved.sort_unstable();
-    reserved.dedup();
+    // Only reserved columns *below* `cur` affect this count, so the window is
+    // clamped to `cur` -- otherwise a single far-right cursor column would
+    // materialise a sheet-wide Vec and scan a sheet-wide range on the way to
+    // a count that cannot depend on them.
+    let main_hi = main_hi.min(cur.min(total.saturating_sub(1)) as u32) as usize;
 
-    // Same count `binary_search` over `filtered` would yield, without
-    // materialising the list.
-    (0..cur).filter(|c| !reserved.binary_search(c).is_ok()).count()
+    // `reserved` sorted is `[lm-1] ++ [lm, lm+main_hi]`; count the columns of
+    // `[0, cur)` it excludes, without building it.
+    let border_reserved = usize::from(lm > 0 && lm - 1 < cur);
+    let main_lo = lm.min(cur);
+    let main_hi_excl = (lm + main_hi + 1).min(cur);
+    let main_reserved = main_hi_excl.saturating_sub(main_lo);
+    cur.saturating_sub(border_reserved + main_reserved)
 }
 
 pub fn visible_col_indices(
@@ -1749,10 +1769,24 @@ pub fn visible_col_indices(
         return ((0..total).collect(), 0);
     }
 
+    // `main_col_window` bounds `main_hi` by the last main column *with
+    // content*, which is a property of the sheet, not of the viewport. Every
+    // band built from it below must therefore be clamped to `dim` here: the
+    // bands are a viewport, and letting them span the sheet makes this
+    // function's result grow with `main_cols` while `trim_visible_cols_to_width`
+    // removes the surplus one element at a time -- quadratic work (and a
+    // sheet-sized allocation) on a per-frame path. See the
+    // `viewport_bands_are_bounded_by_dim` test.
     let (_main_lo, main_hi) = main_col_window(state, cursor);
+    // Most main columns the viewport can hold, once the pinned left-margin
+    // border and the cursor's own column are accounted for: a hard ceiling on
+    // any band below. `dim` columns of content is the theoretical maximum, so
+    // this can never show less than a full viewport.
+    let main_budget = dim.saturating_sub(1).max(1);
+    let main_hi = main_hi.min(main_budget.saturating_sub(1) as u32);
     let right_start = lm + mc;
     let mut right_band: Vec<usize> = match right_nonblank_end(state) {
-        Some(end) => (0..=end).map(|i| right_start + i).collect(),
+        Some(end) => (0..=end.min(dim.saturating_sub(1))).map(|i| right_start + i).collect(),
         None => Vec::new(),
     };
     let blank_right = right_nonblank_end(state)
@@ -1770,7 +1804,12 @@ pub fn visible_col_indices(
     let left_band: Vec<usize> = if cursor_in_left {
         let start = cursor.col;
         let end = lm.saturating_sub(1);
-        let window = lm;
+        // The left band is a viewport too: it is capped by `dim`, not by the
+        // margin's own width. `window = lm` made this band 702 entries wide on
+        // a 9-column viewport whenever the cursor sat deep in the left margin,
+        // and every downstream scan (`reserved.contains`, `out.contains`) then
+        // walked all of them.
+        let window = lm.min(dim);
         if end.saturating_sub(start) <= window {
             (start..=end).collect()
         } else {
@@ -1793,6 +1832,7 @@ pub fn visible_col_indices(
         stable_band.push(lm - 1);
     }
     stable_band.extend(left_band.iter().copied());
+    // Bounded by `main_hi`, which is itself clamped to the viewport above.
     stable_band.extend((0..=main_hi).map(|ci| lm + ci as usize));
     // Fill remaining viewport space.  Prefer main columns so that
     // non-blank data columns past the cursor window are never hidden
@@ -1847,27 +1887,61 @@ pub fn visible_col_indices(
     reserved.dedup();
 
     let available = dim.saturating_sub(reserved.len()).max(1);
-    let filtered: Vec<usize> = (0..total)
-        .filter(|c| !reserved.iter().any(|p| p == c))
-        .collect();
-    if filtered.is_empty() {
+    // `filtered` is "every column in the sheet that the reserved set does not
+    // pin", so materialising it allocates and scans `total` entries -- the
+    // sheet's full width -- on a per-frame path. Only two things are ever
+    // needed from it: the cursor's index, and the `available`-wide window
+    // starting at `start`. Both are computed here by counting, so the cost is
+    // bounded by the viewport and the reserved set rather than by the sheet.
+    //
+    // `reserved` is sorted and deduped, so "is column c pinned?" is a binary
+    // search and the count of unpinned columns below `n` is a closed form.
+    let pinned_below = |n: usize| -> usize {
+        // Number of reserved entries strictly less than `n`.
+        reserved.partition_point(|&r| r < n)
+    };
+    let filtered_len = total.saturating_sub(reserved.len());
+    if filtered_len == 0 {
         return (reserved, 0);
     }
-
-    let cur_pos = match filtered.binary_search(&cur) {
-        Ok(i) => i,
-        Err(i) => i.min(filtered.len().saturating_sub(1)),
+    // Index of the unpinned column `c` within `filtered`.
+    let filtered_index = |c: usize| c - pinned_below(c);
+    // The `k`-th (0-based) unpinned column: walk the gaps between reserved
+    // entries. O(reserved.len()), independent of the sheet.
+    let unfiltered_at = |k: usize| -> usize {
+        let mut prev = 0usize; // last value considered
+        let mut remaining = k;
+        for &r in reserved.iter() {
+            let gap = r.saturating_sub(prev); // unpinned in [prev, r)
+            if remaining < gap {
+                return prev + remaining;
+            }
+            remaining -= gap;
+            // Skip the pinned column `r` itself.
+            prev = r + 1;
+        }
+        prev + remaining
     };
-    let max_start = filtered.len().saturating_sub(available);
+
+    let cur_pinned = reserved.binary_search(&cur).is_ok();
+    let cur_pos = if cur_pinned {
+        // The cursor is pinned. It is re-added by `out.extend(reserved)` below,
+        // so the window only needs to sit somewhere sensible; anchor at the
+        // unpinned count below it, clamped into range.
+        filtered_index(cur).min(filtered_len.saturating_sub(1))
+    } else {
+        filtered_index(cur)
+    };
+    let max_start = filtered_len.saturating_sub(available);
     let mut start = prev_start.min(max_start);
     if cur_pos < start || cur_pos >= start + available {
         start = cur_pos.saturating_sub(available / 2).min(max_start);
     }
-    let end = (start + available).min(filtered.len());
+    let end = (start + available).min(filtered_len);
 
-    let mut out: Vec<usize> = filtered[start..end].to_vec();
+    let mut out: Vec<usize> = (start..end).map(unfiltered_at).collect();
 
-    if end >= filtered.len() && out.last().copied().unwrap_or(0) <= right_start.saturating_sub(1) {
+    if end >= filtered_len && out.last().copied().unwrap_or(0) <= right_start.saturating_sub(1) {
         let right_start_col = right_start;
         for i in 0..MARGIN_COLS {
             let gc = right_start_col + i;
@@ -1884,6 +1958,312 @@ pub fn visible_col_indices(
     out.extend(reserved);
     out.sort_unstable();
     (out, start)
+}
+
+#[cfg(test)]
+mod visible_col_bounds_tests {
+    use super::*;
+    use crate::grid::{CellAddr, HEADER_ROWS};
+
+    /// Build a sheet `mc` main columns wide with content in the last one (so
+    /// `main_col_window`'s `hi` reaches it) and the cursor there too — the
+    /// state a user reaches by holding Right.
+    fn wide_sheet(mc: usize) -> (SheetState, SheetCursor) {
+        let mut st = SheetState::new(3, mc);
+        st.grid
+            .set(&CellAddr::Main { row: 0, col: (mc - 1) as u32 }, "x".to_string());
+        let cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS + mc - 1 };
+        (st, cursor)
+    }
+
+    /// The result is a *viewport*, so its size must not grow with the sheet.
+    ///
+    /// Regression: `main_col_window` bounds `main_hi` by the last main column
+    /// with content, and the bands built from it inherited that sheet-wide
+    /// bound. On a 20 000-column sheet this returned 20 002 columns for a
+    /// 9-column viewport and took 5.4 s per call, on a per-frame path.
+    ///
+    /// A viewport can legitimately be shorter than `dim`, so the assertion is
+    /// a bounded excess over `dim`, not equality: the caller merges pinned
+    /// columns in afterwards and trims to width.
+    #[test]
+    fn viewport_bands_are_bounded_by_dim() {
+        const DIM: usize = 9;
+        for mc in [1usize, 10, 100, 1_000, 5_000, 20_000] {
+            let (st, cursor) = wide_sheet(mc);
+            let (cols, _) = visible_col_indices(&st, cursor, DIM, 0);
+            assert!(
+                cols.len() <= 2 * DIM + 2,
+                "main_cols={mc}: returned {} columns for a {DIM}-column viewport; \
+                 the result must not scale with the sheet",
+                cols.len()
+            );
+        }
+    }
+
+    /// The cursor's own column is always present, however far right it is —
+    /// the bound must not hide the cell the user is standing on.
+    #[test]
+    fn the_cursor_column_survives_the_bound() {
+        const DIM: usize = 9;
+        for mc in [10usize, 1_000, 20_000] {
+            let (st, cursor) = wide_sheet(mc);
+            let (cols, _) = visible_col_indices(&st, cursor, DIM, 0);
+            assert!(
+                cols.contains(&cursor.col),
+                "main_cols={mc}: cursor column {} missing from {cols:?}",
+                cursor.col
+            );
+        }
+    }
+
+    /// The result stays sorted and duplicate-free, which the callers rely on
+    /// (`trim_visible_cols_to_width` walks it front-to-back, the renderers
+    /// accumulate widths across it).
+    #[test]
+    fn the_result_stays_sorted_and_deduped() {
+        for mc in [1usize, 100, 20_000] {
+            let (st, cursor) = wide_sheet(mc);
+            let (cols, _) = visible_col_indices(&st, cursor, 9, 0);
+            let mut sorted = cols.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(cols, sorted, "main_cols={mc}: result must be a sorted set");
+        }
+    }
+
+    /// The bound is scale-free: the same viewport width must yield the same
+    /// number of columns whatever the sheet's size. This is the property that
+    /// makes the cost independent of `main_cols`.
+    #[test]
+    fn the_viewport_size_does_not_depend_on_the_sheet_size() {
+        let (small, c_small) = wide_sheet(100);
+        let (large, c_large) = wide_sheet(100_000);
+        let (a, _) = visible_col_indices(&small, c_small, 9, 0);
+        let (b, _) = visible_col_indices(&large, c_large, 9, 0);
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "a 1000x wider sheet must not change the viewport's column count"
+        );
+    }
+
+    /// The original implementation, verbatim: the `0..main_cols` scan of
+    /// `logical_col_has_content`. Kept as the oracle the indexed version must
+    /// reproduce, character for character.
+    fn main_col_window_brute(state: &SheetState, cursor: SheetCursor) -> (u32, u32) {
+        let g = &state.grid;
+        let lm = MARGIN_COLS;
+        let mc = g.main_cols();
+        if mc == 0 {
+            return (0, 0);
+        }
+        let mc_u32 = mc as u32;
+        let cursor_main_col = if cursor.col < lm {
+            0u32
+        } else if cursor.col < lm + mc {
+            (cursor.col - lm) as u32
+        } else {
+            mc_u32.saturating_sub(1)
+        };
+        let mut lo = mc_u32;
+        let mut hi = 0u32;
+        for c in 0..mc_u32 {
+            if g.logical_col_has_content(lm + c as usize) {
+                lo = lo.min(c);
+                hi = hi.max(c);
+            }
+        }
+        if lo <= hi {
+            lo = lo.saturating_sub(1);
+            hi = (hi + 1).min(mc_u32.saturating_sub(1));
+        } else {
+            lo = 0;
+            hi = 0;
+        }
+        if cursor_main_col > hi {
+            hi = cursor_main_col;
+        }
+        if cursor_main_col < lo {
+            lo = 0;
+        }
+        (lo, hi)
+    }
+
+    /// The indexed `main_col_window` must agree with the scan it replaced for
+    /// every cursor column, over sheet shapes that exercise each occupancy
+    /// source: main cells, header/footer columns, margins, and emptiness.
+    ///
+    /// This is the safety net for the whole indexed query — it is what caught
+    /// the out-of-extent `Main(c)` case, where a header names a column past the
+    /// sheet's width and clamping the index answer before the emptiness test
+    /// made an empty sheet look like it had content in its last column.
+    #[test]
+    fn indexed_main_col_window_matches_the_scan_it_replaced() {
+        use crate::grid::{ColumnAddr, FOOTER_ROWS, MARGIN_COLS};
+
+        for mc in [1usize, 2, 5, 9, 100, 999] {
+            for seed in 0..4usize {
+                let mut st = SheetState::new(3, mc);
+                match seed {
+                    0 => {}
+                    1 => {
+                        st.grid.set(
+                            &CellAddr::Main { row: 0, col: (mc - 1) as u32 },
+                            "x".to_string(),
+                        );
+                    }
+                    2 => {
+                        st.grid.set(
+                            &CellAddr::Main { row: 1, col: (mc / 2) as u32 },
+                            "x".to_string(),
+                        );
+                        st.grid.set(
+                            &CellAddr::Header {
+                                row: (HEADER_ROWS - 1) as u32,
+                                col: ColumnAddr::Main(0),
+                            },
+                            "H".to_string(),
+                        );
+                    }
+                    _ => {
+                        // Occupied every third column, plus a footer mid-sheet.
+                        for c in (0..mc).step_by(3) {
+                            st.grid.set(
+                                &CellAddr::Header {
+                                    row: 0,
+                                    col: ColumnAddr::Main(c as u32),
+                                },
+                                "H".to_string(),
+                            );
+                        }
+                        st.grid.set(
+                            &CellAddr::Footer {
+                                row: (FOOTER_ROWS - 1) as u32,
+                                col: ColumnAddr::Main((mc / 2) as u32),
+                            },
+                            "F".to_string(),
+                        );
+                    }
+                }
+                for col in 0..(MARGIN_COLS + mc + MARGIN_COLS) {
+                    let cursor = SheetCursor { row: HEADER_ROWS, col };
+                    assert_eq!(
+                        main_col_window_brute(&st, cursor),
+                        main_col_window(&st, cursor),
+                        "mc={mc} seed={seed} col={col}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A header may name a `Main` column past the sheet's width (that spelling
+    /// keeps its absolute global column). Such a column is content for
+    /// `logical_col_has_content`, but it is not *addressable* in `0..main_cols`
+    /// — so the window must stay empty rather than clamp the far-away answer
+    /// into the last column of the sheet.
+    #[test]
+    fn a_header_past_the_extent_does_not_invent_content_in_range() {
+        use crate::grid::ColumnAddr;
+        let mut st = SheetState::new(3, 4);
+        st.grid.set(
+            &CellAddr::Header { row: 0, col: ColumnAddr::Main(500) },
+            "H".to_string(),
+        );
+        // The index reports it (it is real content at a main-relative column).
+        assert_eq!(st.grid.last_main_col_with_content(), Some(500));
+        // No column inside 0..4 has content, so the window is the empty one.
+        for col in 0..(MARGIN_COLS + 4 + MARGIN_COLS) {
+            let cursor = SheetCursor { row: HEADER_ROWS, col };
+            assert_eq!(
+                main_col_window(&st, cursor),
+                main_col_window_brute(&st, cursor),
+                "col={col}"
+            );
+        }
+        let cursor = SheetCursor { row: HEADER_ROWS, col: 0 };
+        assert_eq!(main_col_window(&st, cursor).1, 0, "hi must not reach column 3");
+    }
+
+    /// The index must survive the bulk mutations that rewrite column identity:
+    /// a column move permutes it, `clear_cells` keeps the surviving
+    /// header/footer buckets, and a removal drops the entry.
+    #[test]
+    fn the_main_column_index_survives_moves_clears_and_removals() {
+        use crate::grid::ColumnAddr;
+
+        let mut st = SheetState::new(3, 12);
+        for c in [0u32, 4, 11] {
+            st.grid.set(&CellAddr::Main { row: 0, col: c }, "x".to_string());
+            st.grid.set(
+                &CellAddr::Header { row: 0, col: ColumnAddr::Main(c) },
+                "H".to_string(),
+            );
+        }
+        assert_eq!(st.grid.last_main_col_with_content(), Some(11));
+        assert_eq!(st.grid.first_main_col_with_content(), Some(0));
+
+        // Moving the first column to the end moves its occupancy with it.
+        st.grid.move_main_cols(0, 1, 12);
+        assert_eq!(st.grid.first_main_col_with_content(), Some(3));
+        assert_eq!(st.grid.last_main_col_with_content(), Some(11));
+        st.grid.move_main_cols(11, 0, 12);
+
+        // Removing the only main cell in the last column leaves its header.
+        st.grid.set(&CellAddr::Main { row: 0, col: 11 }, String::new());
+        assert_eq!(st.grid.last_main_col_with_content(), Some(11));
+
+        // Clearing the body drops main cells; header/footer buckets survive.
+        st.grid.set(
+            &CellAddr::Footer { row: 0, col: ColumnAddr::Main(5) },
+            "F".to_string(),
+        );
+        st.grid.clear_cells();
+        assert_eq!(
+            st.grid.last_main_col_with_content(),
+            Some(11),
+            "the header on column 11 survives clear_cells"
+        );
+    }
+
+    /// The per-frame path must not do work proportional to the sheet. This
+    /// pins the *cost*, not the output: `main_col_window` scans no columns, so
+    /// its time is flat from a tiny sheet to a very wide one. A generous
+    /// ceiling keeps it robust on a loaded CI machine while still failing
+    /// loudly for an O(main_cols) regression (which is ~1000x more).
+    #[test]
+    fn main_col_window_cost_is_flat_in_sheet_width() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn per_call_micros(mc: usize, reps: u32) -> f64 {
+            let mut st = SheetState::new(3, mc);
+            st.grid.set(
+                &CellAddr::Main { row: 0, col: (mc - 1) as u32 },
+                "x".to_string(),
+            );
+            let cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+            // Warm up, then measure.
+            for _ in 0..50 {
+                black_box(main_col_window(&st, cursor));
+            }
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                black_box(main_col_window(&st, cursor));
+            }
+            t0.elapsed().as_secs_f64() * 1e6 / reps as f64
+        }
+
+        let small = per_call_micros(100, 20_000);
+        let large = per_call_micros(100_000, 20_000);
+        assert!(
+            large < 10.0 && large < small.max(1.0) * 20.0,
+            "main_col_window took {large:.2}us on a 100_000-column sheet vs \
+             {small:.2}us on a 100-column one: the cost must not scale with \
+             the sheet (an O(main_cols) scan here is ~1000x slower)"
+        );
+    }
 }
 
 /// Adjust all visible column widths to fit within `data_width`, mirroring

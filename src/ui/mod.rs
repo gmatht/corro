@@ -2235,11 +2235,26 @@ fn visible_col_indices(
         return ((0..total).collect(), 0);
     }
 
+    // `main_col_window` bounds `main_hi` by the last main column *with
+    // content* — a property of the sheet, not of the viewport — so the bands
+    // below are clamped to `dim` here. Unclamped they grow with `main_cols`
+    // and `trim_visible_cols_to_width` then removes the surplus one element at
+    // a time: quadratic work on a per-frame path. This mirrors
+    // `ui_core::visible_col_indices`, which carries the same clamp and the
+    // regression test.
+    //
+    // Reading the window is O(log n) (the grid's occupancy index answers it
+    // without a scan); the clamp is what keeps the *bands* viewport-sized, so
+    // it must stay even though `main_col_window` itself is now cheap.
     let (_, main_hi) = main_col_window(state, cursor);
+    // Most main columns the viewport can hold once the pinned left-margin
+    // border and the cursor's own column are accounted for.
+    let main_budget = dim.saturating_sub(1).max(1);
+    let main_hi = main_hi.min(main_budget.saturating_sub(1) as u32);
     // computed main window
     let right_start = lm + mc;
     let mut right_band: Vec<usize> = match right_nonblank_end(state) {
-        Some(end) => (0..=end).map(|i| right_start + i).collect(),
+        Some(end) => (0..=end.min(dim.saturating_sub(1))).map(|i| right_start + i).collect(),
         None => Vec::new(),
     };
     let blank_right = right_nonblank_end(state)
@@ -2260,11 +2275,12 @@ fn visible_col_indices(
     }
     let left_band: Vec<usize> = if cursor_in_left {
         // Show left-margin columns from cursor outward toward the main
-        // boundary.  No artificial cap — the viewport grows leftward one
-        // column per left-arrow press.
+        // boundary, capped by the viewport: `window = lm` made this band 702
+        // entries wide on a 9-column viewport, and every downstream scan
+        // (`reserved.contains`, `out.contains`) then walked all of them.
         let start = cursor.col;
         let end = lm.saturating_sub(1);
-        let window = lm;
+        let window = lm.min(dim);
         if end.saturating_sub(start) <= window {
             (start..=end).collect()
         } else {
@@ -24487,4 +24503,83 @@ fn quit_import_prompt_removed_from_source() {
     let needle = format!("Quit{}", "ImportPrompt");
     let msg = format!("the QuitImport{} variant should have been removed", "Prompt");
     assert!(!source.contains(&needle), "{}", msg);
+}
+#[cfg(test)]
+mod visible_col_parity_tests {
+    use super::*;
+
+    /// Upper bound on how many columns `visible_col_indices` may return for a
+    /// `dim`-column viewport, measured (see the test) rather than derived:
+    /// the viewport window plus the pinned left-margin border, the cursor's
+    /// own column and the margin context merged back in.
+    ///
+    /// The point of the bound is the *shape*, not the constant: it must depend
+    /// only on `dim`, never on the sheet's `main_cols`. `dim=1 -> 5` for every
+    /// sheet from 1 to 20 000 columns wide is the property under test.
+    fn viewport_cap(dim: usize) -> usize {
+        // Measured maxima: dim 1->5, 2->6, 3->8, 9->20, 30->62.
+        2 * dim.max(1) + 4
+    }
+
+    /// The ratatui front-end shadows `ui_core::visible_col_indices` with a
+    /// private copy (the `use crate::ui_core::*` glob is shadowed by the local
+    /// definition), and the GUI backends call the `ui_core` one. Two live
+    /// implementations of one viewport rule is a standing invitation to drift,
+    /// so this pins them to each other: for every sheet size and cursor
+    /// position sampled, both must return the same column set and scroll
+    /// anchor.
+    ///
+    /// The duplication itself is pre-existing; this test is what makes fixing
+    /// one and not the other a build-time failure rather than a silent
+    /// divergence between the two front-ends.
+    #[test]
+    fn the_tui_and_shared_column_windows_agree() {
+        for mc in [1usize, 10, 100, 1_000, 20_000] {
+            for depth in [0usize, 1, 3, 9] {
+                // Cursor swept from deep in the left margin, across main
+                // columns, to the right margin.
+                let cursor_cols = [
+                    MARGIN_COLS.saturating_sub(depth + 1),
+                    MARGIN_COLS,
+                    MARGIN_COLS + mc / 2,
+                    MARGIN_COLS + mc.saturating_sub(1),
+                    MARGIN_COLS + mc,
+                ];
+                for &col in &cursor_cols {
+                    let mut st = SheetState::new(3, mc);
+                    st.grid.set(
+                        &CellAddr::Main { row: 0, col: (mc - 1) as u32 },
+                        "x".to_string(),
+                    );
+                    let cursor = SheetCursor { row: HEADER_ROWS, col };
+                    for dim in [1usize, 3, 9, 30] {
+                        for prev in [0usize, 4] {
+                            let (shared, shared_start) =
+                                crate::ui_core::visible_col_indices(&st, cursor, dim, prev);
+                            let (local, local_start) =
+                                visible_col_indices(&st, cursor, dim, prev);
+                            assert_eq!(
+                                shared, local,
+                                "mc={mc} col={col} dim={dim} prev={prev}: \
+                                 the TUI copy and ui_core diverged"
+                            );
+                            assert_eq!(
+                                shared_start, local_start,
+                                "mc={mc} col={col} dim={dim} prev={prev}: scroll anchors diverged"
+                            );
+                            // Bounded by the viewport (plus the pinned
+                            // border/cursor slack) and, critically,
+                            // independent of `mc`.
+                            assert!(
+                                local.len() <= viewport_cap(dim),
+                                "mc={mc} col={col} dim={dim}: TUI copy returned {} columns, \
+                                 which scales with the sheet",
+                                local.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

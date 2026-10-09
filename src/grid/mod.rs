@@ -319,6 +319,26 @@ pub trait GridImpl {
     fn logical_row_has_content(&self, r: usize) -> bool;
     fn logical_col_has_content(&self, c: usize) -> bool;
 
+    /// Main-relative index of the last main column carrying content (a main
+    /// body cell, or a header/footer column spelled `Main(c)`); `None` when
+    /// the main band is empty. Default: linear probe. `Grid` serves it from
+    /// its occupancy index in O(log n) — viewport code must not scan
+    /// `0..main_cols` for this (see `ui_core::main_col_window`).
+    fn last_main_col_with_content(&self) -> Option<u32> {
+        let mc = self.main_cols();
+        (0..mc)
+            .rev()
+            .map(|c| c as u32)
+            .find(|&c| self.logical_col_has_content(MARGIN_COLS + c as usize))
+    }
+
+    /// First main-relative column carrying content; `None` when the main band
+    /// is empty. Default: linear probe, mirroring the query above.
+    fn first_main_col_with_content(&self) -> Option<u32> {
+        let mc = self.main_cols();
+        (0..mc as u32).find(|&c| self.logical_col_has_content(MARGIN_COLS + c as usize))
+    }
+
     // Iteration
     fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_>;
 
@@ -638,6 +658,19 @@ impl GridBox {
         self.inner.logical_col_has_content(c)
     }
 
+    /// Main-relative index of the last main column that carries content — a
+    /// main body cell, or a header/footer column spelled `Main(c)`. `None`
+    /// when the main band is entirely empty. O(log n).
+    pub fn last_main_col_with_content(&self) -> Option<u32> {
+        self.inner.last_main_col_with_content()
+    }
+
+    /// First main-relative column carrying content; `None` when the main band
+    /// is empty. O(log n).
+    pub fn first_main_col_with_content(&self) -> Option<u32> {
+        self.inner.first_main_col_with_content()
+    }
+
     pub fn col_all_formats(&self) -> Vec<(usize, CellFormat)> {
         self.inner.col_all_formats()
     }
@@ -855,6 +888,18 @@ pub struct Grid {
     header_col_counts: HashMap<ColumnAddr, usize>,
     footer_row_counts: BTreeMap<u32, usize>,
     footer_col_counts: HashMap<ColumnAddr, usize>,
+    /// Main-relative columns whose *global* column counts as occupied by
+    /// [`Grid::logical_col_has_content`], i.e. a main body cell, or a
+    /// header/footer cell spelled `ColumnAddr::Main(c)`.
+    ///
+    /// `main_col_counts` answers that query for the body and the
+    /// `header_col_counts`/`footer_col_counts` maps for the bands, but those
+    /// are a `BTreeMap` and two `HashMap`s — the latter have no order, so
+    /// "the last occupied main column" needed a full `0..main_cols` scan of
+    /// `logical_col_has_content` (O(main_cols) per viewport frame; see
+    /// `ui_core::main_col_window`). This union index makes that a single
+    /// `next_back()`, O(log n) in the number of occupied columns.
+    main_logical_col_counts: BTreeMap<u32, usize>,
     /// Stored cells holding spreadsheet formulas (`is_formula`), across all
     /// regions. Lets `refresh_spills` skip its fixpoint passes in O(1) when
     /// there is nothing to evaluate (ALGORITHMS.md §2.5). Maintained in
@@ -947,6 +992,7 @@ impl Grid {
             header_col_counts: HashMap::new(),
             footer_row_counts: BTreeMap::new(),
             footer_col_counts: HashMap::new(),
+            main_logical_col_counts: BTreeMap::new(),
             formula_cell_count: 0,
             col_content_widths: HashMap::new(),
             auto_fit_suspend: 0,
@@ -984,6 +1030,21 @@ impl Grid {
             if *cnt == 0 {
                 map.remove(key);
             }
+        }
+    }
+
+    /// Bookkeeping for [`Grid::main_logical_col_counts`] on a header/footer
+    /// write: only `Main`-spelled addresses occupy a *main* column, and only
+    /// they can make `logical_col_has_content` true for one.
+    fn occ_inc_logical_main_col(&mut self, col: &ColumnAddr) {
+        if let ColumnAddr::Main(c) = col {
+            Self::occ_inc(&mut self.main_logical_col_counts, *c);
+        }
+    }
+
+    fn occ_dec_logical_main_col(&mut self, col: &ColumnAddr) {
+        if let ColumnAddr::Main(c) = col {
+            Self::occ_dec(&mut self.main_logical_col_counts, c);
         }
     }
 
@@ -1110,9 +1171,11 @@ impl Grid {
         self.header_col_counts.clear();
         self.footer_row_counts.clear();
         self.footer_col_counts.clear();
+        self.main_logical_col_counts.clear();
         for &(r, c) in self.main_cells.keys() {
             Self::occ_inc(&mut self.main_row_counts, r);
             Self::occ_inc(&mut self.main_col_counts, c);
+            Self::occ_inc(&mut self.main_logical_col_counts, c);
         }
         for &(r, mc) in self.left.keys() {
             Self::occ_inc(&mut self.left_row_counts, r);
@@ -1125,10 +1188,16 @@ impl Grid {
         for &(r, col) in self.header.keys() {
             Self::occ_inc(&mut self.header_row_counts, r);
             Self::occ_inc_hash(&mut self.header_col_counts, col);
+            if let ColumnAddr::Main(c) = col {
+                Self::occ_inc(&mut self.main_logical_col_counts, c);
+            }
         }
         for &(r, col) in self.footer.keys() {
             Self::occ_inc(&mut self.footer_row_counts, r);
             Self::occ_inc_hash(&mut self.footer_col_counts, col);
+            if let ColumnAddr::Main(c) = col {
+                Self::occ_inc(&mut self.main_logical_col_counts, c);
+            }
         }
     }
 
@@ -1434,6 +1503,31 @@ impl Grid {
         false
     }
 
+    /// Main-relative index of the last main column that carries content:
+    /// a main body cell, or a header/footer cell spelled `Main(c)` (the
+    /// absolute-global spelling an out-of-extent header/footer keeps).
+    /// `None` when no main column has content.
+    ///
+    /// One `next_back()` on [`Grid::main_logical_col_counts`] — O(log n) in
+    /// the number of occupied columns. The `0..main_cols` scan of
+    /// `logical_col_has_content` this replaces was O(main_cols) *per
+    /// viewport frame*, which made `ui_core::main_col_window` (and through it
+    /// `visible_col_indices`) scale with the sheet rather than the viewport.
+    ///
+    /// The answer is deliberately **not** clamped to `main_cols`: a
+    /// header/footer may name a `Main` column past the current extent (see
+    /// [`Grid::logical_col_has_content`]), and such a column is content.
+    /// Callers that need it clamped to the extent do so themselves.
+    pub fn last_main_col_with_content(&self) -> Option<u32> {
+        self.main_logical_col_counts.keys().next_back().copied()
+    }
+
+    /// First main-relative column carrying content; `None` when the main band
+    /// is empty. O(log n), the mirror of [`Grid::last_main_col_with_content`].
+    pub fn first_main_col_with_content(&self) -> Option<u32> {
+        self.main_logical_col_counts.keys().next().copied()
+    }
+
     fn resize_header_footer_width(&mut self) {
         self.header.retain(|&(row, _), value| {
             row < HEADER_ROWS as u32 && !value.is_empty()
@@ -1454,17 +1548,8 @@ impl Grid {
         // Compute new main cols from the occupancy index (ALGORITHMS.md §2.7):
         // same maxima the full scans produced, in O(log n).
         let mut max_col_plus1: u32 = 0;
-        if let Some(&c) = self.main_col_counts.keys().next_back() {
+        if let Some(c) = self.last_main_col_with_content() {
             max_col_plus1 = max_col_plus1.max(c.saturating_add(1));
-        }
-        for col in self
-            .header_col_counts
-            .keys()
-            .chain(self.footer_col_counts.keys())
-        {
-            if let ColumnAddr::Main(mc) = col {
-                max_col_plus1 = max_col_plus1.max(mc.saturating_add(1));
-            }
         }
         if max_col_plus1 == 0 {
             max_col_plus1 = 1; // always at least 1
@@ -1912,6 +1997,7 @@ impl Grid {
                         if let Some(old) = self.header.remove(&(*row, *col)) {
                             Self::occ_dec(&mut self.header_row_counts, row);
                             Self::occ_dec_hash(&mut self.header_col_counts, col);
+                            self.occ_dec_logical_main_col(col);
                             self.note_formula_replace(Some(&old), false);
                             Self::width_dec(
                                 &mut self.col_content_widths,
@@ -1926,6 +2012,7 @@ impl Grid {
                             None => {
                                 Self::occ_inc(&mut self.header_row_counts, *row);
                                 Self::occ_inc_hash(&mut self.header_col_counts, *col);
+                                self.occ_inc_logical_main_col(col);
                                 Self::width_inc(&mut self.col_content_widths, c, w);
                                 self.note_formula_replace(None, new_is_formula);
                             }
@@ -1953,6 +2040,7 @@ impl Grid {
                         if let Some(old) = self.footer.remove(&(*row, *col)) {
                             Self::occ_dec(&mut self.footer_row_counts, row);
                             Self::occ_dec_hash(&mut self.footer_col_counts, col);
+                            self.occ_dec_logical_main_col(col);
                             self.note_formula_replace(Some(&old), false);
                             Self::width_dec(
                                 &mut self.col_content_widths,
@@ -1967,6 +2055,7 @@ impl Grid {
                             None => {
                                 Self::occ_inc(&mut self.footer_row_counts, *row);
                                 Self::occ_inc_hash(&mut self.footer_col_counts, *col);
+                                self.occ_inc_logical_main_col(col);
                                 Self::width_inc(&mut self.col_content_widths, c, w);
                                 self.note_formula_replace(None, new_is_formula);
                             }
@@ -1993,6 +2082,7 @@ impl Grid {
                     if let Some(old) = self.main_cells.remove(&(r, c)) {
                         Self::occ_dec(&mut self.main_row_counts, &r);
                         Self::occ_dec(&mut self.main_col_counts, &c);
+                        Self::occ_dec(&mut self.main_logical_col_counts, &c);
                         self.note_formula_replace(Some(&old), false);
                         Self::width_dec(
                             &mut self.col_content_widths,
@@ -2014,6 +2104,7 @@ impl Grid {
                         None => {
                             Self::occ_inc(&mut self.main_row_counts, r);
                             Self::occ_inc(&mut self.main_col_counts, c);
+                            Self::occ_inc(&mut self.main_logical_col_counts, c);
                             Self::width_inc(&mut self.col_content_widths, gc, w);
                             self.note_formula_replace(None, new_is_formula);
                         }
@@ -2250,6 +2341,13 @@ impl Grid {
             next_main_cols.insert(new_pos_of_old[*old_c as usize], *cnt);
         }
         self.main_col_counts = next_main_cols;
+        // The logical (main ∪ Main-spelled header/footer) column index is
+        // permuted identically, so the query it answers survives a move.
+        let mut next_logical_cols = BTreeMap::new();
+        for (old_c, cnt) in self.main_logical_col_counts.iter() {
+            next_logical_cols.insert(new_pos_of_old[*old_c as usize], *cnt);
+        }
+        self.main_logical_col_counts = next_logical_cols;
 
         fn remap_sparse_main_cols_addr(
             cells: &mut HashMap<(u32, ColumnAddr), String>,
@@ -2542,6 +2640,15 @@ impl GridImpl for Grid {
         self.right_row_counts.clear();
         self.right_col_counts.clear();
         // Header/footer buckets survive; the rest is rebuilt.
+        self.main_logical_col_counts = self
+            .header_col_counts
+            .keys()
+            .chain(self.footer_col_counts.keys())
+            .filter_map(|col| match col {
+                ColumnAddr::Main(c) => Some((*c, 1usize)),
+                _ => None,
+            })
+            .collect();
         self.rebuild_width_index();
         self.recount_formulas();
         self.mark_spills_stale()
@@ -2606,6 +2713,14 @@ impl GridImpl for Grid {
 
     fn logical_col_has_content(&self, c: usize) -> bool {
         self.logical_col_has_content(c)
+    }
+
+    fn last_main_col_with_content(&self) -> Option<u32> {
+        self.last_main_col_with_content()
+    }
+
+    fn first_main_col_with_content(&self) -> Option<u32> {
+        self.first_main_col_with_content()
     }
 
     fn clone_box(&self) -> Box<dyn GridImpl> {
@@ -2879,6 +2994,46 @@ mod tests {
             g.footer_row_counts.values().sum::<usize>(),
             g.footer.len()
         );
+        // The logical main-column index must describe exactly the main-band
+        // columns the brute-force probe calls occupied: a stored main cell, or
+        // a header/footer spelled `Main(c)`. Swept over the whole
+        // main-relative axis (it deliberately reaches past the extent), but
+        // compared against a probe *restricted to the main band* — a
+        // right-margin cell at global `MARGIN_COLS + main_cols + k` is not a
+        // main column `k`, and sweeping the raw global axis would confuse the
+        // two.
+        let main_band_occupied = |c: u32| -> bool {
+            g.main_cells.contains_key(&(0, c))
+                || (0..g.main_rows() as u32).any(|r| g.main_cells.contains_key(&(r, c)))
+                || g.header.keys().any(|(_, col)| *col == ColumnAddr::Main(c))
+                || g.footer.keys().any(|(_, col)| *col == ColumnAddr::Main(c))
+        };
+        let axis = g.main_cols() as u32 + 16;
+        let brute_last = (0..axis).rev().find(|&c| main_band_occupied(c));
+        let brute_first = (0..axis).find(|&c| main_band_occupied(c));
+        assert_eq!(
+            g.last_main_col_with_content(),
+            brute_last,
+            "last occupied main column disagrees with the brute force"
+        );
+        assert_eq!(
+            g.first_main_col_with_content(),
+            brute_first,
+            "first occupied main column disagrees with the brute force"
+        );
+        // Every key must be a genuinely occupied main-relative column, and
+        // every occupied column must be a key (same set, not just extrema).
+        for (&c, &cnt) in g.main_logical_col_counts.iter() {
+            assert!(cnt > 0, "indexed main column {c} with a zero count");
+            assert!(main_band_occupied(c), "indexed main column {c} is not occupied");
+        }
+        for c in 0..g.main_cols() as u32 {
+            assert_eq!(
+                g.main_logical_col_counts.contains_key(&c),
+                main_band_occupied(c),
+                "main column {c} occupancy disagrees with the stored cells"
+            );
+        }
     }
 
     fn mc_end(g: &Grid) -> usize {
