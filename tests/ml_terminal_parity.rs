@@ -1,7 +1,8 @@
-
-
 #![cfg(all(target_os = "linux", feature = "pancurses", feature = "ratatui"))]
 
+
+#[path = "support/mod.rs"]
+mod support;
 mod tmux {
     use std::process::Command;
 
@@ -166,7 +167,7 @@ fn fixture_temp_copy(rel: &str) -> String {
 fn run_in_tmux(args: &str, keys: &[&str], wait_ms: u64) -> String {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut rewritten: Vec<String> = Vec::new();
     for tok in args.split_whitespace() {
@@ -279,7 +280,7 @@ fn menu_up_wraps_to_last_item() {
 fn ctrl_c_copies_instead_of_quitting() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-ctrlc-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "C-c");
@@ -335,7 +336,7 @@ fn right_arrow_shows_b2() {
 fn left_arrow_does_not_jump_viewport() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
 
@@ -438,7 +439,7 @@ fn new_doc_left_updates_formula_bar_and_selection() {
     ));
     std::fs::write(&doc, "CORRO_LOG 1\n").expect("write new-doc fixture");
     let session = format!("corro-ml-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     tmux::new_session(
         &session,
         &format!("{} --pancurses {}; sleep 2", bin, doc.to_string_lossy()),
@@ -548,7 +549,7 @@ fn open_root_menu(session: &str, sm: usize) {
 fn walk_menu_items(sm: usize, labels: &[&str]) -> String {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-walk-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     open_root_menu(&session, sm);
@@ -628,7 +629,7 @@ fn menu_help_items() {
 /// and the app is expected to actually terminate.
 fn activate_menu_item(sm: usize, idx: usize, label: &str, expected: &str, quit: bool) {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     // Retry the whole navigation: menu navigation is timing-sensitive under
     // parallel tmux load, and a swallowed Down/Enter silently activates the
     // wrong item. A fresh session per attempt avoids stale state.
@@ -712,7 +713,7 @@ fn menu_file_parity_with_ratatui() {
     // ── pancurses: Escape, f opens the File menu ──
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-parity-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
@@ -757,7 +758,7 @@ fn menu_item_activation_smoke() {
 fn menu_export_tsv_writes_file() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-act-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     let export_path = std::env::temp_dir().join(format!("corro-export-{}.tsv", std::process::id()));
     let _ = std::fs::remove_file(&export_path);
@@ -812,7 +813,7 @@ fn menu_open_loads_file() {
 
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-act-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
@@ -845,7 +846,7 @@ fn menu_open_loads_file() {
 /// actually ran on the workbook).
 fn activate_menu_item_prompt(sm: usize, idx: usize, label: &str, input: &str, expected: &str) {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     // Retry the whole navigation (see activate_menu_item).
     for attempt in 0..3 {
         let session = format!("corro-act-{}-{}-{}", std::process::id(), id, attempt);
@@ -918,7 +919,7 @@ fn menu_replace_text() {
 fn help_about_shows_dialog() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     // Open Help menu with Alt+H (Right-navigation from File would enter the
@@ -979,7 +980,7 @@ fn help_about_shows_dialog() {
 fn help_full_shows_dialog() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
@@ -1057,7 +1058,7 @@ fn help_about_parity_with_ratatui() {
     // ── pancurses: Escape, h opens Help, Enter fires About ──
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-parity-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
@@ -1104,7 +1105,7 @@ fn help_full_parity_with_ratatui() {
     // ── pancurses: Escape, h opens Help, Down x3 + Enter fires Full help ──
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-parity-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
@@ -1138,7 +1139,7 @@ fn help_full_parity_with_ratatui() {
 fn menu_insert_date_shows_cell_immediately() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-date-{}-{}", std::process::id(), id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     // Insert menu (Alt+I), Date is item index 5.
@@ -1185,7 +1186,7 @@ fn menu_insert_date_shows_cell_immediately() {
 fn menu_mitosis_row_copies_row_values() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-mit-r-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     // Cursor starts at A1 ("Hello World!").  Insert menu (Alt+I);
@@ -1237,7 +1238,7 @@ fn menu_mitosis_row_copies_row_values() {
 fn menu_mitosis_col_copies_col_values() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-mit-c-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     // Cursor starts at A1 ("Hello World!").  Insert menu (Alt+I), then the
@@ -1273,7 +1274,7 @@ fn menu_mitosis_col_copies_col_values() {
 fn menu_popup_has_border() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
@@ -1300,7 +1301,7 @@ fn menu_popup_has_border() {
 fn overwrite_text_is_consistent_and_matches_disk() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fid = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let fixture = std::env::temp_dir().join(format!("corro-ow-{}-{}.corro", std::process::id(), fid));
     std::fs::write(&fixture, "CORRO_LOG 1\n").unwrap();
@@ -1357,7 +1358,7 @@ fn overwrite_text_is_consistent_and_matches_disk() {
 fn edit_text_no_file_persists() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     start_session(&session, &format!("{} --pancurses; sleep 2", bin));
     for ch in "AAA".chars() {
         tmux::send_keys(&session, &ch.to_string());
@@ -1387,7 +1388,7 @@ fn edit_text_no_file_persists() {
 fn edit_text_multiple_cells_persists() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fid = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let fixture = std::env::temp_dir().join(format!("corro-multi-{}-{}.corro", std::process::id(), fid));
     std::fs::write(&fixture, "CORRO_LOG 1\n").unwrap();
@@ -1428,7 +1429,7 @@ fn edit_text_multiple_cells_persists() {
 fn edit_text_then_move_persists() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     for ch in "ZZZTEST".chars() {
@@ -1498,7 +1499,6 @@ fn pseudorandom_walk_matches_ratatui() {
     // ── pancurses (tmux) ──
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-walk-{}", id);
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
     // Idle marker: the app appends a line to this file after every redraw, so we
     // can send the next key the moment the previous one has been processed
@@ -1510,12 +1510,14 @@ fn pseudorandom_walk_matches_ratatui() {
     // inherit the long-lived server environment, not this process's, so a
     // set_var before spawn is silently ignored whenever the server predates
     // it (healthy app, zero markers in the expected file).
-    let marker_arg = format!("CORRO_IDLE_MARKER={}", marker.display());
+    let marker_val = marker.display().to_string();
     // Start the app and wait for the initial redraw marker.  Under parallel-tmux
     // load a session can fail to start, so retry a few times.
     let mut started = false;
     for _attempt in 0..3 {
-        tmux::new_session(&session, &format!("{} {} --pancurses {}; sleep 2", marker_arg, bin, fixture));
+        tmux::new_session(&session, &format!("{} --pancurses {fixture}; sleep 2",
+            support::capped_command_with_env(&support::corro_bin(), &[("CORRO_IDLE_MARKER", &marker_val)], ""),
+        ));
         std::thread::sleep(Duration::from_millis(2000));
         if tmux::has_session(&session) {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);

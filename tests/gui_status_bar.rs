@@ -25,8 +25,10 @@
 //!   xvfb-run -a cargo test --features gtk --test gui_status_bar
 #![cfg(all(target_os = "linux", feature = "gui"))]
 
+#[path = "support/mod.rs"]
+mod support;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -52,18 +54,9 @@ impl Drop for KillOnDrop {
 }
 
 fn spawn_gui_status(template: &str) -> KillOnDrop {
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
-    KillOnDrop(
-        Command::new(&bin)
-            // No file arg: an explicit path wins over the template (same as
-            // the terminal), so a fresh doc is the only template trigger.
-            .arg("--gui")
-            .env("CORRO_TEMPLATE", template)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn corro --gui"),
-    )
+    // No file arg: an explicit path wins over the template (same as the
+    // terminal), so a fresh doc is the only template trigger.
+    KillOnDrop(support::spawn_capped_corro(&["--gui"], &[("CORRO_TEMPLATE", template)]))
 }
 
 fn find_corro_window(child_pid: u32, deadline: Instant) -> String {

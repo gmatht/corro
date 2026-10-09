@@ -17,8 +17,10 @@
 //! Run with: xvfb-run -a cargo test --features gtk --test gui_window_mirror
 #![cfg(all(target_os = "linux", feature = "gui"))]
 
+#[path = "support/mod.rs"]
+mod support;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 /// Live GUI tests share one X server and global focus: serialize them.
@@ -144,15 +146,9 @@ fn external_commit_repaints_without_input() {
     // A single-sheet log: appends from the "other window" use plain `SET A1 v`.
     std::fs::write(&file, "CORRO_LOG 1\n").unwrap();
 
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
+    
     let child = KillOnDrop(
-        Command::new(&bin)
-            .arg("--gui")
-            .arg(&file)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn corro --gui"),
+        support::spawn_capped_corro(&["--gui", &file.to_string_lossy()], &[]),
     );
     let pid = child.id();
     let wid = find_corro_window(pid, Instant::now() + Duration::from_secs(30));

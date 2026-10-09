@@ -15,6 +15,8 @@
 //!   cargo test --features pancurses --test pnc_overwrite_confirm
 #![cfg(all(target_os = "linux", feature = "pancurses", feature = "ratatui"))]
 
+#[path = "support/mod.rs"]
+mod support;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -93,7 +95,7 @@ fn spawn_session() -> (String, PathBuf, PathBuf) {
     let target = std::env::temp_dir().join(format!("{tag}-target.corro"));
     std::fs::write(&work, "CORRO_LOG 1\nSET $1:A1 SESSIONMARK\n").unwrap();
     std::fs::write(&target, "OLD-CONTENT\n").unwrap();
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     tmux::new_session(&tag, &format!("{bin} --pancurses {}; sleep 2", work.display()));
     wait_for_text(&tag, "[File]");
     (tag, work, target)

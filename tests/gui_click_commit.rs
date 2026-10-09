@@ -16,8 +16,10 @@
 //!   xvfb-run -a cargo test --features gtk --test gui_click_commit
 #![cfg(all(target_os = "linux", feature = "gui"))]
 
+#[path = "support/mod.rs"]
+mod support;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 static GUI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -128,15 +130,9 @@ fn clicking_another_cell_commits_the_edit_to_its_original_cell() {
     let file = dir.join("wb.corro");
     std::fs::write(&file, "CORRO_LOG 1\n").unwrap();
 
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
+    
     let child = KillOnDrop(
-        Command::new(&bin)
-            .arg("--gui")
-            .arg(&file)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn corro --gui"),
+        support::spawn_capped_corro(&["--gui", &file.to_string_lossy()], &[]),
     );
     let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(30));
     xdotool(&["windowactivate", "--sync", &wid]);

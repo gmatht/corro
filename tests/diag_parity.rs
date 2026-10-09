@@ -1,4 +1,7 @@
 #![cfg(all(target_os = "linux", feature = "pancurses", feature = "ratatui"))]
+
+#[path = "support/mod.rs"]
+mod support;
 use std::path::PathBuf;
 use std::time::Duration;
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -128,7 +131,7 @@ fn diag_parity() {
 
         // ── pancurses (atomic M-letter chord + settle; see open_root_menu) ──
         let session = format!("diagp-{}-{}", std::process::id(), id);
-        let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+        let bin = support::capped_command(&support::corro_bin());
         tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, tmp.display()));
         // Bound to `_session` so every `wait_for_text` panic below still tears
         // the session (and its corro child) down.

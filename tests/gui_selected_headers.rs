@@ -12,8 +12,10 @@
 //! Run with: xvfb-run -a cargo test --features gtk --test gui_selected_headers
 #![cfg(all(target_os = "linux", feature = "gui"))]
 
+#[path = "support/mod.rs"]
+mod support;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -163,15 +165,9 @@ fn covered_headers_use_selection_fill() {
     let file = dir.join("wb.corro");
     std::fs::write(&file, "CORRO_LOG 1\n").unwrap();
 
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
+    
     let child = KillOnDrop(
-        Command::new(&bin)
-            .arg("--gui")
-            .arg(&file)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn corro --gui"),
+        support::spawn_capped_corro(&["--gui", &file.to_string_lossy()], &[]),
     );
     let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(30));
     xdotool(&["windowactivate", "--sync", &wid]);

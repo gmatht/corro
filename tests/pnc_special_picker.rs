@@ -15,6 +15,8 @@
 //!   cargo test --features pancurses --test pnc_special_picker
 #![cfg(all(target_os = "linux", feature = "pancurses", feature = "ratatui"))]
 
+#[path = "support/mod.rs"]
+mod support;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -102,7 +104,7 @@ fn spawn_session() -> (String, PathBuf) {
     let session = format!("pnc-pick-{}-{id}", std::process::id());
     let tmp = std::env::temp_dir().join(format!("{session}.corro"));
     std::fs::write(&tmp, "CORRO_LOG 1\n").unwrap();
-    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let bin = support::capped_command(&support::corro_bin());
     tmux::new_session(&session, &format!("{bin} --pancurses {}; sleep 2", tmp.display()));
     wait_for_text(&session, "[File]");
     (session, tmp)

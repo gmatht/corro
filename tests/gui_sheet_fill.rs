@@ -17,8 +17,10 @@
 //!   xvfb-run -a cargo test --features gtk --test gui_sheet_fill
 #![cfg(all(target_os = "linux", feature = "gui"))]
 
+#[path = "support/mod.rs"]
+mod support;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -193,15 +195,9 @@ impl Drop for KillOnDrop {
 }
 
 fn spawn_gui(path: &PathBuf) -> KillOnDrop {
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
+    
     KillOnDrop(
-        Command::new(&bin)
-            .arg("--gui")
-            .arg(path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn corro --gui"),
+        support::spawn_capped_corro(&["--gui", &path.to_string_lossy()], &[]),
     )
 }
 

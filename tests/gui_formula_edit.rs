@@ -16,8 +16,10 @@
 //!   xvfb-run -a cargo test --features gtk --test gui_formula_edit
 #![cfg(all(target_os = "linux", feature = "gui"))]
 
+#[path = "support/mod.rs"]
+mod support;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -206,17 +208,9 @@ fn spawn_gui(path: &PathBuf) -> KillOnDrop {
     // CORRO_TEST_BIN overrides the spawned binary (hermetic against
     // concurrent sessions rebuilding target/debug/corro with different
     // features mid-run); otherwise the usual cargo-built binary.
-    let bin = std::env::var("CORRO_TEST_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro"));
+    
     KillOnDrop(
-        Command::new(&bin)
-            .arg("--gui")
-            .arg(path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn corro --gui"),
+        support::spawn_capped_corro(&["--gui", &path.to_string_lossy()], &[]),
     )
 }
 

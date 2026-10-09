@@ -16,8 +16,10 @@
 //!   xvfb-run -a cargo test --features gtk --test gui_menu_key
 #![cfg(all(target_os = "linux", feature = "gui"))]
 
+#[path = "support/mod.rs"]
+mod support;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -76,15 +78,9 @@ impl Drop for KillOnDrop {
 }
 
 fn spawn_gui(path: &PathBuf) -> KillOnDrop {
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
+    
     KillOnDrop(
-        Command::new(&bin)
-            .arg("--gui")
-            .arg(path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn corro --gui"),
+        support::spawn_capped_corro(&["--gui", &path.to_string_lossy()], &[]),
     )
 }
 
@@ -464,16 +460,9 @@ fn gui_workbook_external_launches_gui_editor() {
             .expect("chmod editor script");
     }
 
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
+    
     let mut child = KillOnDrop(
-        Command::new(&bin)
-            .arg("--gui")
-            .arg(&path)
-            .env("CORRO_GUI_EDITOR", &script)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn corro --gui"),
+        support::spawn_capped_corro(&["--gui", &path.to_string_lossy()], &[("CORRO_GUI_EDITOR", &script.to_string_lossy())]),
     );
     let pid = child.id();
     let wid = find_corro_window(pid, Instant::now() + Duration::from_secs(25));
