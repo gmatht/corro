@@ -83,3 +83,6 @@ DerivedData/
 *.swp
 *.swo
 *~
+
+# Verus exploratory scratch: never claimed, never built.
+proofs/scratch/
