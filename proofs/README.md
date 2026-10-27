@@ -24,8 +24,11 @@ verification results:: 4 verified, 0 errors
 $ verus --triggers-mode silent proofs/balance_subset.rs
 verification results:: 4 verified, 0 errors
 
-$ cargo test --test col_decode_xcheck --test split_digits_xcheck
+$ cargo test --test col_decode_xcheck --test split_digits_xcheck \
+             --test money_parse_xcheck --test balance_subset_xcheck
 running 5 tests ... test result: ok. 5 passed; 0 failed
+running 5 tests ... test result: ok. 5 passed; 0 failed
+running 6 tests ... test result: ok. 6 passed; 0 failed
 running 5 tests ... test result: ok. 5 passed; 0 failed
 ```
 
