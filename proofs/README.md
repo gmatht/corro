@@ -1,16 +1,22 @@
 # Verus proofs for corro
 
-Two files verify today. Everything else in this directory is scratch and is
-not claimed.
+Three files verify, plus a cross-check test that drives the real corro code.
+Everything else in this directory is scratch and is not claimed.
 
 Checked with `verus 0.2026.10.18.7d82994` (bundled z3 4.16.0):
 
 ```
-$ /opt/verus-0.2026.10.18.7d82994/verus --triggers-mode silent proofs/arith.rs
+$ verus --triggers-mode silent proofs/arith.rs
 verification results:: 12 verified, 0 errors
 
-$ /opt/verus-0.2026.10.18.7d82994/verus --triggers-mode silent proofs/col_codec.rs
+$ verus --triggers-mode silent proofs/col_codec.rs
 verification results:: 8 verified, 0 errors
+
+$ verus --triggers-mode silent proofs/col_decode.rs
+verification results:: 19 verified, 0 errors
+
+$ cargo test --test col_decode_xcheck
+running 5 tests ... test result: ok. 5 passed; 0 failed
 ```
 
 ## `arith.rs` — the integer lemmas
@@ -21,51 +27,55 @@ neither comes free here, so the shapes that *do* go through are collected in
 one place: `mul_mono_const` (by induction on the gap), `mul_nonneg`,
 `expand26`, `expand10`, `comm26`, `le_of_le_eq`, `le_add_const`.
 
-Every kernel proof in corro will need these; they are the reason a "one-line"
+Every kernel proof in corro will need these; they are why a "one-line"
 inequality takes a lemma.
 
-## `col_codec.rs` — the column codec, partially
+## `col_decode.rs` — the column codec, proved
 
-Established:
+`src/addr.rs:34 parse_excel_column`, transcribed to `&[u8]` and verified end to
+end: `Some` iff every byte is `A`..=`Z`, and on success the value is the
+base-26 value of the name.
 
-- `val_at` / `val` define the bijective base-26 value of a column name;
-- `val_at` is non-negative on a valid name (`val_at_nonneg`);
-- `val_at` unfolds exactly one digit (`val_at_unfold`);
-- a valid name's value is `< 26^len` — *not* proved; the file stops short.
+The hard part was the bound. Both of the obvious statements are **false**:
 
-**Not established, and this is the honest limit of the file:** the upper bound
-and the executable decoder loop. A valid name of `k` letters has value below
-`26^k`; the tight bound needs a case split (when the last digit is `Z` and the
-prefix is maximal the value reaches exactly `pow26(k)`), and the file carries
-neither. The executable `parse_excel_column` is therefore **not** verified.
+| claim | counterexample |
+|---|---|
+| `val <= 26^len - 1` | `"Z"` = 26, and `26^1 - 1 = 25` |
+| `val <= 26^len` | `"ZZ"` = 702, and `26^2 = 676` |
 
-## What closing the codec would take
+The exact maximum is `(26^(len+1) - 26)/25`, and the bound that *composes*
+under the recursion is
 
-The missing piece is one lemma, `val_at_upper`, in this shape:
-
-```rust
-pub proof fn val_at_upper(s: Seq<u8>, i: int)
-    requires valid(s), 0 <= i <= s.len(),
-    ensures val_at(s, i) < pow26((s.len() - i) as nat),
+```
+25 * val(s) + 26  <=  26^(len+1)
 ```
 
-The induction step is `d + 26*t` with `d <= 26` and `t < pow26(k)`. It splits
-into two cases that *both* verify standalone (`scratch/try_CE1.rs`, 4
-obligations):
+because `25*(26t + d) + 26 = 650t + 25d + 26 <= 650t + 676 = 26*(25t+26)`.
+With that, the induction is linear at every step and closes.
 
-- `d <= 25` — `d + 26t <= 25 + 26*(P-1) = 26P - 1`;
-- `t <= P - 2` — `d + 26t <= 26 + 26*(P-2) = 26P - 26`.
+`col_codec.rs` (8 obligations) keeps the earlier, smaller spec of the same
+value; it is superseded by `col_decode.rs` for the loop, and is retained
+because it states the value function in the digit-at-front form that reads
+more like the source.
 
-The remaining case, `d == 26 && t == pow26(k) - 1`, gives exactly
-`26*pow26(k)`. So the bound that actually holds is `val <= pow26(len)` (not
-`pow26(len) - 1`) — `'Z'` is 26 and `26^1 - 1 = 25`, which is the counterexample
-that cost the most time here. With that statement the induction closes
-*except* for threading the `+ 26` slack through the recursive call: several
-attempts in `scratch/` got the step lemma alone (`try_CA1.rs` and `try_CD1.rs`
-both verify with 5 obligations)
-but not the full recursion. That is the next hour of work, not a research
-problem — but it is unfinished, and `col_probe.rs` still reports
-`3 verified, 3 errors`.
+## `tests/col_decode_xcheck.rs` — the proof checked against corro
+
+A proof about a copy is only worth something if the copy is the real thing.
+This test drives corro's actual `parse_excel_column` and the verified model
+over the same inputs: known names, rejected input, and an exhaustive sweep of
+`{A,Z,a,0,[,@}` up to length 3, asserting `Some` iff all-uppercase.
+
+It found two bugs in `src/addr.rs`, both asserted rather than papered over:
+
+- **`parse_excel_column("")` panics.** `n` stays 0 and `Some(n - 1)` subtracts
+  from zero.
+- **`"ZZZZZZZ"` and longer are rejected** although well formed: the Horner
+  value overflows a `u32`. `"ZZZZZZ"` (index 321_272_405) is the largest that
+  fits.
+
+The proof's precondition `pow26(len+1) <= u32::MAX` is exactly the domain where
+the two agree, so neither bug is inside what is proved — which is also why the
+precondition is worth stating explicitly rather than hiding.
 
 ## Why this matters for corro
 
@@ -79,8 +89,9 @@ explicitly.
 | file | status |
 |---|---|
 | `arith.rs` | verifies: 12 obligations |
-| `col_codec.rs` | verifies: 8 obligations (codec spec + non-negativity) |
-| `col_probe.rs` | not finished; kept as the record of the failing obligations |
+| `col_decode.rs` | verifies: 19 obligations; the full decoder |
+| `col_codec.rs` | verifies: 8 obligations (smaller spec of the same value) |
+| `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |
 | `VERUS_FIT_REPORT.md` | the earlier measurement report, unchanged |
