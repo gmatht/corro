@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Four files verify, plus cross-check tests that drive the real corro code.
+Five files verify, plus cross-check tests that drive the real corro code.
 Everything else in this directory is scratch and is not claimed.
 
 Checked with `verus 0.2026.10.18.7d82994` (bundled z3 4.16.0):
@@ -16,6 +16,9 @@ $ verus --triggers-mode silent proofs/col_decode.rs
 verification results:: 19 verified, 0 errors
 
 $ verus --triggers-mode silent proofs/split_digits.rs
+verification results:: 4 verified, 0 errors
+
+$ verus --triggers-mode silent proofs/money_parse.rs
 verification results:: 4 verified, 0 errors
 
 $ cargo test --test col_decode_xcheck --test split_digits_xcheck
@@ -76,6 +79,22 @@ This is the half of fill inference that is pure byte work. Its caller
 `infer_suffix_fill` adds `parse::<i64>` and `format!`, neither of which has a
 vstd spec -- the same wall the money parser hits.
 
+## `money_parse.rs` — the money parser's shape, not its value
+
+`balance-core/src/lib.rs:7 parse_amount_cents`: an optional sign, a non-empty
+digit run, then optionally a `.` and a digit run reaching the end. Proved:
+whenever it accepts, the parts it identified really are digit runs with a
+non-empty whole part.
+
+**Not proved:** the returned cents value. That needs `parse::<i64>`,
+`saturating_mul`/`saturating_add` and the `replace(',', "")` pre-pass — three
+things with no vstd spec. Also no round-trip, since `format_amount_cents` uses
+`format!`.
+
+This is the honest shape of the money work: the control flow is provable and
+the arithmetic is reachable only through shims that would each be a proof
+obligation in disguise.
+
 ## `tests/col_decode_xcheck.rs` — the proof checked against corro
 
 A proof about a copy is only worth something if the copy is the real thing.
@@ -112,6 +131,7 @@ explicitly.
 | `col_decode.rs` | verifies: 19 obligations; the full decoder |
 | `col_codec.rs` | verifies: 8 obligations (smaller spec of the same value) |
 | `split_digits.rs` | verifies: 4 obligations; the digit splitter |
+| `money_parse.rs` | verifies: 4 obligations; parse shape only |
 | `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |
