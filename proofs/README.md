@@ -56,9 +56,13 @@ into two cases that *both* verify standalone (see `scratch/try_BY1.rs`):
 - `t <= pow26(k) - 2` — `d + 26t <= 26 + 26*(pow26(k)-2) = 26*pow26(k) - 26`.
 
 The remaining case, `d == 26 && t == pow26(k) - 1`, gives exactly
-`26*pow26(k)`, so it has to be excluded by strengthening the induction
-hypothesis rather than by arithmetic. That is the next hour of work, not a
-research problem — but it is unfinished, and `col_probe.rs` still reports
+`26*pow26(k)`. So the bound that actually holds is `val <= pow26(len)` (not
+`pow26(len) - 1`) — `'Z'` is 26 and `26^1 - 1 = 25`, which is the counterexample
+that cost the most time here. With that statement the induction closes
+*except* for threading the `+ 26` slack through the recursive call: several
+attempts in `scratch/` got the step lemma alone (`try_CA1.rs`, `try_CD1.rs`)
+but not the full recursion. That is the next hour of work, not a research
+problem — but it is unfinished, and `col_probe.rs` still reports
 `3 verified, 3 errors`.
 
 ## Why this matters for corro
