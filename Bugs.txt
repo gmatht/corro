@@ -52,3 +52,23 @@ first key. So the test fails on its precondition before it ever presses Left.
 Unrelated to the formula row; it needs a settle (or a key) before the first
 screenshot. Confirmed pre-existing: it fails identically with the GTK label
 pin disabled.
+
+addr: parse_excel_column("") panics on n - 1
+Found while verifying the function with Verus, then confirmed by a test.
+An empty name loops zero times, leaves `n` at 0, and evaluates `Some(n - 1)`.
+In debug: "attempt to subtract with overflow" at src/addr.rs:42. In release it
+wraps, so `parse_excel_column("")` returns `Some(u32::MAX)` -- the last column.
+Every current caller (`parse_cell_ref_at`, `celladdr.rs`) rejects an empty
+column fragment with `col_len == 0` before calling, so this is latent, not
+live. But the function is `pub` and the guard lives in its callers, not in it.
+Fix: `if n == 0 { return None; }` before the subtraction.
+Evidence: tests/col_decode_xcheck.rs::corro_panics_on_empty_input.
+
+addr: parse_excel_column rejects well-formed names of 7+ letters
+The Horner accumulator for "ZZZZZZZ" is 8_353_082_582, which does not fit in a
+u32, so `checked_mul`/`checked_add` return None. "ZZZZZZ" (index 321_272_405) is
+the largest name accepted. The returned *index* for 7 letters does not fit
+either, so the ceiling may be intended -- but the caller cannot tell "not a
+column at all" from "column too large", and both currently mean None. Worth a
+decision rather than a silent limit.
+Evidence: tests/col_decode_xcheck.rs::corro_rejects_7_zs.
