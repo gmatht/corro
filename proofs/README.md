@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Five files verify, plus cross-check tests that drive the real corro code.
+Six files verify, plus cross-check tests that drive the real corro code.
 Everything else in this directory is scratch and is not claimed.
 
 Checked with `verus 0.2026.10.18.7d82994` (bundled z3 4.16.0):
@@ -19,6 +19,9 @@ $ verus --triggers-mode silent proofs/split_digits.rs
 verification results:: 4 verified, 0 errors
 
 $ verus --triggers-mode silent proofs/money_parse.rs
+verification results:: 4 verified, 0 errors
+
+$ verus --triggers-mode silent proofs/balance_subset.rs
 verification results:: 4 verified, 0 errors
 
 $ cargo test --test col_decode_xcheck --test split_digits_xcheck
@@ -95,6 +98,22 @@ This is the honest shape of the money work: the control flow is provable and
 the arithmetic is reachable only through shims that would each be a proof
 obligation in disguise.
 
+## `balance_subset.rs` — book balancing cannot lie about "no match"
+
+`balance-core/src/lib.rs:125 choose_subset` searches for a subset of the
+remaining rows whose amounts sum exactly to an anchor's amount. The property
+that matters is soundness: when it reports nothing, there really is nothing.
+A search that silently gave up would balance a book wrongly and say nothing.
+
+Proved: `prepend_ok` (adding a smaller index in front keeps a subset valid) and
+`no_subset_step` -- if nothing in `[start, n)` sums to `target`, then for any
+usable index `i` nothing in `(i, n)` sums to `target - vals[i]`. That is
+exactly the step the recursion takes before moving to the next candidate.
+
+**Not proved:** the executable recursion, the `used[]` mask, the outer loop over
+anchors, or that groups are disjoint. Those need `Vec`, `sort_by_key` and
+iterator chains rewritten to loops.
+
 ## `tests/col_decode_xcheck.rs` — the proof checked against corro
 
 A proof about a copy is only worth something if the copy is the real thing.
@@ -132,6 +151,7 @@ explicitly.
 | `col_codec.rs` | verifies: 8 obligations (smaller spec of the same value) |
 | `split_digits.rs` | verifies: 4 obligations; the digit splitter |
 | `money_parse.rs` | verifies: 4 obligations; parse shape only |
+| `balance_subset.rs` | verifies: 4 obligations; subset-sum soundness |
 | `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |
