@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Three files verify, plus a cross-check test that drives the real corro code.
+Four files verify, plus cross-check tests that drive the real corro code.
 Everything else in this directory is scratch and is not claimed.
 
 Checked with `verus 0.2026.10.18.7d82994` (bundled z3 4.16.0):
@@ -15,7 +15,11 @@ verification results:: 8 verified, 0 errors
 $ verus --triggers-mode silent proofs/col_decode.rs
 verification results:: 19 verified, 0 errors
 
-$ cargo test --test col_decode_xcheck
+$ verus --triggers-mode silent proofs/split_digits.rs
+verification results:: 4 verified, 0 errors
+
+$ cargo test --test col_decode_xcheck --test split_digits_xcheck
+running 5 tests ... test result: ok. 5 passed; 0 failed
 running 5 tests ... test result: ok. 5 passed; 0 failed
 ```
 
@@ -58,6 +62,20 @@ value; it is superseded by `col_decode.rs` for the loop, and is retained
 because it states the value function in the digit-at-front form that reads
 more like the source.
 
+## `split_digits.rs` — the fill-inference splitter
+
+`src/extrapolate/mod.rs:398 split_trailing_digits`, over bytes: the scan
+returns exactly `len - trailing_digit_run`, and `None` exactly when there is
+no trailing digit. Supporting lemma `ndigits_split` carries the loop
+invariant.
+
+Not proved: that the byte at the boundary is a non-digit (the run is maximal).
+The loop condition makes it true; stating it needs another induction.
+
+This is the half of fill inference that is pure byte work. Its caller
+`infer_suffix_fill` adds `parse::<i64>` and `format!`, neither of which has a
+vstd spec -- the same wall the money parser hits.
+
 ## `tests/col_decode_xcheck.rs` — the proof checked against corro
 
 A proof about a copy is only worth something if the copy is the real thing.
@@ -80,7 +98,9 @@ precondition is worth stating explicitly rather than hiding.
 ## Why this matters for corro
 
 `cargo test` cannot fail when a spec stops holding, so verification has to be
-its own CI step naming the real source path. A file that nothing `mod`-declares
+its own CI step naming the real source path. The two `*_xcheck` tests are the
+other half: they are what notice when the *copy* in `proofs/` drifts from the
+function in `src/`. A file that nothing `mod`-declares
 is invisible to `cargo` and visible to `verus`, so the step must name the file
 explicitly.
 
@@ -91,6 +111,7 @@ explicitly.
 | `arith.rs` | verifies: 12 obligations |
 | `col_decode.rs` | verifies: 19 obligations; the full decoder |
 | `col_codec.rs` | verifies: 8 obligations (smaller spec of the same value) |
+| `split_digits.rs` | verifies: 4 obligations; the digit splitter |
 | `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |
