@@ -1,7 +1,8 @@
 # Verus proofs for corro
 
-Eight files verify, plus cross-check tests that drive the real corro code.
-Everything else in this directory is scratch and is not claimed.
+Eight files verify (67 obligations), plus six cross-check suites (32 tests)
+that drive the real corro code. Everything else in this directory is scratch and
+is not claimed.
 
 Checked with `verus 0.2026.10.18.7d82994` (bundled z3 4.16.0):
 
