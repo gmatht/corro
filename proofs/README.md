@@ -296,6 +296,39 @@ is the one kernel with a proof sharp enough to have a stated domain. The other
 ten proofs do not imply their kernels are bug-free — only that the property
 each one states holds.
 
+## `col_encode` — attempted, not closed
+
+`src/addr.rs::excel_column_name_bytes` is now a byte-level core with a
+`String` wrapper, so it is a candidate for the inverse-direction proof. It is
+**not proved**. Recording why, so the next attempt does not repeat the work.
+
+The encoder is a *bijective* base-26 counter: each step does `n -= 1` before
+taking `n % 26`. The obvious specs are wrong, and I checked each against data
+rather than trusting it:
+
+| claim | counterexample |
+|---|---|
+| `enc(m)` = base-26 digits of `m - 1` | `enc(27) = [0,0]`, but base-26 of 26 is `[0,1]` |
+| `sum(d_j * 26^j) = m - 1` | fails for 19,973 of the first 20,000 |
+
+The correct characterisation, validated against every `m < 20000`, is
+
+```
+S_k       = (26^k - 1) / 25            (offset of the first k-letter name)
+n_k       = (m - S_k) / 26^k
+digit_k   = (n_k - 1) % 26
+```
+
+`proofs/scratch/enc3.rs` proves `25 * S_k == 26^k - 1`. What is missing is one
+integer-division step, `(n_k - 1)/26 == (m - S_k - 26^k)/26^(k+1)`, which needs
+a Euclidean-division lemma that `scratch/enc5.rs` and `enc6.rs` did not
+close. That is the open item; it is arithmetic, not a modelling problem.
+
+What *is* pinned meanwhile: `tests/column_name_xcheck.rs` (4 tests) checks the
+byte core against `parse_excel_column` over 70,000 indices, that names are
+unique, and that lengths follow the bijective digit count. Mutation-checked:
+`(n + 1) % 26` in the digit fails 2 of the 4.
+
 ## Why this matters for corro
 
 `cargo test` cannot fail when a spec stops holding: `proofs/` is not a crate, no

@@ -86,17 +86,47 @@ pub fn parse_excel_column_checked(name: &str) -> Result<u32, ColumnNameError> {
     n.checked_sub(1).ok_or(ColumnNameError::Malformed)
 }
 
-/// 0-based main column index → bijective base-26 column letters (`A`, `AA`, …).
-/// Inverse of [`parse_excel_column`].
-pub fn excel_column_name(main_col_index: usize) -> String {
-    let mut n = main_col_index + 1;
-    let mut s = String::new();
+/// Buffer size for a column name. The largest index a `usize` can hold,
+/// `usize::MAX`, needs 14 letters for its `+ 1` value (26^13 < 2^64-1 <= 26^14
+/// and `usize::MAX + 1` is the largest number of letters any input can demand).
+/// 16 leaves margin and keeps the buffer a single cache-friendly constant.
+const COLUMN_NAME_MAX_BYTES: usize = 16;
+
+/// The byte-level core: writes `A`..=`Z` bytes into the tail of `out` and
+/// returns the (possibly empty) used slice.
+///
+/// Kept separate from the `String` wrapper so the executable core has no
+/// allocation and no `format!`, which is what makes it a candidate for the
+/// Verus proofs (the inverse direction is not proved yet — see
+/// `proofs/README.md`). Pinned by `tests/column_name_xcheck.rs`, which checks
+/// it against `parse_excel_column` over 70,000 indices.
+///
+/// `main_col_index == usize::MAX` would overflow the `+ 1`; it is rejected as
+/// empty rather than panicking, which the wrapper's callers never hit (a
+/// column index is a display extent, not `usize::MAX`).
+fn excel_column_name_bytes(main_col_index: usize, out: &mut [u8; COLUMN_NAME_MAX_BYTES]) -> &[u8] {
+    let mut n = match main_col_index.checked_add(1) {
+        Some(v) => v,
+        None => return &out[COLUMN_NAME_MAX_BYTES..],
+    };
+    let mut i = COLUMN_NAME_MAX_BYTES;
     while n > 0 {
         n -= 1;
-        s.push((b'A' + (n % 26) as u8) as char);
+        i -= 1;
+        out[i] = b'A' + (n % 26) as u8;
         n /= 26;
     }
-    s.chars().rev().collect()
+    &out[i..]
+}
+
+/// 0-based main column index → bijective base-26 column letters (`A`, `AA`, …).
+/// Inverse of [`parse_excel_column`]. One allocation; the arithmetic lives in
+/// [`excel_column_name_bytes`], which the proofs use directly.
+pub fn excel_column_name(main_col_index: usize) -> String {
+    let mut buf = [0u8; COLUMN_NAME_MAX_BYTES];
+    let bytes = excel_column_name_bytes(main_col_index, &mut buf);
+    // Only ASCII 'A'..='Z' is ever written, so this cannot fail.
+    String::from_utf8(bytes.to_vec()).expect("column names are ASCII")
 }
 
 /// A store's **global** column index → its base-26 letter.

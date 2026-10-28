@@ -158,4 +158,5 @@ jobs:
             --test agg_sparse_order_xcheck \
             --test cursor_roundtrip_xcheck \
             --test cellref_parse_xcheck \
-            --test decimal_parse_xcheck
+            --test decimal_parse_xcheck \
+            --test column_name_xcheck
