@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Nine files verify (70 obligations), plus seven cross-check suites (36 tests)
+Ten files verify (74 obligations), plus eight cross-check suites (40 tests)
 that drive the real corro code. Everything else in this directory is scratch and
 is not claimed.
 
@@ -33,6 +33,9 @@ verification results:: 10 verified, 0 errors
 
 $ verus --triggers-mode silent proofs/agg_sparse_order.rs
 verification results:: 3 verified, 0 errors
+
+$ verus --triggers-mode silent proofs/cursor_roundtrip.rs
+verification results:: 4 verified, 0 errors
 
 $ cargo test --test col_decode_xcheck --test split_digits_xcheck \
              --test money_parse_xcheck --test balance_subset_xcheck
@@ -182,6 +185,28 @@ addition is not associative.
 is about the *index order*, the part reachable without `Grid`,
 `Box<dyn GridImpl>` or closures.
 
+## `cursor_roundtrip.rs` — the sheet cursor and the cell address are inverses
+
+`src/addr.rs:115 sheet_cursor_to_addr` and `:159 addr_to_sheet_cursor`. The UI
+converts between them on every cursor move and every address display, so a
+mismatch puts the selection or the status line on the wrong cell.
+
+Two layers, both proved:
+
+- `ColumnAddr::from_global` / `to_global` (`src/grid/mod.rs:222,234`) invert each
+  other in both directions, given the region bounds. The left margin is globals
+  `[0, 702)`, the main grid `[702, 702+main_cols)`, the right margin everything
+  above.
+- `cursor_to_addr` / `addr_to_cursor` over the five regions (Header, Left, Main,
+  Right, Footer) compose to the identity.
+
+`regions_are_distinct` is in the file so the round-trip is not vacuously true:
+all five regions are reachable and map to distinct address kinds.
+
+Modelled over `int` rather than `usize`/`u32`. The `as u32` casts in the source
+are therefore outside the proof — the cross-check test covers those, and a
+deliberately injected off-by-one in `to_global` is caught by it.
+
 ## `tests/col_decode_xcheck.rs` — the proof checked against corro
 
 A proof about a copy is only worth something if the copy is the real thing.
@@ -223,6 +248,7 @@ explicitly.
 | `shift_guards.rs` | verifies: 6 obligations; insert-repair shift guards |
 | `keyword_table.rs` | verifies: 10 obligations; keyword precedence table |
 | `agg_sparse_order.rs` | verifies: 3 obligations; sparse-path visit order |
+| `cursor_roundtrip.rs` | verifies: 4 obligations; cursor <-> address inverse |
 | `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |
