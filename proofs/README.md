@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Ten files verify (74 obligations), plus eight cross-check suites (40 tests)
+Eleven files verify (81 obligations), plus nine cross-check suites (46 tests)
 that drive the real corro code. Everything else in this directory is scratch and
 is not claimed.
 
@@ -36,6 +36,9 @@ verification results:: 3 verified, 0 errors
 
 $ verus --triggers-mode silent proofs/cursor_roundtrip.rs
 verification results:: 4 verified, 0 errors
+
+$ verus --triggers-mode silent proofs/cellref_parse.rs
+verification results:: 7 verified, 0 errors
 
 $ cargo test --test col_decode_xcheck --test split_digits_xcheck \
              --test money_parse_xcheck --test balance_subset_xcheck
@@ -207,6 +210,21 @@ Modelled over `int` rather than `usize`/`u32`. The `as u32` casts in the source
 are therefore outside the proof — the cross-check test covers those, and a
 deliberately injected off-by-one in `to_global` is caught by it.
 
+## `cellref_parse.rs` — where a cell ref ends
+
+`src/addr.rs:282 parse_cell_ref_at` returns `(addr, locks, n)`, and every caller
+slices the formula source at `n` to find the next token. Off by one and `A5+A6`
+mis-tokenises. So the property worth proving is not the address value (that is
+`col_decode.rs`) but that **`n` is exactly the letters and digits consumed, and
+the byte after it is not a digit**.
+
+Proved: `letter_run`/`digit_run` count maximal runs and stop where the run ends;
+a run never passes the end of the input; `a1_len` is in range and the byte at it
+is not a digit.
+
+**Not proved:** the header/footer (`~`/`_`) branch, the `$`-lock prefix rules, or
+`cell_ref_text` (which is `format!`-bound). The cross-check test covers those.
+
 ## `tests/col_decode_xcheck.rs` — the proof checked against corro
 
 A proof about a copy is only worth something if the copy is the real thing.
@@ -249,6 +267,7 @@ explicitly.
 | `keyword_table.rs` | verifies: 10 obligations; keyword precedence table |
 | `agg_sparse_order.rs` | verifies: 3 obligations; sparse-path visit order |
 | `cursor_roundtrip.rs` | verifies: 4 obligations; cursor <-> address inverse |
+| `cellref_parse.rs` | verifies: 7 obligations; cell-ref consumed length |
 | `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |
