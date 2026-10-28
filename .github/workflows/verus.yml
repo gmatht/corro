@@ -129,6 +129,7 @@ jobs:
             cursor_roundtrip \
             cellref_parse \
             decimal_parse \
+            col_encode \
           ; do
             printf '%-20s ' "$f"
             if out=$(verus --triggers-mode silent "proofs/$f.rs" 2>&1); then

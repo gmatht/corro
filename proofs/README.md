@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Twelve files verify (83 obligations), plus ten cross-check suites (50 tests)
+Thirteen files verify (93 obligations), plus eleven cross-check suites (56 tests)
 that drive the real corro code. Everything else in this directory is scratch and
 is not claimed.
 
@@ -42,6 +42,9 @@ verification results:: 7 verified, 0 errors
 
 $ verus --triggers-mode silent proofs/decimal_parse.rs
 verification results:: 2 verified, 0 errors
+
+$ verus --triggers-mode silent proofs/col_encode.rs
+verification results:: 10 verified, 0 errors
 
 $ cargo test --test col_decode_xcheck --test split_digits_xcheck \
              --test money_parse_xcheck --test balance_subset_xcheck
@@ -296,6 +299,79 @@ is the one kernel with a proof sharp enough to have a stated domain. The other
 ten proofs do not imply their kernels are bug-free — only that the property
 each one states holds.
 
+## `col_encode` — the encoder's digit sequence, partly proved
+
+`src/addr.rs::excel_column_name_bytes` is a *bijective* base-26 counter: each
+step does `n -= 1` before taking `n % 26`. That is not a base conversion, and
+both specs I first wrote were wrong — caught only by running the model against
+data, not by the prover:
+
+| claim | counterexample |
+|---|---|
+| `enc(m)` = base-26 digits of `m − 1` | `enc(27) = [0,0]`, base-26 of 26 is `[0,1]` |
+| `sum(d_j · 26^j) = m − 1` | fails for 19,973 of the first 20,000 |
+
+The characterisation that holds recurses exactly as the loop does:
+
+```
+digits(x) = []                                       if x == 0
+            digits((x − 1)/26).push((x − 1) mod 26)  otherwise
+```
+
+validated against the real loop for every `x < 50000`.
+
+**Proved** (`col_encode.rs`, 10 obligations): the recurrence, its length, that a
+positive value has at least one digit, four concrete values (`A`, `Z`, `AA`,
+`AB`), and that the loop terminates having written exactly `digits(x).len()`
+bytes.
+
+**Not proved:** that the bytes written *equal* `digits(x)`. The loop writes
+MSB-first into a buffer tail, i.e. the reverse of `digits`, and that reversal
+invariant is not closed — the loop is proved to have the right *length*, not the
+right *content*. So the round-trip against `parse_excel_column` rests on
+`tests/column_name_xcheck.rs` (70,000 indices), not on the proof.
+
+## Why this matters for corro
+
+`cargo test` cannot fail when a spec stops holding: `proofs/` is not a crate, no
+file in it is reachable from a `mod` tree, and `cargo` therefore never compiles
+them. So verification is `.github/workflows/verus.yml`, which names each proof
+file explicitly. The `*_xcheck` suites are the other half: they are what notice
+when a copy in `proofs/` drifts from the function in `src/`.
+
+The job pins Verus by version rather than tracking `latest`, and sets
+`RUSTUP_TOOLCHAIN=1.99.1-...` **only** on the step that runs `verus` -- the test
+step must use the repo's own `rust-toolchain.toml` (`nightly`), or `src/` would
+silently be built on a toolchain the repo does not declare.
+
+Checked by running the job's own steps on a clean `RUSTUP_HOME` (only the pinned
+toolchain installed, Verus fetched from the release URL): 11 proofs verify and
+9 suites pass. Also checked that the job *fails*: breaking one `ensures` in
+`cellref_parse.rs` makes the run exit 1 with that file named. A file that nothing `mod`-declares
+is invisible to `cargo` and visible to `verus`, so the step must name the file
+explicitly.
+
+## Files
+
+| file | status |
+|---|---|
+| `arith.rs` | verifies: 12 obligations |
+| `col_decode.rs` | verifies: 19 obligations; the full decoder |
+| `col_codec.rs` | verifies: 8 obligations (smaller spec of the same value) |
+| `split_digits.rs` | verifies: 4 obligations; the digit splitter |
+| `money_parse.rs` | verifies: 4 obligations; parse shape only |
+| `balance_subset.rs` | verifies: 4 obligations; subset-sum soundness |
+| `shift_guards.rs` | verifies: 6 obligations; insert-repair shift guards |
+| `keyword_table.rs` | verifies: 10 obligations; keyword precedence table |
+| `agg_sparse_order.rs` | verifies: 3 obligations; sparse-path visit order |
+| `cursor_roundtrip.rs` | verifies: 4 obligations; cursor <-> address inverse |
+| `cellref_parse.rs` | verifies: 7 obligations; cell-ref consumed length |
+| `decimal_parse.rs` | verifies: 2 obligations; decimal accept/reject shape |
+| `col_encode.rs` | verifies: 10 obligations; encoder digit spec + loop length |
+| `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
+| `tiny.rs` | timing floor for a trivial file (~3 s wall) |
+| `scratch/` | exploratory, not claimed |
+| `VERUS_FIT_REPORT.md` | the earlier measurement report, unchanged |
 ## `col_encode` — attempted, not closed
 
 `src/addr.rs::excel_column_name_bytes` is now a byte-level core with a
@@ -365,6 +441,7 @@ explicitly.
 | `cursor_roundtrip.rs` | verifies: 4 obligations; cursor <-> address inverse |
 | `cellref_parse.rs` | verifies: 7 obligations; cell-ref consumed length |
 | `decimal_parse.rs` | verifies: 2 obligations; decimal accept/reject shape |
+| `col_encode.rs` | verifies: 10 obligations; encoder digit spec + loop length |
 | `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |
