@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Thirteen files verify (97 obligations), plus eleven cross-check suites (56 tests)
+Fourteen files verify (109 obligations), plus eleven cross-check suites (56 tests)
 that drive the real corro code. Everything else in this directory is scratch and
 is not claimed.
 
@@ -46,6 +46,9 @@ verification results:: 2 verified, 0 errors
 $ verus --triggers-mode silent proofs/col_encode.rs
 verification results:: 14 verified, 0 errors
 
+$ verus --triggers-mode silent proofs/standalone_lemmas.rs
+verification results:: 12 verified, 0 errors
+
 $ cargo test --test col_decode_xcheck --test split_digits_xcheck \
              --test money_parse_xcheck --test balance_subset_xcheck
 running 5 tests ... test result: ok. 5 passed; 0 failed
@@ -53,6 +56,31 @@ running 5 tests ... test result: ok. 5 passed; 0 failed
 running 6 tests ... test result: ok. 6 passed; 0 failed
 running 5 tests ... test result: ok. 5 passed; 0 failed
 ```
+
+## `standalone_lemmas.rs` — the lemmas that are not about corro at all
+
+Twelve lemmas stated over `int`, or over a generic `Seq<A>` with an abstract
+order relation. **No line of code in that file mentions corro**, and it proves
+from an empty directory with nothing else present. They can be lifted into any
+Verus project and worked on without this repository.
+
+They are worth separating out because each one exists for a *prover* reason,
+not a spreadsheet reason:
+
+| lemma | why it is needed |
+|---|---|
+| `mul_mono_const(a, b, m)` | Z3 will not multiply a hypothesis by a constant — with or without `nonlinear_arith` |
+| `mul_nonneg(a, b)` | ...and will not derive that a product of non-negatives is non-negative |
+| `le_of_le_eq(x, y, z)` | will not chain `x <= y` with `y == z` unless oriented to match |
+| `le_add_const(x, y, c)` | adding a constant to both sides |
+| `rev_push(s, a)` | `rev(s ++ [a]) == [a] ++ rev(s)`; needs induction, and `reveal_with_fuel` for the base case |
+| `rev_len(s)` | reversal preserves length |
+| `subseq_mem(f, s, x)` | every element of a subsequence occurs in the source (`Seq::contains` does not decompose over `drop_first`) |
+| `subseq_sorted(f, s, le)` | a subsequence of a `le`-sorted list is `le`-sorted, **given `le` is transitive** — the generic form of "a filtered fast path keeps the scan order" |
+
+The corro-specific *instantiations* — base-26 digits, cell addresses, aggregate
+visit order — live in the other files and are not reusable outside a
+spreadsheet.
 
 ## `arith.rs` — the integer lemmas
 
@@ -355,27 +383,6 @@ toolchain installed, Verus fetched from the release URL): 11 proofs verify and
 is invisible to `cargo` and visible to `verus`, so the step must name the file
 explicitly.
 
-## Files
-
-| file | status |
-|---|---|
-| `arith.rs` | verifies: 12 obligations |
-| `col_decode.rs` | verifies: 19 obligations; the full decoder |
-| `col_codec.rs` | verifies: 8 obligations (smaller spec of the same value) |
-| `split_digits.rs` | verifies: 4 obligations; the digit splitter |
-| `money_parse.rs` | verifies: 4 obligations; parse shape only |
-| `balance_subset.rs` | verifies: 4 obligations; subset-sum soundness |
-| `shift_guards.rs` | verifies: 6 obligations; insert-repair shift guards |
-| `keyword_table.rs` | verifies: 10 obligations; keyword precedence table |
-| `agg_sparse_order.rs` | verifies: 3 obligations; sparse-path visit order |
-| `cursor_roundtrip.rs` | verifies: 4 obligations; cursor <-> address inverse |
-| `cellref_parse.rs` | verifies: 7 obligations; cell-ref consumed length |
-| `decimal_parse.rs` | verifies: 2 obligations; decimal accept/reject shape |
-| `col_encode.rs` | verifies: 10 obligations; encoder digit spec + loop length |
-| `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
-| `tiny.rs` | timing floor for a trivial file (~3 s wall) |
-| `scratch/` | exploratory, not claimed |
-| `VERUS_FIT_REPORT.md` | the earlier measurement report, unchanged |
 ## `col_encode` — attempted, not closed
 
 `src/addr.rs::excel_column_name_bytes` is now a byte-level core with a
@@ -445,7 +452,8 @@ explicitly.
 | `cursor_roundtrip.rs` | verifies: 4 obligations; cursor <-> address inverse |
 | `cellref_parse.rs` | verifies: 7 obligations; cell-ref consumed length |
 | `decimal_parse.rs` | verifies: 2 obligations; decimal accept/reject shape |
-| `col_encode.rs` | verifies: 10 obligations; encoder digit spec + loop length |
+| `col_encode.rs` | verifies: 14 obligations; encoder digit spec + loop length |
+| `standalone_lemmas.rs` | verifies: 12 obligations; **no corro content** |
 | `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |

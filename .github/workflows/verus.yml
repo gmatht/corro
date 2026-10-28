@@ -130,6 +130,7 @@ jobs:
             cellref_parse \
             decimal_parse \
             col_encode \
+            standalone_lemmas \
           ; do
             printf '%-20s ' "$f"
             if out=$(verus --triggers-mode silent "proofs/$f.rs" 2>&1); then
