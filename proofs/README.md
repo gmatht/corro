@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Thirteen files verify (93 obligations), plus eleven cross-check suites (56 tests)
+Thirteen files verify (97 obligations), plus eleven cross-check suites (56 tests)
 that drive the real corro code. Everything else in this directory is scratch and
 is not claimed.
 
@@ -44,7 +44,7 @@ $ verus --triggers-mode silent proofs/decimal_parse.rs
 verification results:: 2 verified, 0 errors
 
 $ verus --triggers-mode silent proofs/col_encode.rs
-verification results:: 10 verified, 0 errors
+verification results:: 14 verified, 0 errors
 
 $ cargo test --test col_decode_xcheck --test split_digits_xcheck \
              --test money_parse_xcheck --test balance_subset_xcheck
@@ -320,16 +320,20 @@ digits(x) = []                                       if x == 0
 
 validated against the real loop for every `x < 50000`.
 
-**Proved** (`col_encode.rs`, 10 obligations): the recurrence, its length, that a
-positive value has at least one digit, four concrete values (`A`, `Z`, `AA`,
-`AB`), and that the loop terminates having written exactly `digits(x).len()`
-bytes.
+**Proved** (`col_encode.rs`, 14 obligations): the recurrence, its length,
+positivity, four concrete values (`A`, `Z`, `AA`, `AB`) pinning the spec to the
+real encoder, that the loop terminates having written exactly `digits(x).len()`
+bytes, and the two lemmas the content proof needs — `rev_push` (appending `a`
+puts `a` at the front of the reverse) and `prefix_step` (the quotient's digits
+are the value's digits minus the last).
 
-**Not proved:** that the bytes written *equal* `digits(x)`. The loop writes
-MSB-first into a buffer tail, i.e. the reverse of `digits`, and that reversal
-invariant is not closed — the loop is proved to have the right *length*, not the
-right *content*. So the round-trip against `parse_excel_column` rests on
-`tests/column_name_xcheck.rs` (70,000 indices), not on the proof.
+**Not proved:** that the bytes written *equal* `digits(x)`. The invariant that
+would give it — `out[i..]` is the suffix of `digits(x)` below `digits(n)` — is
+arithmetically correct (checked numerically for every `x < 3000`) but its step
+does not close in Verus. The loop is therefore proved to have the right
+*length*, not yet the right *content*, and the round-trip against
+`parse_excel_column` rests on `tests/column_name_xcheck.rs` (70,000 indices),
+not on the proof.
 
 ## Why this matters for corro
 
