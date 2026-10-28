@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Seven files verify, plus cross-check tests that drive the real corro code.
+Eight files verify, plus cross-check tests that drive the real corro code.
 Everything else in this directory is scratch and is not claimed.
 
 Checked with `verus 0.2026.10.18.7d82994` (bundled z3 4.16.0):
@@ -26,6 +26,9 @@ verification results:: 4 verified, 0 errors
 
 $ verus --triggers-mode silent proofs/shift_guards.rs
 verification results:: 6 verified, 0 errors
+
+$ verus --triggers-mode silent proofs/keyword_table.rs
+verification results:: 10 verified, 0 errors
 
 $ cargo test --test col_decode_xcheck --test split_digits_xcheck \
              --test money_parse_xcheck --test balance_subset_xcheck
@@ -140,6 +143,23 @@ One thing worth knowing when reading the tests: `gap_start` is a **0-based**
 main-row index while formula text is 1-based, so `A5` is index 4 and shifts only
 when `gap_start <= 4`. Getting that backwards makes a correct function look broken.
 
+## `keyword_table.rs` — the margin-keyword precedence rules
+
+`src/ops/mod.rs:35 margin_key_agg_func` decides whether a margin label is an
+aggregate. The interesting content is the *precedence* between four input
+forms, and that is what is proved:
+
+- a leading apostrophe makes the label literal text — never an aggregate,
+  whatever follows;
+- a single `=` prefix accepts **only** `TOTAL`, which is what keeps `=MIN` and
+  `=SUM` usable as ordinary formulas;
+- `==WORD` and a bare `WORD` share one table;
+- nothing outside the eleven literals is ever accepted.
+
+**Not proved:** the trim and upper-case steps (`str::trim`,
+`to_ascii_uppercase`), which the source applies before the table. The
+cross-check test covers the composed behaviour.
+
 ## `tests/col_decode_xcheck.rs` — the proof checked against corro
 
 A proof about a copy is only worth something if the copy is the real thing.
@@ -179,6 +199,7 @@ explicitly.
 | `money_parse.rs` | verifies: 4 obligations; parse shape only |
 | `balance_subset.rs` | verifies: 4 obligations; subset-sum soundness |
 | `shift_guards.rs` | verifies: 6 obligations; insert-repair shift guards |
+| `keyword_table.rs` | verifies: 10 obligations; keyword precedence table |
 | `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |
