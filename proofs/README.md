@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Eight files verify (67 obligations), plus six cross-check suites (32 tests)
+Nine files verify (70 obligations), plus seven cross-check suites (36 tests)
 that drive the real corro code. Everything else in this directory is scratch and
 is not claimed.
 
@@ -30,6 +30,9 @@ verification results:: 6 verified, 0 errors
 
 $ verus --triggers-mode silent proofs/keyword_table.rs
 verification results:: 10 verified, 0 errors
+
+$ verus --triggers-mode silent proofs/agg_sparse_order.rs
+verification results:: 3 verified, 0 errors
 
 $ cargo test --test col_decode_xcheck --test split_digits_xcheck \
              --test money_parse_xcheck --test balance_subset_xcheck
@@ -161,6 +164,24 @@ forms, and that is what is proved:
 `to_ascii_uppercase`), which the source applies before the table. The
 cross-check test covers the composed behaviour.
 
+## `agg_sparse_order.rs` — why the sparse aggregate path agrees with dense
+
+`src/agg/mod.rs:60 fold_numbers_summable` has two paths. The dense one visits
+every cell of the range in row-major order; the sparse one walks
+`plan.stored_sorted`, the stored cells filtered to the range and sorted. They
+agree only if **filtering preserves the visit order**.
+
+Proved: `subseq_mem` (every element of a subsequence occurs in the source) and
+`subseq_sorted` (a subsequence of a row-major sorted list is row-major sorted).
+Together they say the sparse path sees exactly the sequence the dense path
+would — which matters because aggregates are order-sensitive: floating-point
+addition is not associative.
+
+**Not proved:** that skipped empty cells contribute nothing, that
+`summable_numeric` agrees between paths, or any `Number` arithmetic. This file
+is about the *index order*, the part reachable without `Grid`,
+`Box<dyn GridImpl>` or closures.
+
 ## `tests/col_decode_xcheck.rs` — the proof checked against corro
 
 A proof about a copy is only worth something if the copy is the real thing.
@@ -201,6 +222,7 @@ explicitly.
 | `balance_subset.rs` | verifies: 4 obligations; subset-sum soundness |
 | `shift_guards.rs` | verifies: 6 obligations; insert-repair shift guards |
 | `keyword_table.rs` | verifies: 10 obligations; keyword precedence table |
+| `agg_sparse_order.rs` | verifies: 3 obligations; sparse-path visit order |
 | `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |
