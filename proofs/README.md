@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Eleven files verify (81 obligations), plus nine cross-check suites (46 tests)
+Twelve files verify (83 obligations), plus ten cross-check suites (50 tests)
 that drive the real corro code. Everything else in this directory is scratch and
 is not claimed.
 
@@ -39,6 +39,9 @@ verification results:: 4 verified, 0 errors
 
 $ verus --triggers-mode silent proofs/cellref_parse.rs
 verification results:: 7 verified, 0 errors
+
+$ verus --triggers-mode silent proofs/decimal_parse.rs
+verification results:: 2 verified, 0 errors
 
 $ cargo test --test col_decode_xcheck --test split_digits_xcheck \
              --test money_parse_xcheck --test balance_subset_xcheck
@@ -225,6 +228,25 @@ is not a digit.
 **Not proved:** the header/footer (`~`/`_`) branch, the `$`-lock prefix rules, or
 `cell_ref_text` (which is `format!`-bound). The cross-check test covers those.
 
+## `decimal_parse.rs` — which literals count as numbers
+
+`src/formula/number.rs:462 parse_number_literal`. Proved is the accept/reject
+shape, the part with no `BigInt` in it: non-empty, at most one `.`, every byte a
+digit or `.`.
+
+A quirk worth knowing, because it looks like a bug and is not: **`"."` and
+`"-."` are accepted and parse as zero.** Neither side of the `.` being empty is
+rejected, and `parse_decimal_rational` turns two empty parts into 0.
+
+**Not proved:** the numeric value (`BigInt`/`BigRational`), the `trim` and the
+complex-literal pre-pass, and `rational_to_formula_literal` — so no round-trip.
+
+While cross-checking this, deleting the multi-dot guard in
+`parse_number_literal` turned out to change no observable behaviour: the
+downstream `parse_decimal_rational` rejects a second `.` anyway. Recorded in
+`Bugs.txt`, since the guard fires (7 of 9 multi-dot inputs reach it) but is
+redundant rather than load-bearing.
+
 ## `tests/col_decode_xcheck.rs` — the proof checked against corro
 
 A proof about a copy is only worth something if the copy is the real thing.
@@ -279,6 +301,7 @@ explicitly.
 | `agg_sparse_order.rs` | verifies: 3 obligations; sparse-path visit order |
 | `cursor_roundtrip.rs` | verifies: 4 obligations; cursor <-> address inverse |
 | `cellref_parse.rs` | verifies: 7 obligations; cell-ref consumed length |
+| `decimal_parse.rs` | verifies: 2 obligations; decimal accept/reject shape |
 | `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |

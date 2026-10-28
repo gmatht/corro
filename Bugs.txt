@@ -72,3 +72,17 @@ either, so the ceiling may be intended -- but the caller cannot tell "not a
 column at all" from "column too large", and both currently mean None. Worth a
 decision rather than a silent limit.
 Evidence: tests/col_decode_xcheck.rs::corro_rejects_7_zs.
+
+formula: the multi-dot guard in parse_number_literal is redundant
+`src/formula/number.rs:472` rejects a literal with more than one '.' before
+delegating to `parse_decimal_rational`. Deleting the guard changes no
+observable behaviour: `parse_decimal_rational` splits on the first '.', then
+rejects the remainder because it is not all digits, so "1..2" and "1.2.3" are
+still refused. Verified by removing the guard and running the decimal xcheck
+and the 90 `formula::` lib tests -- all still pass.
+
+The guard is NOT dead: 7 of 9 two-or-more-dot inputs reach it on a targeted
+sweep, so it does fire. It is redundant with the downstream check, which is
+worth knowing before anyone "simplifies" either one -- removing this one is
+safe today, but only because `parse_decimal_rational` happens to reject
+anything after a second dot.
