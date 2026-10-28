@@ -1,0 +1,159 @@
+name: Verus
+
+# Keeps the proofs in `proofs/` actually verifying.
+#
+# Why this exists, given that all eleven files were written passing: nothing
+# else in the repo can notice them breaking. `proofs/` is not a crate (no
+# Cargo.toml), none of its files are reachable from any `mod` tree, and
+# `cargo test` therefore never compiles them. A spec that quietly stops holding
+# fails no test, no build and no lint -- it just sits there looking like
+# evidence. That is exactly the "green run proves nothing" failure mode
+# `.github/workflows/wasm.yml` was written to fix for the wasm target, and the
+# same reasoning applies here: the check has to be a required step that names
+# the files, not an inference from a build that happens to pass.
+#
+# What this job covers:
+#   * each proof file is handed to `verus` by name, so a file that stops
+#     verifying fails the job;
+#   * the nine `*_xcheck` suites run, which is what notices when a proof's copy
+#     of a function drifts from the real one in `src/`.
+#
+# What this does NOT cover, stated here so it is not assumed:
+#   * The proofs are copies of the source functions, not the functions
+#     themselves. `cargo test` compiles `src/` and `verus` checks `proofs/`;
+#     they are two independent transcriptions, and only the xcheck tests tie
+#     them together. A change to `src/` that keeps the xcheck tests passing but
+#     alters a property no test exercises would not be caught here.
+#   * Only the plain `A1` branch of the cell-ref parser is proved. The
+#     `$`-lock rules, the `~`/`_` header-footer markers and `cell_ref_text` are
+#     checked by tests only (`proofs/cellref_parse.rs` says so in its header).
+#   * Anything behind `str::parse`, `format!` or `replace` is out of scope
+#     entirely -- the money value, the op-log codec, the display mirrors and
+#     `infer_suffix_fill`'s step arithmetic have no proofs, and no amount of CI
+#     changes that.
+#
+# A green run here means "the proofs still verify against the transcription in
+# proofs/", nothing stronger.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "proofs/**"
+      - "tests/*_xcheck.rs"
+      - "src/**"
+      - "balance-core/**"
+      - ".github/workflows/verus.yml"
+  pull_request:
+    paths:
+      - "proofs/**"
+      - "tests/*_xcheck.rs"
+      - "src/**"
+      - "balance-core/**"
+      - ".github/workflows/verus.yml"
+
+env:
+  CARGO_TERM_COLORS: false
+  VERUS_VERSION: "0.2026.10.26.d17fbd0"
+
+# NOTE on toolchains. `RUSTUP_TOOLCHAIN` is deliberately NOT set here. Verus
+# needs `1.99.1-x86_64-unknown-linux-gnu`, but `cargo test` must use the
+# repo's own `rust-toolchain.toml`, which says `nightly`. Exporting the Verus
+# pin job-wide would silently build `src/` on a toolchain the repo does not
+# declare -- so the pin is set only on the steps that run `verus`.
+
+jobs:
+  verify:
+    # Eleven small files, each a few seconds of SMT once the toolchain is warm.
+    # 25 minutes leaves room for a cold rustup install plus the zip download.
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain Verus is pinned to
+        # Verus bundles its own rustc but not the *toolchain*: on a clean runner
+        # it stops with
+        #
+        #   verus: required rust toolchain 1.99.1-x86_64-unknown-linux-gnu not found
+        #   error: toolchain '1.99.1-...' is not installed
+        #
+        # so the install has to be a step, not an assumption. `rustup` comes
+        # with the runner image.
+        run: rustup toolchain install 1.99.1-x86_64-unknown-linux-gnu --profile minimal
+
+      - name: Install Verus
+        # Pinned by version, not `latest`: a new release can change the prover
+        # or its bundled z3, and a proof that passes today should not start
+        # failing because someone else shipped. The proofs were re-checked
+        # against this exact release before it was pinned.
+        #
+        # Note the tag format is `release/<version>`, with a slash, so the
+        # download path is releases/download/release/<ver>/... .
+        run: |
+          set -euo pipefail
+          url="https://github.com/verus-lang/verus/releases/download/release/${VERUS_VERSION}/verus-${VERUS_VERSION}-x86-linux.zip"
+          # `-f` matters: without it a 404 is written to the zip and `unzip`
+          # then fails with a confusing "not a zip" error instead of naming the
+          # bad version.
+          curl -fsSL -o /tmp/verus.zip "$url"
+          unzip -q /tmp/verus.zip -d /tmp/verus
+          echo "/tmp/verus/verus-x86-linux" >> "$GITHUB_PATH"
+          RUSTUP_TOOLCHAIN=1.99.1-x86_64-unknown-linux-gnu \
+            /tmp/verus/verus-x86-linux/verus --version
+
+      - name: Every proof in proofs/ verifies
+        # The pin is set on this step only -- see the note above `jobs:`.
+        env:
+          RUSTUP_TOOLCHAIN: "1.99.1-x86_64-unknown-linux-gnu"
+        # The file list is explicit rather than a glob: the globs live in a
+        # shell that does not fail on an unmatched pattern, so a renamed or
+        # deleted proof file would silently drop out of the run. Naming them
+        # means deleting one is a visible edit to this list.
+        #
+        # `--triggers-mode silent` suppresses the trigger-selection hints, which
+        # are advisory; errors still fail the job.
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in \
+            arith \
+            col_codec \
+            col_decode \
+            split_digits \
+            money_parse \
+            balance_subset \
+            shift_guards \
+            keyword_table \
+            agg_sparse_order \
+            cursor_roundtrip \
+            cellref_parse \
+          ; do
+            printf '%-20s ' "$f"
+            if out=$(verus --triggers-mode silent "proofs/$f.rs" 2>&1); then
+              echo "$out" | tail -1
+            else
+              echo "FAILED"
+              echo "$out" >&2
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+      - name: The proofs still match the code they describe
+        # A proof about a copy is worth nothing if the copy drifts. These are
+        # the tests that tie `proofs/` back to `src/`; running them here rather
+        # than only in the normal test job is deliberate, because they are the
+        # only thing that would notice a divergence.
+        run: |
+          set -euo pipefail
+          cargo test \
+            --test col_decode_xcheck \
+            --test split_digits_xcheck \
+            --test money_parse_xcheck \
+            --test balance_subset_xcheck \
+            --test shift_guards_xcheck \
+            --test keyword_table_xcheck \
+            --test agg_sparse_order_xcheck \
+            --test cursor_roundtrip_xcheck \
+            --test cellref_parse_xcheck

@@ -246,10 +246,21 @@ precondition is worth stating explicitly rather than hiding.
 
 ## Why this matters for corro
 
-`cargo test` cannot fail when a spec stops holding, so verification has to be
-its own CI step naming the real source path. The two `*_xcheck` tests are the
-other half: they are what notice when the *copy* in `proofs/` drifts from the
-function in `src/`. A file that nothing `mod`-declares
+`cargo test` cannot fail when a spec stops holding: `proofs/` is not a crate, no
+file in it is reachable from a `mod` tree, and `cargo` therefore never compiles
+them. So verification is `.github/workflows/verus.yml`, which names each proof
+file explicitly. The `*_xcheck` suites are the other half: they are what notice
+when a copy in `proofs/` drifts from the function in `src/`.
+
+The job pins Verus by version rather than tracking `latest`, and sets
+`RUSTUP_TOOLCHAIN=1.99.1-...` **only** on the step that runs `verus` -- the test
+step must use the repo's own `rust-toolchain.toml` (`nightly`), or `src/` would
+silently be built on a toolchain the repo does not declare.
+
+Checked by running the job's own steps on a clean `RUSTUP_HOME` (only the pinned
+toolchain installed, Verus fetched from the release URL): 11 proofs verify and
+9 suites pass. Also checked that the job *fails*: breaking one `ensures` in
+`cellref_parse.rs` makes the run exit 1 with that file named. A file that nothing `mod`-declares
 is invisible to `cargo` and visible to `verus`, so the step must name the file
 explicitly.
 
