@@ -1,6 +1,6 @@
 # Verus proofs for corro
 
-Six files verify, plus cross-check tests that drive the real corro code.
+Seven files verify, plus cross-check tests that drive the real corro code.
 Everything else in this directory is scratch and is not claimed.
 
 Checked with `verus 0.2026.10.18.7d82994` (bundled z3 4.16.0):
@@ -23,6 +23,9 @@ verification results:: 4 verified, 0 errors
 
 $ verus --triggers-mode silent proofs/balance_subset.rs
 verification results:: 4 verified, 0 errors
+
+$ verus --triggers-mode silent proofs/shift_guards.rs
+verification results:: 6 verified, 0 errors
 
 $ cargo test --test col_decode_xcheck --test split_digits_xcheck \
              --test money_parse_xcheck --test balance_subset_xcheck
@@ -117,6 +120,26 @@ exactly the step the recursion takes before moving to the next candidate.
 anchors, or that groups are disjoint. Those need `Vec`, `sort_by_key` and
 iterator chains rewritten to loops.
 
+## `shift_guards.rs` — inserted-row repair cannot corrupt `$`-locked refs
+
+`src/formula/mod.rs:626 shift_if_unlocked_row` and `:638 shift_if_unlocked_col`
+decide whether a cell reference moves when rows or columns are inserted. Getting
+this wrong silently rewrites a user's formulas, so the properties are:
+
+- a locked coordinate is returned unchanged;
+- one above the insertion gap is unchanged (rows after the gap keep their number);
+- one at or below the gap moves by exactly `delta`;
+- `None` exactly when the result leaves the `u32` range;
+- the `i64` intermediate cannot overflow, so that range test is the only place a
+  value is ever refused.
+
+**Not proved:** `translate_cell_addr_by_offset` (:1145), which dispatches over
+`CellAddr` variants and composes these shifts with `ColumnAddr::from_global`.
+
+One thing worth knowing when reading the tests: `gap_start` is a **0-based**
+main-row index while formula text is 1-based, so `A5` is index 4 and shifts only
+when `gap_start <= 4`. Getting that backwards makes a correct function look broken.
+
 ## `tests/col_decode_xcheck.rs` — the proof checked against corro
 
 A proof about a copy is only worth something if the copy is the real thing.
@@ -155,6 +178,7 @@ explicitly.
 | `split_digits.rs` | verifies: 4 obligations; the digit splitter |
 | `money_parse.rs` | verifies: 4 obligations; parse shape only |
 | `balance_subset.rs` | verifies: 4 obligations; subset-sum soundness |
+| `shift_guards.rs` | verifies: 6 obligations; insert-repair shift guards |
 | `col_probe.rs` | superseded by `col_decode.rs`; kept as the failure record |
 | `tiny.rs` | timing floor for a trivial file (~3 s wall) |
 | `scratch/` | exploratory, not claimed |
