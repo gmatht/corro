@@ -31,6 +31,12 @@ pub struct MainCols(pub usize);
 /// Parse a bijective base-26 column name `A`..`ZZZ` → 0-based main column
 /// index. (The `A`/`AA` scheme; see the module docs for why it is named after
 /// Excel.)
+///
+/// Returns `None` for a malformed name (empty, or any byte outside `A`..=`Z`),
+/// and for a well-formed name whose index does not fit in a `u32` (seven or
+/// more letters: `ZZZZZZ` is index 321_272_405, the largest that fits). Callers
+/// that need to tell those two cases apart use
+/// [`parse_excel_column_checked`].
 pub fn parse_excel_column(name: &str) -> Option<u32> {
     let mut n: u32 = 0;
     for b in name.bytes() {
@@ -39,7 +45,45 @@ pub fn parse_excel_column(name: &str) -> Option<u32> {
         }
         n = n.checked_mul(26)?.checked_add((b - b'A') as u32 + 1)?;
     }
-    Some(n - 1)
+    // An empty name leaves `n` at 0, and `n - 1` would underflow: in debug
+    // that panics, in release it wraps to `u32::MAX` and silently names the
+    // last column. Every caller guards with `col_len == 0` first, but this is
+    // a `pub` function and the guard belongs here. (Found by the Verus
+    // cross-check; see tests/col_decode_xcheck.rs.)
+    n.checked_sub(1)
+}
+
+/// The two ways [`parse_excel_column`] can fail, kept apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ColumnNameError {
+    /// Not a column name: empty, or a byte outside `A`..=`Z`.
+    Malformed,
+    /// A well-formed name, but its index does not fit in a `u32` (7+ letters).
+    OutOfRange,
+}
+
+/// [`parse_excel_column`], but reporting *why* it failed.
+///
+/// `parse_excel_column` collapses "this is not a column" and "this column is
+/// too large for a u32" into `None`, which a caller cannot distinguish: a
+/// status line showing "not a column" for `ZZZZZZZ` is wrong, because it is a
+/// valid column that corro cannot address. This variant makes the distinction
+/// available without changing the shape every existing caller uses.
+///
+/// (The conflation was found by the Verus cross-check; see
+/// `tests/col_decode_xcheck.rs`.)
+pub fn parse_excel_column_checked(name: &str) -> Result<u32, ColumnNameError> {
+    let mut n: u32 = 0;
+    for b in name.bytes() {
+        if !b.is_ascii_uppercase() {
+            return Err(ColumnNameError::Malformed);
+        }
+        n = n
+            .checked_mul(26)
+            .and_then(|v| v.checked_add((b - b'A') as u32 + 1))
+            .ok_or(ColumnNameError::OutOfRange)?;
+    }
+    n.checked_sub(1).ok_or(ColumnNameError::Malformed)
 }
 
 /// 0-based main column index → bijective base-26 column letters (`A`, `AA`, …).

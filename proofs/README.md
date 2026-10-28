@@ -266,6 +266,36 @@ The proof's precondition `pow26(len+1) <= u32::MAX` is exactly the domain where
 the two agree, so neither bug is inside what is proved — which is also why the
 precondition is worth stating explicitly rather than hiding.
 
+## Bugs these proofs found
+
+Two real defects in `src/addr.rs`, both now fixed. Recorded here because the
+*route* is the reusable part: neither came from fuzzing, review, or a failing
+user report.
+
+**The method.** Prove the kernel, then cross-check the proof against the real
+function. A proof forces the input domain to be written down explicitly
+(`pow26(len+1) <= u32::MAX`); every input the proof *excludes* becomes a
+question — "why is that excluded, and what does the code do there?" Asking that
+of an empty name produced an immediate panic on the first test written against
+the real function.
+
+| defect | mechanism | how the proof exposed it |
+|---|---|---|
+| `parse_excel_column("")` panicked | `Some(n - 1)` with `n = 0`; debug panics, release wraps to `u32::MAX` (the last column) | the domain had to exclude the empty name |
+| 7+ letter names indistinguishable from malformed | the index of `ZZZZZZZ` is 8_353_082_581, which does not fit the `u32` return | the precondition `pow26(len+1) <= u32::MAX` had to be *justified* |
+
+Both were latent: every caller guards `col_len == 0` first, and the `u32`
+ceiling is real (six letters is the largest that fits). That is exactly why
+neither showed up in testing — the code never reached them.
+
+Each fix is pinned by a test that fails when the fix is reverted, checked by
+reverting it. See `Bugs.txt` for the full mechanism of each.
+
+**The caveat, stated plainly.** This found bugs in `addr.rs` because `addr.rs`
+is the one kernel with a proof sharp enough to have a stated domain. The other
+ten proofs do not imply their kernels are bug-free — only that the property
+each one states holds.
+
 ## Why this matters for corro
 
 `cargo test` cannot fail when a spec stops holding: `proofs/` is not a crate, no

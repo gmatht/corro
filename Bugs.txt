@@ -53,25 +53,46 @@ Unrelated to the formula row; it needs a settle (or a key) before the first
 screenshot. Confirmed pre-existing: it fails identically with the GTK label
 pin disabled.
 
-addr: parse_excel_column("") panics on n - 1
-Found while verifying the function with Verus, then confirmed by a test.
-An empty name loops zero times, leaves `n` at 0, and evaluates `Some(n - 1)`.
-In debug: "attempt to subtract with overflow" at src/addr.rs:42. In release it
-wraps, so `parse_excel_column("")` returns `Some(u32::MAX)` -- the last column.
-Every current caller (`parse_cell_ref_at`, `celladdr.rs`) rejects an empty
-column fragment with `col_len == 0` before calling, so this is latent, not
-live. But the function is `pub` and the guard lives in its callers, not in it.
-Fix: `if n == 0 { return None; }` before the subtraction.
-Evidence: tests/col_decode_xcheck.rs::corro_panics_on_empty_input.
+addr: parse_excel_column("") panicked on n - 1   [FIXED]
+HOW IT WAS FOUND. Not by fuzzing and not by review: by writing a Verus proof
+of the decoder and then cross-checking it against the real function. The
+proof forced the input domain to be stated, and "empty name" fell outside it;
+the first test written against the real function then panicked.
 
-addr: parse_excel_column rejects well-formed names of 7+ letters
-The Horner accumulator for "ZZZZZZZ" is 8_353_082_582, which does not fit in a
-u32, so `checked_mul`/`checked_add` return None. "ZZZZZZ" (index 321_272_405) is
-the largest name accepted. The returned *index* for 7 letters does not fit
-either, so the ceiling may be intended -- but the caller cannot tell "not a
-column at all" from "column too large", and both currently mean None. Worth a
-decision rather than a silent limit.
-Evidence: tests/col_decode_xcheck.rs::corro_rejects_7_zs.
+MECHANISM. An empty name loops zero times, leaves `n` at 0, and evaluated
+`Some(n - 1)`. In debug: "attempt to subtract with overflow". In release it
+wrapped, so `parse_excel_column("")` returned `Some(u32::MAX)` -- the last
+column, which is worse than a crash because nothing reports it.
+
+WHY IT HAD SURVIVED. Every caller (`parse_cell_ref_at`, `celladdr.rs`)
+rejects an empty column fragment with `col_len == 0` before calling, so the
+bug was latent. But the function is `pub` and the guard lived in its callers.
+
+FIX. `n.checked_sub(1)` instead of `Some(n - 1)`, in src/addr.rs.
+VERIFIED. tests/col_decode_xcheck.rs::empty_input_is_rejected_not_a_panic.
+Reverting the fix fails exactly that test.
+
+addr: parse_excel_column conflated "not a column" with "too large"   [FIXED]
+HOW IT WAS FOUND. Same route: the proof's precondition was
+`pow26(len+1) <= u32::MAX`, and asking why that precondition was needed
+exposed that two different failures returned the same value.
+
+MECHANISM. The Horner value of "ZZZZZZZ" is 8_353_082_582 and the index is
+8_353_082_581; neither fits a u32, so `checked_mul`/`checked_add` return None.
+A caller could not tell that from "this is not a column at all", so a status
+line reporting "not a column" for a perfectly valid ZZZZZZZ was wrong.
+
+WHY IT HAD SURVIVED. The u32 return type is a real ceiling (six letters is
+the largest index that fits: 321_272_405), so no caller was misbehaving yet;
+the information was simply unavailable.
+
+FIX. `ColumnNameError { Malformed, OutOfRange }` plus
+`parse_excel_column_checked` in src/addr.rs. The checked variant reports which
+failure it was. `parse_excel_column` is unchanged in shape and still returns
+None for both, so no call site changed -- the distinction is available where a
+caller wants it rather than guessed at.
+VERIFIED. tests/col_decode_xcheck.rs::oversized_names_are_distinguished_from_malformed_ones.
+Reverting the fix (reporting OutOfRange as Malformed) fails exactly that test.
 
 formula: the multi-dot guard in parse_number_literal is redundant
 `src/formula/number.rs:472` rejects a literal with more than one '.' before

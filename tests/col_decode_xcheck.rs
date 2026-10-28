@@ -7,13 +7,17 @@
 //! if the copy is the real thing, so this test drives corro's actual function
 //! and the model over the same inputs.
 //!
-//! Where they disagree, this file asserts the disagreement rather than hiding
-//! it -- see `corro_panics_on_empty_input` and `corro_rejects_7_z's`. Both are
-//! bugs in `src/addr.rs`, found by writing the proof, not by fuzzing.
+//! Two defects in `src/addr.rs` were found this way and have since been fixed;
+//! the tests below pin the fixed behaviour and say what it used to be. Both
+//! were found by writing the proof, not by fuzzing:
+//!
+//!   * `parse_excel_column("")` panicked on `n - 1` (release: wrapped to
+//!     `u32::MAX`, i.e. the last column);
+//!   * names of 7+ letters were indistinguishable from malformed ones.
 //!
 //! This test writes nothing.
 
-use corro::addr::parse_excel_column;
+use corro::addr::{parse_excel_column, parse_excel_column_checked};
 
 /// The executor verified in `proofs/col_decode.rs`, transcribed back to Rust
 /// with the same shape (accumulate, reject non-letters, return the index).
@@ -103,40 +107,84 @@ fn some_iff_all_uppercase() {
     }
 }
 
-/// BUG (found by this proof): the empty string panics.
+/// FIXED (was a bug found by this proof): the empty string no longer panics.
 ///
-/// `parse_excel_column("")` loops zero times, `n` stays 0, and `Some(n - 1)`
-/// subtracts from zero. The verified model returns `Some(u32::MAX)`; corro
-/// aborts in debug and wraps to `Some(u32::MAX)` in release.
+/// `parse_excel_column("")` used to loop zero times, leave `n` at 0, and
+/// evaluate `Some(n - 1)`, which subtracts from zero. In debug that panicked
+/// with "attempt to subtract with overflow"; in release it wrapped to
+/// `Some(u32::MAX)` and silently named the last column. It now uses
+/// `checked_sub`.
 #[test]
-fn corro_panics_on_empty_input() {
+fn empty_input_is_rejected_not_a_panic() {
     let got = std::panic::catch_unwind(|| parse_excel_column(""));
-    assert!(
-        got.is_err(),
-        "expected the `n - 1` underflow; got {got:?}. If this now passes, \
-         the empty-string bug was fixed and the model should be re-checked"
+    assert!(got.is_ok(), "empty input must not panic, got {got:?}");
+    assert_eq!(parse_excel_column(""), None);
+    // The released build used to wrap to u32::MAX here; that would have named
+    // the last column, so assert it is not that either.
+    assert_ne!(parse_excel_column(""), Some(u32::MAX));
+}
+
+/// FIXED (was a bug found by this proof): "not a column" and "column too large"
+/// are no longer the same answer.
+///
+/// Seven or more `Z`s is a well-formed name whose index does not fit in a
+/// `u32` (`ZZZZZZZ` denotes 8_353_082_581). `parse_excel_column` still returns
+/// `None` -- the return type cannot express it -- but
+/// `parse_excel_column_checked` now says *why*, so a caller need not report a
+/// valid column as malformed.
+#[test]
+fn oversized_names_are_distinguished_from_malformed_ones() {
+    use corro::addr::ColumnNameError;
+
+    // The largest name that fits.
+    assert_eq!(parse_excel_column_checked("ZZZZZZ"), Ok(321_272_405));
+    assert_eq!(parse_excel_column("ZZZZZZ"), Some(321_272_405));
+
+    // Well-formed but unrepresentable: OutOfRange, not Malformed.
+    assert_eq!(
+        parse_excel_column_checked("ZZZZZZZ"),
+        Err(ColumnNameError::OutOfRange)
+    );
+
+    // Genuinely not a column name.
+    for bad in ["", "abc", "A1", "a", "[A", " A"] {
+        assert_eq!(
+            parse_excel_column_checked(bad),
+            Err(ColumnNameError::Malformed),
+            "{bad:?} should be Malformed"
+        );
+    }
+
+    // The two are distinguishable, which is the point of the fix.
+    assert_ne!(
+        parse_excel_column_checked("ZZZZZZZ"),
+        parse_excel_column_checked("abc")
     );
 }
 
-/// BUG (found by this proof): 7 or more `Z`s are rejected although the name is
-/// valid.
-///
-/// The Horner value of `ZZZZZZZ` is 8_353_082_582, and the index it denotes is
-/// 8_353_082_581; neither fits in a `u32`, so `checked_mul`/`checked_add`
-/// return `None`. That is arguably correct -- but the function returns `None`
-/// for a well-formed name, which callers cannot distinguish from a malformed
-/// one. `ZZZZZZ` (6 letters, index 321_272_405) is the largest that fits.
+/// The checked variant agrees with the plain one wherever the plain one succeeds.
 #[test]
-fn corro_rejects_7_zs() {
-    assert_eq!(parse_excel_column("ZZZZZZ"), Some(321_272_405));
-    assert_eq!(parse_excel_column("ZZZZZZZ"), None);
-    // The model wraps rather than returning None, so the precondition in
-    // `proofs/col_decode.rs` (`pow26(len+1) <= u32::MAX`) is exactly the gap:
-    // outside it the two functions are not claimed to agree, and here they
-    // visibly do not.
-    // The Horner value 8_353_082_582 wrapped mod 2^32 is 4_058_115_286 -- not the
-    // true index, which is why the model is only correct inside the
-    // precondition.
+fn checked_agrees_with_plain_on_the_valid_domain() {
+    for name in ["A", "Z", "AA", "AZ", "ZZ", "ALL", "ZZZ", "XFD", "ZZZZZZ"] {
+        assert_eq!(
+            parse_excel_column_checked(name),
+            Ok(parse_excel_column(name).unwrap()),
+            "checked disagreed with plain on {name:?}"
+        );
+    }
+}
+
+/// The verified model's precondition is exactly the domain where the plain
+/// function succeeds.
+#[test]
+fn the_model_precondition_matches_the_plain_functions_domain() {
+    // Inside the precondition (6 letters): model and function agree.
+    assert_eq!(
+        verified_model(b"ZZZZZZ").map(|v| v - 1),
+        parse_excel_column("ZZZZZZ")
+    );
+    // Outside it (7 letters) the model wraps to a value that is not the index,
+    // which is exactly why `proofs/col_decode.rs` carries the precondition.
     assert_eq!(verified_model(b"ZZZZZZZ"), Some(4_058_115_286));
     assert_eq!(parse_excel_column("ZZZZZZZ"), None);
 }
