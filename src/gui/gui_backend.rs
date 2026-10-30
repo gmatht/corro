@@ -1162,7 +1162,21 @@ fn paint_row_headers(
         // neutral header gray. With no selection nothing changes.
         let hl = hl_rows.is_some_and(|(r0, r1)| logical_row >= r0 && logical_row <= r1);
         let pal = chrome::palette();
-        let fill = if hl { pal.gutter_selected() } else { pal.gutter() };
+        // A header belongs to the same region as the cells it labels: a margin
+        // row's number sits beside margin-gray body cells, so it takes the
+        // margin shade rather than the neutral header gray. Without this the
+        // header strip disagreed with the body at two edges -- `~1` (the
+        // header row) and `_1` (the first footer row) were the only neutral
+        // headers in a margin-gray band, so each read as a lone highlighted
+        // cell.
+        let is_margin_row = !(logical_row >= HEADER_ROWS && logical_row < HEADER_ROWS + mr);
+        let fill = if hl {
+            pal.gutter_selected()
+        } else if is_margin_row {
+            pal.margin_body()
+        } else {
+            pal.gutter()
+        };
         let fill = (fill.0, fill.1, fill.2, 1.0);
         dc.fill_rect(0.0, ry, row_label_w(), row_h(), fill.0, fill.1, fill.2, fill.3);
         // Row numbers sit 6px off the gutter's right gridline so glyphs
@@ -1207,7 +1221,17 @@ fn paint_col_headers(
         // Same selection fill as covered row headers (see paint_row_headers).
         let hl = hl_cols.is_some_and(|(c0, c1)| c >= c0 && c <= c1);
         let pal = chrome::palette();
-        let fill = if hl { pal.gutter_selected() } else { pal.gutter() };
+        // A margin column's header takes the margin shade, for the same reason
+        // a margin row's does (see `paint_row_headers`): the label and the
+        // cells under it describe one region, so they must not disagree.
+        let is_margin_col = !(c >= MARGIN_COLS && c < MARGIN_COLS + mc);
+        let fill = if hl {
+            pal.gutter_selected()
+        } else if is_margin_col {
+            pal.margin_body()
+        } else {
+            pal.gutter()
+        };
         let fill = (fill.0, fill.1, fill.2, 1.0);
         dc.fill_rect(cx, 0.0, cw, header_h(), fill.0, fill.1, fill.2, fill.3);
         // The rule under this header. Without it the column headers of a
@@ -1784,6 +1808,40 @@ fn viewport_from_parts(
     crate::gui::viewport::Viewport::from_parts(app, display_rows, col_ixs, col_widths, HEADER_ROWS)
 }
 
+/// A [`DrawContext`] shifted down by `dy`, so the gutter strip can be painted
+/// in the coordinate space it was written in (window top = 0) while landing on
+/// the body, which starts one menu bar + one formula bar below it.
+///
+/// The trait has no `translate`, and the alternative -- adding one to every
+/// backend -- would be a new method for one caller. Only the four drawing
+/// calls the header painters make are forwarded; measurement is unaffected by
+/// an origin shift and goes straight through.
+struct Translated<'a>(&'a mut dyn DrawContext, f64);
+
+impl DrawContext for Translated<'_> {
+    fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64) {
+        self.0.fill_rect(x, y + self.1, w, h, r, g, b, a)
+    }
+    fn stroke_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64, lw: f64) {
+        self.0.stroke_rect(x, y + self.1, w, h, r, g, b, a, lw)
+    }
+    fn draw_text_styled(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64,
+                        r: f64, g: f64, b: f64, a: f64, slant: i32, weight: i32) {
+        self.0.draw_text_styled(x, y + self.1, text, font, size, r, g, b, a, slant, weight)
+    }
+    fn text_extents_styled(&self, text: &str, font: &str, size: f64, slant: i32, weight: i32) -> (f64, f64, f64, f64) {
+        self.0.text_extents_styled(text, font, size, slant, weight)
+    }
+    fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
+        self.0.clear(r, g, b, a)
+    }
+    fn save(&mut self) { self.0.save() }
+    fn restore(&mut self) { self.0.restore() }
+    fn clip(&mut self, x: f64, y: f64, w: f64, h: f64) {
+        self.0.clip(x, y + self.1, w, h)
+    }
+}
+
 /// Paint a complete sheet body (gutter, column headers, cells, selection) for
 /// an already-computed [`Viewport`].
 ///
@@ -1863,9 +1921,6 @@ fn render_grid_body_inner(
     });
     let cover_rows = cover.and_then(|(r, _)| r);
     let cover_cols = cover.and_then(|(_, c)| c);
-    paint_row_headers(dc, display_rows, mr, pinned_rows, padlocks, cover_rows);
-    paint_col_headers(dc, col_ixs, col_widths, mc, pinned_cols, padlocks, cover_cols);
-
     // Fill cells via the shared render pipeline, into a `GridView` through the
     // one shared `CellSink` adapter (the same one the terminal host uses).
     let grid = rswidgets::gridview::GridView::new(0, 0);
@@ -1887,9 +1942,16 @@ fn render_grid_body_inner(
             &vp.row_agg_func,
         );
     }
+    // The body origin, not the window origin: `dc` is the whole window, and
+    // the canvas starts one menu bar plus one formula bar below its top.
+    // `render_to` and the two header painters all draw from the top of the
+    // sheet, so all three are shifted by that amount -- the header strip is
+    // painted *last* so it lands on top of whatever the cell grid drew in the
+    // body's first rows.
+    let body_y = 2.0 * header_h();
     render_to(
         &grid,
-        dc,
+        &mut Translated(dc, body_y),
         col_ixs,
         col_widths,
         display_rows,
@@ -1905,6 +1967,14 @@ fn render_grid_body_inner(
         app.core.selection_kind,
         &vp.row_agg_func,
         &vp.col_agg_func,
+    );
+    paint_row_headers(
+        &mut Translated(dc, body_y),
+        display_rows, mr, pinned_rows, padlocks, cover_rows,
+    );
+    paint_col_headers(
+        &mut Translated(dc, body_y),
+        col_ixs, col_widths, mc, pinned_cols, padlocks, cover_cols,
     );
 
     // No status strip at the bottom of the body: the status text lives in the
@@ -8389,18 +8459,94 @@ mod gutter_tests {
             .collect()
     }
 
-    /// Covered row headers use the body selection fill; uncovered rows keep
-    /// the neutral header gray (and `None` keeps everything gray, i.e. the
-    /// pre-existing unselected rendering).
+    /// Margin headers take the margin shade, not the neutral header gray.
+    ///
+    /// The body paints a margin cell (any cell outside `hr..hr+mr` /
+    /// `lm..lm+mc`) with [`chrome::Palette::margin_body`]; a header that
+    /// straddles the boundary has to agree with the cells beside it or it
+    /// reads as a one-cell highlight of its own. The case that found this:
+    /// `A_1` was the only dark header in the `_1` row, so a sheet with no
+    /// selection looked like it had one.
+    #[test]
+    fn margin_headers_use_the_margin_shade() {
+        use std::collections::BTreeSet;
+        let mut dc = RecordingDrawContext::new();
+        // hr=2, mr=1: a header row, one main row, one footer row.
+        let mut hits = Vec::new();
+        paint_row_headers(
+            &mut dc,
+            &[HEADER_ROWS.wrapping_sub(1), HEADER_ROWS, HEADER_ROWS + 1],
+            1,
+            &BTreeSet::new(),
+            &mut hits,
+            None,
+        );
+        let row_fills: Vec<(f64, f64, f64, f64)> = dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::FillRect { x, w, rgba, .. }
+                    if *x == 0.0 && *w == row_label_w() =>
+                {
+                    Some(*rgba)
+                }
+                _ => None,
+            })
+            .collect();
+        // The row above the body (a header row) and the row below it (a footer
+        // row) are both margin rows; the main row is not.
+        let p = chrome::palette();
+        let (m, g) = (p.margin_body(), p.gutter());
+        assert_eq!(
+            row_fills,
+            vec![
+                (m.0, m.1, m.2, 1.0),
+                (g.0, g.1, g.2, 1.0),
+                (m.0, m.1, m.2, 1.0),
+            ],
+            "margin rows must match the margin body, the main row the header gray, got {row_fills:?}"
+        );
+
+        // Columns: left margin, main column, right margin (mc=1).
+        let mut dc = RecordingDrawContext::new();
+        let col_ixs = vec![MARGIN_COLS - 1, MARGIN_COLS, MARGIN_COLS + 1];
+        let col_widths: HashMap<usize, usize> = col_ixs.iter().map(|&c| (c, 8)).collect();
+        let mut hits = Vec::new();
+        paint_col_headers(&mut dc, &col_ixs, &col_widths, 1, &BTreeSet::new(), &mut hits, None);
+        let col_fills: Vec<(f64, f64, f64, f64)> = dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::FillRect { y, h, rgba, .. } if *y == 0.0 && *h == header_h() => Some(*rgba),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            col_fills,
+            vec![
+                (m.0, m.1, m.2, 1.0),
+                (g.0, g.1, g.2, 1.0),
+                (m.0, m.1, m.2, 1.0),
+            ],
+            "margin columns must match the margin body, the main column the header gray, got {col_fills:?}"
+        );
+    }
+
+    /// Covered row headers use the body selection fill; uncovered *main* rows
+    /// keep the neutral header gray (and `None` keeps everything un-highlighted,
+    /// i.e. the pre-existing unselected rendering).
     #[test]
     fn covered_row_headers_use_selection_fill() {
         use std::collections::BTreeSet;
         let mut dc = RecordingDrawContext::new();
         let mut hits = Vec::new();
+        // Two *main* rows (mr=2): outside the body every row is a margin row
+        // and takes the margin shade (see margin_headers_use_the_margin_shade),
+        // so a covered main row can only be compared against the header gray.
         paint_row_headers(
             &mut dc,
             &[HEADER_ROWS, HEADER_ROWS + 1],
-            1,
+            2,
             &BTreeSet::new(),
             &mut hits,
             Some((HEADER_ROWS, HEADER_ROWS)),
@@ -8493,9 +8639,9 @@ mod gutter_tests {
             .collect();
         assert_eq!(
             fills,
-            { let p = chrome::palette(); let (s, g) = (p.gutter_selected(), p.gutter());
-              vec![(g.0, g.1, g.2, 1.0), (s.0, s.1, s.2, 1.0)] },
-            "margin col keeps header gray, covered col uses selection fill, got {fills:?}"
+            { let p = chrome::palette(); let (s, m) = (p.gutter_selected(), p.margin_body());
+              vec![(m.0, m.1, m.2, 1.0), (s.0, s.1, s.2, 1.0)] },
+            "margin col takes the margin shade, covered col the selection fill, got {fills:?}"
         );
     }
     #[test]
