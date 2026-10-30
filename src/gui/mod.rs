@@ -238,7 +238,13 @@ impl App {
                 persisted_view_sort_cols: Default::default(),
                 linked_source_mtimes: Default::default(),
                 unsaved_file: None,
-                unsaved_auto_create: true,
+                // No filesystem in a browser, so there is no per-user file
+                // store an edit could be journalled into: `ensure_unsaved_file`
+                // would ask the browser for a temp directory (which panics on
+                // wasm32) and then `std::fs::write` a path that cannot exist.
+                // Off, the first commit reports "no file" instead of aborting
+                // the app on the frame that opens it.
+                unsaved_auto_create: !cfg!(target_arch = "wasm32"),
                 status: template_note.unwrap_or_default(),
                 exit_message: None,
                 clipboard_snapshot: None,

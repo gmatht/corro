@@ -58,11 +58,69 @@ fn fire_commit_edit(row: u32, col: u32, text: String) {
     GLOBAL_COMMIT_EDIT.with(|c| *c.borrow_mut() = cbs);
 }
 
+/// A cell map keyed by `(row, col)`, hashed for that shape.
+///
+/// The renderer looks up every painted cell, every frame -- ~5000 lookups per
+/// keypress -- and `std::collections::HashMap` seeds SipHash per map, which was
+/// the single largest entry in a browser profile of one arrow key (70 ms).
+/// A cell key is two integers with no adversarial input, so the multiply-xor
+/// hash below is enough, and it needs no dependency.
+pub type CellMap<V> = HashMap<(u32, u32), V, BuildCellHasher>;
+
+/// Builds [`CellHasher`]. See [`CellMap`].
+#[derive(Clone, Copy, Default)]
+pub struct BuildCellHasher;
+
+impl std::hash::BuildHasher for BuildCellHasher {
+    type Hasher = CellHasher;
+    fn build_hasher(&self) -> CellHasher {
+        CellHasher(0)
+    }
+}
+
+/// See [`CellMap`].
+pub struct CellHasher(u64);
+
+impl std::hash::Hasher for CellHasher {
+    fn finish(&self) -> u64 {
+        // Avalanche the mixed word so the low bits (h1 of hashbrown) are uniform.
+        let mut x = self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^= x >> 33;
+        x
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Not used by `CellMap`'s keys, but a `Hasher` must implement it:
+        // fold the bytes in rather than silently ignoring them.
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(7) ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        // Row then column arrive as two `write_u32` calls (that is how
+        // `(u32, u32)` hashes); mix each in with an odd multiplier.
+        self.0 = self.0.rotate_left(32) ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = self.0.rotate_left(32) ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
 /// Backend-agnostic spreadsheet data model.
 pub struct SpreadsheetModel {
-    pub cells: HashMap<(u32, u32), String>,
-    pub cell_styles: HashMap<(u32, u32), u8>,
-    pub raw_cells: HashMap<(u32, u32), String>,
+    pub cells: CellMap<String>,
+    pub cell_styles: CellMap<u8>,
+    pub raw_cells: CellMap<String>,
     pub cursor_row: u32,
     pub cursor_col: u32,
     pub anchor: Option<(u32, u32)>,
@@ -101,9 +159,9 @@ pub struct SpreadsheetModel {
 impl Default for SpreadsheetModel {
     fn default() -> Self {
         SpreadsheetModel {
-            cells: HashMap::new(),
-            cell_styles: HashMap::new(),
-            raw_cells: HashMap::new(),
+            cells: CellMap::default(),
+            cell_styles: CellMap::default(),
+            raw_cells: CellMap::default(),
             cursor_row: 0,
             cursor_col: 0,
             anchor: None,

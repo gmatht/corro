@@ -25,8 +25,30 @@
 //!   xvfb-run -a cargo test --features gtk --test gui_status_bar
 #![cfg(all(target_os = "linux", feature = "gui"))]
 
+
+#[path = "support/mod.rs"]
+mod support;
+/// Skip when there is no X server to drive.
+///
+/// These tests launch a real corro window and steer it with `xdotool`. With no
+/// `DISPLAY` each one blocks in a poll loop until its deadline, then panics on
+/// an "empty commit" — which reads as a product bug rather than as "this suite
+/// needs a display". Returning early reports the case as passed and says why on
+/// stderr. A machine that *can* run them (a desktop, or `xvfb-run -a cargo test`)
+/// is unaffected, because `DISPLAY` is set there.
+fn require_x_display() -> bool {
+    if std::env::var_os("DISPLAY").is_none() {
+        eprintln!(
+            "note: skipping {} — no DISPLAY. Run under `xvfb-run -a` or on a desktop.",
+            file!(),
+        );
+        return false;
+    }
+    true
+}
+
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -52,18 +74,9 @@ impl Drop for KillOnDrop {
 }
 
 fn spawn_gui_status(template: &str) -> KillOnDrop {
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
-    KillOnDrop(
-        Command::new(&bin)
-            // No file arg: an explicit path wins over the template (same as
-            // the terminal), so a fresh doc is the only template trigger.
-            .arg("--gui")
-            .env("CORRO_TEMPLATE", template)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn corro --gui"),
-    )
+    // No file arg: an explicit path wins over the template (same as the
+    // terminal), so a fresh doc is the only template trigger.
+    KillOnDrop(support::spawn_capped_corro(&["--gui"], &[("CORRO_TEMPLATE", template)]))
 }
 
 fn find_corro_window(child_pid: u32, deadline: Instant) -> String {

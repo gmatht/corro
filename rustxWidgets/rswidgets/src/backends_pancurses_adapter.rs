@@ -457,10 +457,22 @@ mod pancurses_adapter {
         pub fn popup_submenu_by_mnemonic_at(&self, _keyval: u32, _x: i32, _y: i32) -> bool {
             false
         }
-        pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool { false }
+        /// No positionable popup on this backend, so `anchor` and the point are
+        /// unused and the call reports "not opened". This is the same answer
+        /// `popup_submenu_by_mnemonic_at` already gave here -- `popup_at` just
+        /// makes that explicit in one place instead of leaving each caller to
+        /// discover it.
+        pub fn popup_at(&self, _label: &str, _anchor: &Canvas, _x: f64, _y: f64) -> bool {
+            false
+        }        pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool { false }
         pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
         pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool { false }
         pub fn handle_menu_key(&self, _keyval: u32, _mod: u32) -> bool { false }
+        /// [`handle_menu_key`](Self::handle_menu_key) with the typed character
+        /// supplied separately; this backend's key codes are already characters.
+        pub fn handle_menu_key_char(&self, keyval: u32, _ch: char, modifiers: u32) -> bool {
+            self.handle_menu_key(keyval, modifiers)
+        }
         pub fn menu_active(&self) -> bool { false }
         pub fn menu_close(&self) {}
     }

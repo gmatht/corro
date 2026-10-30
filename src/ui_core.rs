@@ -1751,18 +1751,27 @@ pub fn visible_col_indices(
 
     let (_main_lo, main_hi) = main_col_window(state, cursor);
     let right_start = lm + mc;
-    let mut right_band: Vec<usize> = match right_nonblank_end(state) {
-        Some(end) => (0..=end).map(|i| right_start + i).collect(),
+    // Every band below is clamped to `dim`: only `dim` columns can be on
+    // screen, so building more is pure waste. This keeps the result
+    // viewport-sized regardless of how many main columns exist, which is
+    // what lets `trim_visible_cols_to_width` stop re-scanning a
+    // sheet-wide vector once per removed column.
+    let nb_end = right_nonblank_end(state);
+    let mut right_band: Vec<usize> = match nb_end {
+        Some(end) => (0..=end.min(dim.saturating_sub(1)))
+            .map(|i| right_start + i)
+            .collect(),
         None => Vec::new(),
     };
-    let blank_right = right_nonblank_end(state)
+    let blank_right = nb_end
         .map(|end| end + 1)
         .filter(|&i| i < rm)
         .map(|i| right_start + i)
         .unwrap_or(right_start);
     if cursor_in_right {
         let rcur = cur.saturating_sub(right_start);
-        for i in 0..=rcur {
+        // Clamp to `dim` entries: the right band alone can span the margin.
+        for i in 0..=rcur.min(dim.saturating_sub(1)) {
             right_band.push(right_start + i);
         }
         right_band.push(blank_right);
@@ -1782,6 +1791,11 @@ pub fn visible_col_indices(
     } else {
         Vec::new()
     };
+    // The main span runs from the body origin through `main_hi`, which is the
+    // last column *with content* — not the viewport. Clamp it to `dim` so a
+    // sheet with thousands of populated columns still yields a
+    // viewport-sized band.
+    let main_hi = main_hi.min((dim.saturating_sub(1)) as u32);
     let main_span = (main_hi.saturating_sub(0) + 1) as usize;
     let mut stable_band = Vec::with_capacity(
         (if lm > 0 { 1 } else { 0 })
@@ -1869,7 +1883,10 @@ pub fn visible_col_indices(
 
     if end >= filtered.len() && out.last().copied().unwrap_or(0) <= right_start.saturating_sub(1) {
         let right_start_col = right_start;
-        for i in 0..MARGIN_COLS {
+        // Clamp to the viewport: `dim` columns are all that can be shown, so
+        // never push the whole margin band in.
+        let fill_cap = MARGIN_COLS.min(dim.saturating_sub(out.len().min(dim)));
+        for i in 0..fill_cap {
             let gc = right_start_col + i;
             if reserved.contains(&gc) || out.contains(&gc) {
                 continue;
@@ -2092,6 +2109,12 @@ pub fn trim_visible_cols_to_width(grid: &Grid, cols: &mut Vec<usize>, cursor_col
     // cursor is in the left margin — it is the visual anchor to the main grid.
     let boundary = MARGIN_COLS.saturating_sub(1);
     let protect_boundary = cursor_col < MARGIN_COLS;
+    // Callers pass a viewport-sized `cols`: `visible_col_indices` clamps every
+    // band to `dim`, and `dim` is itself clamped to `total`. The loop below is
+    // therefore bounded by the viewport, not by the sheet — which is what
+    // makes the per-iteration re-scan of `visible_cols_render_width`
+    // acceptable again. It stays O(len^2) in the viewport width, but that is
+    // a screenful (tens of columns), never `main_cols`.
     while cols.len() > 1 && visible_cols_render_width(grid, cols) > width {
         let first = cols.first().copied().unwrap_or(cursor_col);
         let last = cols.last().copied().unwrap_or(cursor_col);
@@ -2818,3 +2841,46 @@ fn go_target_from_ref(grid: &Grid, cref: crate::celladdr::CellRef) -> Option<GoT
         min_main_cols,
     })
 }
+
+#[cfg(test)]
+mod clamp_measure_tests {
+    use super::*;
+    use crate::grid::HEADER_ROWS;
+
+    /// The band builders must stay viewport-sized however many main columns
+    /// the sheet has. `main_span` (bounded by `main_hi`) was the one field
+    /// that bypassed `dim`: it is derived from the last column *with content*.
+    #[test]
+    fn visible_cols_is_viewport_sized_for_a_wide_sheet() {
+        for &mc in &[1usize, 10, 100, 1000, 5000] {
+            let mut state = SheetState::new(2, mc);
+            {
+                let g = &mut state.grid;
+                // Give every main column content, so `main_col_window`'s `hi`
+                // reaches the far edge — the pathological case.
+                for c in 0..mc {
+                    g.set(
+                        &CellAddr::Main { row: 0, col: c as u32 },
+                        "x".into(),
+                    );
+                }
+                g.set(
+                    &CellAddr::Left { col: MARGIN_COLS - 1, row: 0 },
+                    "r".into(),
+                );
+            }
+            let state = state;
+            let cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+            for dim in [9usize, 12, 40, 80] {
+                let (cols, _) = visible_col_indices(&state, cursor, dim, 0);
+                assert!(
+                    cols.len() <= dim * 2,
+                    "main_cols={mc} dim={dim}: returned {} columns, \
+                     which is not viewport-sized",
+                    cols.len()
+                );
+            }
+        }
+    }
+}
+

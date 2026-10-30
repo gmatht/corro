@@ -281,6 +281,26 @@ macro_rules! common_types_mod {
             pub fn on_release(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) { self.inner.on_release(cb); }
             pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
             pub fn set_content_size(&self, w: i32, h: i32) { self.inner.set_content_size(w, h); }
+            /// The size this canvas is drawn at, in the backend's drawing
+            /// pixels, measured now.
+            ///
+            /// GTK reports the allocation its container made; the wasm adapter
+            /// measures the element's CSS box. Only a caller that can be
+            /// resized *without* an app event needs this -- a browser can be,
+            /// and hit-testing with a stale size is a click in the wrong cell.
+            pub fn measure(&self) -> (i32, i32) {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return self.inner.measure();
+                }
+                // Other backends: the caller's own bookkeeping
+                // (`GuiState::canvas_size`) is already current, because every
+                // resize there arrives as an app event with a measured size.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    (0, 0)
+                }
+            }
             pub fn grab_focus(&self) { self.inner.grab_focus(); }
             pub fn set_can_focus(&self, can: bool) { self.inner.set_can_focus(can); }
             pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) { self.inner.on_key_raw(cb); }
@@ -313,8 +333,39 @@ macro_rules! common_types_mod {
             /// Open the submenu whose mnemonic is `keyval` at a screen position
             /// (the sheet-tab context menu). Unpositioned on backends without a
             /// position hook.
+            ///
+            /// **Prefer [`Self::popup_at`]**: this form makes the caller
+            /// assemble screen coordinates itself, which means owning the
+            /// widget's on-screen origin, rounding, and whatever vertical
+            /// offset the menu's corner needs. It also forces the caller to
+            /// invent a mnemonic for a menu it wants to open by name.
             pub fn popup_submenu_by_mnemonic_at(&self, keyval: u32, screen_x: i32, screen_y: i32) -> bool {
                 self.inner.popup_submenu_by_mnemonic_at(keyval, screen_x, screen_y)
+            }
+            /// Pop up the top-level menu labelled `label`, anchored at
+            /// (`x`, `y`) in `anchor`'s own coordinates -- typically the
+            /// widget the user right-clicked.
+            ///
+            /// The top-left corner lands exactly on that point, unless that
+            /// would put part of the menu off screen or under the taskbar, in
+            /// which case it flips to the other side of that edge. Both the
+            /// measuring and the flipping are handled here, so a caller never
+            /// has to know where its widget sits on screen.
+            ///
+            /// `label` is the top-level entry's label in the menu model,
+            /// including its mnemonic marker (`"_Sheet"` for a GTK-style menu
+            /// that the backend has already translated, or the literal text if
+            /// the model carries no marker).
+            ///
+            /// Returns false when the backend cannot pop up a menu at all, or
+            /// when no top-level entry matches `label`. A false return is not a
+            /// failure to place the menu -- only a refusal to open one -- so a
+            /// caller should report it as "no context menu available" rather
+            /// than retrying at another position.
+            pub fn popup_at(&self, label: &str, anchor: &Canvas, x: f64, y: f64) -> bool {
+                // `anchor` is this module's wrapper type; `self.inner` is the
+                // platform `Canvas` underneath, which is what the backend takes.
+                self.inner.popup_at(label, &anchor.inner, x, y)
             }
             pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
                 self.inner.activate_submenu_item_by_mnemonic(keyval)
@@ -336,6 +387,17 @@ macro_rules! common_types_mod {
             /// Callers should also check `menu_active()` to prevent normal key handling.
             pub fn handle_menu_key(&self, keyval: u32, modifiers: u32) -> bool {
                 self.inner.handle_menu_key(keyval, modifiers)
+            }
+            /// [`handle_menu_key`](Self::handle_menu_key) with the typed
+            /// character supplied separately from the key code.
+            ///
+            /// A host whose key codes are not character values (the DOM
+            /// reports the *physical* key, so on a QWERTZ layout the key
+            /// marked `Z` arrives as keyCode 89) passes the character it
+            /// decoded; a backend without such a distinction forwards the
+            /// keyval, which is what it already does internally.
+            pub fn handle_menu_key_char(&self, keyval: u32, ch: char, modifiers: u32) -> bool {
+                self.inner.handle_menu_key_char(keyval, ch, modifiers)
             }
             /// Returns true if a keyboard menu is currently open (Alt+letter was pressed,
             /// menu is active for navigation).  Callers can use this to skip normal

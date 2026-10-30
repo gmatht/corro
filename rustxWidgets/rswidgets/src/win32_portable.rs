@@ -44,6 +44,50 @@ pub(crate) fn gtk_mnemonic_to_win32(label: &str) -> String {
     out
 }
 
+/// The `&`-marked character of a Win32 menu label, uppercased.
+///
+/// `None` for a label with no marker, or one whose only marker is an escape
+/// (`&&` / `&&_`), so a caller asking "does this label answer to Alt+key?"
+/// gets "no" rather than a mnemonic the OS does not actually install.
+#[cfg(any(windows, test))]
+pub(crate) fn win32_mnemonic_of(label: &str) -> Option<char> {
+    let mut chars = label.chars();
+    while let Some(c) = chars.next() {
+        if c != '&' {
+            continue;
+        }
+        match chars.next() {
+            // `&&` (literal `&`) and `&&_` (literal `_`) both spell the
+            // marker away, so nothing is registered — but the consumed `_` is
+            // real text, so keep scanning past it.
+            Some('&') => continue,
+            Some(m) => return Some(m.to_ascii_uppercase()),
+            // A trailing `&` marks nothing.
+            None => return None,
+        }
+    }
+    None
+}
+
+/// The zero-based position of the first top-level menu entry whose mnemonic is
+/// `keyval` (already uppercased), or `None`.
+///
+/// Mirrors how the OS resolves a top-level mnemonic: it scans the menu bar
+/// left to right and takes the first match, so this must too — matching a
+/// later entry instead makes the wrong menu pop up. Entries with no marker
+/// are skipped rather than treated as a match on their first letter.
+///
+/// Split out from the Win32 code so the "which entry?" decision is unit
+/// testable on any host; the caller only supplies the labels.
+#[cfg(any(windows, test))]
+pub(crate) fn find_win32_top_level_mnemonic(
+    labels: &[&str],
+    keyval: u32,
+) -> Option<usize> {
+    let want = char::from_u32(keyval)?.to_ascii_uppercase();
+    labels.iter().position(|l| win32_mnemonic_of(l) == Some(want))
+}
+
 /// Win32 virtual-key code for Return (also arrives for numpad Enter).
 #[cfg(any(windows, test))]
 pub(crate) const VK_RETURN_CODE: u32 = 0x0D;
@@ -280,6 +324,54 @@ pub(crate) fn dialog_layout_geometry(
 #[cfg(test)]
 mod portable_win32_tests {
     use super::*;
+
+    #[test]
+    fn win32_mnemonic_finds_the_marked_character() {
+        assert_eq!(win32_mnemonic_of("&File"), Some('F'));
+        assert_eq!(win32_mnemonic_of("Save &As..."), Some('A'));
+        // Only the FIRST marker is the mnemonic; the rest are literal text.
+        assert_eq!(win32_mnemonic_of("&File &Edit"), Some('F'));
+    }
+
+    #[test]
+    fn win32_mnemonic_ignores_escapes_and_bare_labels() {
+        // `&&` spells a literal `&`, not a mnemonic.
+        assert_eq!(win32_mnemonic_of("Copy && Paste"), None);
+        // `&&_` spells a literal `_`.
+        assert_eq!(win32_mnemonic_of("A&&_B"), None);
+        // No marker at all: the OS installs no mnemonic, so none is reported.
+        assert_eq!(win32_mnemonic_of("Help"), None);
+        // A trailing `&` marks nothing.
+        assert_eq!(win32_mnemonic_of("Odd&"), None);
+    }
+
+    #[test]
+    fn win32_top_level_mnemonic_takes_the_first_match_left_to_right() {
+        let labels = ["&File", "&Edit", "&View"];
+        assert_eq!(find_win32_top_level_mnemonic(&labels, 'f' as u32), Some(0));
+        // Case-insensitive, as the OS treats mnemonics.
+        assert_eq!(find_win32_top_level_mnemonic(&labels, 'E' as u32), Some(1));
+        assert_eq!(find_win32_top_level_mnemonic(&labels, 'e' as u32), Some(1));
+        assert_eq!(find_win32_top_level_mnemonic(&labels, 'z' as u32), None);
+    }
+
+    #[test]
+    fn win32_top_level_mnemonic_skips_unmarked_entries() {
+        // An unmarked entry must not be matched on its first letter: 'P' is
+        // plain text in "Print", not an Alt+P accelerator.
+        let labels = ["File", "&Edit", "Print"];
+        assert_eq!(find_win32_top_level_mnemonic(&labels, 'f' as u32), None);
+        assert_eq!(find_win32_top_level_mnemonic(&labels, 'e' as u32), Some(1));
+        assert_eq!(find_win32_top_level_mnemonic(&labels, 'p' as u32), None);
+    }
+
+    #[test]
+    fn win32_top_level_mnemonic_handles_empty_and_garbage_input() {
+        assert_eq!(find_win32_top_level_mnemonic(&[], 'f' as u32), None);
+        // A keyval that is not a char (e.g. a VK_ constant) matches nothing
+        // rather than panicking on `char::from_u32`.
+        assert_eq!(find_win32_top_level_mnemonic(&["&File"], 0xF0), None);
+    }
 
     #[test]
     fn mnemonic_converts_gtk_marker_to_win32() {

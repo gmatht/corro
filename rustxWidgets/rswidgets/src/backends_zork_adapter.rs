@@ -834,6 +834,11 @@ impl MenuBar {
     pub fn handle_menu_key(&self, _keyval: u32, _modifiers: u32) -> bool {
         false
     }
+    /// [`handle_menu_key`](Self::handle_menu_key) with the typed character
+    /// supplied separately; this backend's key codes are already characters.
+    pub fn handle_menu_key_char(&self, keyval: u32, _ch: char, modifiers: u32) -> bool {
+        self.handle_menu_key(keyval, modifiers)
+    }
     pub fn menu_active(&self) -> bool {
         crate::backends::zork::menu_active(self.id)
     }

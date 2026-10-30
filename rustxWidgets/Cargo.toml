@@ -10,6 +10,33 @@ default-members = [
     "rswidgets",
 ]
 
+# REQUIRED for this workspace to resolve at all, and it was missing.
+#
+# rswidgets takes the vendored pdcurses-sys as a *path* dependency
+# (rswidgets/Cargo.toml: `pdcurses-sys = { path = "../../vendor/pdcurses-sys"
+# }`), while `pancurses 0.17` takes `pdcurses-sys = "^0.7"` from crates.io.
+# Both declare `links = "pdcurses"`, and Cargo refuses to link two packages
+# with the same `links` key -- so `cargo build --manifest-path
+# rustxWidgets/Cargo.toml` failed with:
+#
+#     package `pdcurses-sys` links to the native library `pdcurses`, but it
+#     conflicts with a previous package which links to `pdcurses` as well
+#
+# The root workspace manifest already had the matching `[patch.crates-io]`
+# entry, which is why `cargo build` from the root worked and this manifest did
+# not. Nothing in the repo built through this manifest, so nothing reported it.
+[patch.crates-io]
+pdcurses-sys = { path = "../vendor/pdcurses-sys" }
+pancurses = { path = "../vendor/pancurses" }
+# These two are also vendored (Win95 API patches) and are in the root
+# workspace's patch table. rswidgets lists them as plain crates.io versions,
+# so without them this manifest resolves *different* crates than the root one
+# does -- the same drift the pdcurses-sys line above creates.
+chrono = { path = "../vendor/chrono" }
+crossterm = { path = "../vendor/crossterm" }
+notify = { path = "../vendor/notify" }
+native-windows-gui = { path = "../vendor/native-windows-gui" }
+
 [profile.release]
 opt-level = "z"
 lto = true

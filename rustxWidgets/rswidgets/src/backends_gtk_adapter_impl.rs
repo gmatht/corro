@@ -547,6 +547,24 @@ mod gtk_adapter {
         pub fn popup_submenu_by_mnemonic_at(&self, keyval: u32, screen_x: i32, screen_y: i32) -> bool {
             self.0.popup_submenu_by_mnemonic_at(keyval, screen_x, screen_y)
         }
+        /// `popup_submenu_by_mnemonic_at` with the caller's widget-relative
+        /// point resolved to screen coordinates here.
+        ///
+        /// The GTK3 path keeps its existing positioning (it hands GTK the point
+        /// and lets GTK flip off-screen edges itself); GTK4 has no equivalent
+        /// hook and falls back to the unpositioned open, as before.
+        pub fn popup_at(&self, label: &str, anchor: &Canvas, x: f64, y: f64) -> bool {
+            let keyval = match label.chars().next() {
+                Some(c) => c as u32,
+                None => return false,
+            };
+            match anchor.screen_origin() {
+                Some((ox, oy)) => {
+                    self.popup_submenu_by_mnemonic_at(keyval, ox + x as i32, oy + y as i32)
+                }
+                None => self.activate_submenu_by_mnemonic(keyval),
+            }
+        }
         pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
             self.0.activate_submenu_item_by_mnemonic(keyval)
         }
@@ -557,6 +575,16 @@ mod gtk_adapter {
             self.0.handle_mnemonic_key(keyval)
         }
         pub fn handle_menu_key(&self, keyval: u32, modifiers: u32) -> bool {
+            self.0.handle_menu_key(keyval, modifiers)
+        }
+
+        /// [`handle_menu_key`](Self::handle_menu_key) with the typed character
+        /// supplied separately (see `common::MenuBar::handle_menu_key_char`).
+        /// GTK keyvals are X11 keysyms, not characters (GDK_KEY_KP_0 is
+        /// 0xffb0), so `ch` is the more faithful input where a caller has it;
+        /// GTK's own mnemonics are handled natively, so this stays a forward.
+        pub fn handle_menu_key_char(&self, keyval: u32, ch: char, modifiers: u32) -> bool {
+            let _ = ch;
             self.0.handle_menu_key(keyval, modifiers)
         }
         pub fn menu_active(&self) -> bool {
@@ -670,6 +698,13 @@ mod gtk_adapter {
         /// (visible, mapped, alloc_w, alloc_h, has_parent) diagnostic.
         pub fn diagnostics(&self) -> (bool, bool, i32, i32, bool) { self.0.diagnostics() }
         /// True when the GTK4 DropDown backend is in use (vs GTK3 combo).
+        ///
+        /// Delegates to the loader, which decides the backend ONCE in
+        /// `DropDown::new` and records it on the widget. It used to be
+        /// recomputed per call from `symbols.gtk_drop_down_new.is_some()`, and
+        /// on Linux that probe said "GTK4" for a `GtkComboBoxText` -- libgtk-3
+        /// exports `gtk_drop_down_new` as a 3.24 forwarder. Every caller
+        /// branched on GTK4 behaviour it never got.
         pub fn is_gtk4(&self) -> bool { self.0.is_gtk4() }
         pub fn has_size_request_symbol(&self) -> bool { self.0.has_size_request_symbol() }
         pub fn get_active(&self) -> i32 { self.0.get_active() }

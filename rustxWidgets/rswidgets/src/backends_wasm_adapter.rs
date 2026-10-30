@@ -273,9 +273,42 @@ mod wasm_adapter {
             // Set document title as a signal for test frameworks
             // that may poll for it.
             doc.set_title("CORRO_QUIT");
+            // `window.close()` below is refused for a tab the script did not
+            // open, which is every tab a user navigated to. Take the app's own
+            // root out of the page so "Exit" visibly exits; see
+            // `Window::hide`.
+            if let Some(root) = doc
+                .body()
+                .and_then(|b| b.first_element_child())
+                .filter(|e| e.tag_name() != "SCRIPT")
+            {
+                let _ = root.remove();
+            }
         }
-        if let Some(win) = web_sys::window() {
-            let _ = win.close();
+        // Deliberately NOT `window.close()`: a browser refuses it for a tab
+        // the script did not open (every tab a user navigated to), and Chrome
+        // logs the refusal to the console *after* the caller of this function
+        // returns -- which the shared GUI turns into a panic, because it exits
+        // the process straight after quitting. So the tab stays open (a page
+        // cannot close itself) and the title above is what tells a caller the
+        // app has quit.
+    }
+
+    /// Honour a repaint requested from inside the frame that just finished.
+    ///
+    /// The host calls this once per frame, after its draw callback returns. A
+    /// redraw requested *during* a paint cannot run in that paint (it would
+    /// recurse) and must not be dropped, or a change would stay on screen only
+    /// until some later input. One more frame is scheduled here; in practice
+    /// that frame requests nothing and the chain ends.
+    pub fn flush_pending_frame() {
+        if !REDRAW_AFTER_FRAME.with(|f| f.replace(false)) {
+            return;
+        }
+        let canvas = LAST_CANVAS.with(|c| c.borrow_mut().take());
+        if let Some(canvas) = canvas {
+            canvas.redraw_pending.set(false);
+            canvas.queue_redraw();
         }
     }
 
@@ -306,6 +339,273 @@ mod wasm_adapter {
                 &wasm_bindgen::JsValue::from_str("__corro_output"),
                 &wasm_bindgen::JsValue::from_str(&new),
             );
+        }
+    }
+
+    /// The pointer's position inside the canvas, in **style pixels**.
+    ///
+    /// `offset_x`/`offset_y` are already the event's position in the canvas'
+    /// own CSS box -- the space every drawing call works in (a row is 20px, a
+    /// column 7.2px), because the 2d context installs the only
+    /// `devicePixelRatio` transform there is.
+    ///
+    /// Scaling them by the element's backing store (`width` / CSS width) was
+    /// the "a click lands about twice as far from the top-left as the cursor"
+    /// bug on a 2x display: the hit test compared the doubled numbers against
+    /// a grid drawn at 1x, so every press resolved `dpr` rows and columns
+    /// down and right of the pointer. The scale was also read before the first
+    /// frame assigned the backing store, so the first press after a load was
+    /// tested against a 300x150 default.
+    fn local_point(off_x: f64, off_y: f64, _css_size: &Cell<(f64, f64)>, _elem: &HtmlCanvasElement) -> (f64, f64) {
+        (off_x, off_y)
+    }
+
+    /// Let native `scroll` events reach `target` from `outer`'s scrolling.
+    ///
+    /// `ScrolledWindow` here is a real overflow container, so the element that
+    /// receives a user's scroll and fires `scroll` is the *container*, not the
+    /// canvas inside it. A listener registered on the canvas therefore never
+    /// sees a wheel or a touchpad drag. These three properties turn the wheel
+    /// and the scrollbar into a native scroll of the container, and then hand
+    /// the event to `target`: the container keeps its scrollbar (and hides it,
+    /// because the app paints the thumb itself), while every delta arrives on
+    /// the canvas, which is where `on_gesture` listens.
+    fn forward_scroll_from(outer: &HtmlElement, target: &Element) {
+        // The *canvas* decides where a scroll goes, so the container must not
+        // scroll itself: a browser that scrolls it would move the drawing
+        // surface out from under the pixels the app has already painted, and
+        // `clientWidth`/`clientHeight` -- the size the backing store follows --
+        // would shrink with it.
+        set_css(outer, "scrollbar-width", "none");
+        set_css(outer, "overscroll-behavior", "contain");
+        set_css(outer, "touch-action", "none");
+        let _ = target;
+    }
+
+    /// Set a menu label's text, interpreting a GTK mnemonic marker.
+    ///
+    /// The shared menu tree produces GTK labels (`_File`, `S_ave as`) whose
+    /// underscore marks the letter `Alt` activates. A page has no underline,
+    /// so the marker has to be rendered *as* one: `_File` becomes a
+    /// first-letter `<u>` element and `S_ave as` an underlined `a`. Rendering
+    /// the raw string (what this did) put a control character in every menu
+    /// item -- `_File`, `S_ave as` -- which is the bug this fixes.
+    ///
+    /// `innerHTML` rather than `textContent` because the underline is an
+    /// element; every label character is HTML-escaped first, so the only tag
+    /// in the result is the `<u>` introduced here.
+    ///
+    /// Mnemonics are still derived from the *original* label (with its marker)
+    /// in `activate_submenu_by_mnemonic`, so the visible label and the working
+    /// key cannot drift apart.
+    fn set_menu_label(elem: &Element, label: &str) {
+        match label.char_indices().find(|(_, c)| *c == '_') {
+            Some((i, _)) => {
+                let (before, rest) = label.split_at(i);
+                let mut after = rest.chars();
+                after.next(); // the marker
+                match after.next() {
+                    Some(marked) => {
+                        let tail: String = after.collect();
+                        elem.set_inner_html(&format!(
+                            "{}<u>{}</u>{}",
+                            escape_html_text(before),
+                            escape_html_text(&marked.to_string()),
+                            escape_html_text(&tail),
+                        ));
+                    }
+                    // A trailing marker marks nothing: show the text as-is.
+                    None => elem.set_text_content(Some(&format!("{before}_"))),
+                }
+            }
+            None => elem.set_text_content(Some(label)),
+        }
+    }
+
+    /// Escape the three characters that could turn label text into markup.
+    ///
+    /// `set_menu_label` writes `innerHTML` in order to emit one `<u>` tag, so
+    /// any `<`, `>` or `&` in a label (a future "Sort > Ascending", an item
+    /// named "R&D") would otherwise be parsed as markup or swallowed.
+    fn escape_html_text(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '&' => out.push_str("&amp;"),
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// Whether any submenu is open.
+    fn menu_active_in(open: &OpenMenu) -> bool {
+        open.borrow().is_some()
+    }
+
+    /// The value shared by every closure that has to open or close a submenu:
+    /// the one "which submenu is open" cell for the whole bar.
+    ///
+    /// The cell is `(toggle, dropdown)` for the open entry, matching
+    /// `MenuBar::open`. Toggle and item click handlers run outside any
+    /// `MenuBar` method, so without a shared handle they could only flip the
+    /// DOM `display` -- and the bar went on believing a menu was open after it
+    /// had visibly closed. That was the "menus open but never close" symptom:
+    /// clicking an item dispatched its action but left the menubar's state (and
+    /// the next menu's geometry) untouched, and `Alt+letter` then reopened the
+    /// same dropdown while Escape closed it only in the DOM.
+    type OpenMenu = Rc<RefCell<Option<(Element, Element)>>>;
+
+    /// Whether `dropdown` is the submenu the bar has open.
+    fn menu_open_is(open: &OpenMenu, dropdown: &Element) -> bool {
+        let borrowed = open.borrow();
+        let Some((_, dd)) = borrowed.as_ref() else {
+            return false;
+        };
+        // `is_same_node`: two `Element` handles for one DOM node are distinct
+        // `JsValue`s, so `==` would compare identity rather than the node.
+        let a: &web_sys::Node = dd;
+        let b: &web_sys::Node = dropdown;
+        a.is_same_node(Some(b))
+    }
+
+    /// Show `dropdown` and mark it open. The caller closes what was open
+    /// first (`close_open_menu`), so this never leaves two menus visible.
+    fn open_menu_entry(open: &OpenMenu, dropdown: &Element, toggle: Option<&Element>) {
+        if let Some(html) = dropdown.dyn_ref::<HtmlElement>() {
+            let _ = html.style().set_property("display", "block");
+        }
+        // The toggle is the dropdown's previous sibling: the two are always
+        // created as a pair in `create_menubar`.
+        let toggle = match toggle {
+            Some(t) => t.clone(),
+            None => dropdown
+                .previous_element_sibling()
+                .unwrap_or_else(|| dropdown.clone()),
+        };
+        if let Some(html) = toggle.dyn_ref::<HtmlElement>() {
+            let _ = html.style().set_property("background", "#e8e8e8");
+        }
+        *open.borrow_mut() = Some((toggle, dropdown.clone()));
+    }
+
+    // The menubar's key guard: one live `keydown` listener, installed while a
+    // menu is open.
+    //
+    // The formula entry keeps focus while a menu is open (a press on the
+    // menubar never moves it), so the browser delivers in-menu keystrokes to a
+    // text input -- and the input inserts the character however our own
+    // handler is written, because suppressing a *text input's* default action
+    // has to happen on `keydown`, upstream of both handlers.
+    //
+    // Measured, not assumed (headless Chromium, a page with one focused
+    // `<input>` and nothing else): a `keydown` that is not prevented inserts
+    // the character even when the input has no input/change/composition
+    // listeners at all -- the insertion is the browser's default action, and
+    // preventing `keydown` is the only thing that stops it.
+    //
+    // So while a menu is open the bar installs one `keydown` listener on
+    // `window` that prevents the default for every key and routes it to
+    // `MenuBar::handle_menu_key_char`; a key the menu does not consume goes on
+    // to the app's own sink (`set_host_key_sink`), or Ctrl+Q and F1 would stop
+    // working for as long as a menu is open.
+    //
+    // Kept in thread-locals so `close_open_menu` -- which every close path
+    // goes through -- can remove the listener; one per open would otherwise
+    // accumulate.
+    thread_local! {
+        /// True while a frame is being painted (see `Canvas::draw_now`).
+        static FRAME_OPEN: Cell<bool> = const { Cell::new(false) };
+        /// A repaint was requested from inside a frame, for the next one.
+        static REDRAW_AFTER_FRAME: Cell<bool> = const { Cell::new(false) };
+        /// The canvas that painted most recently, so a request made during its
+        /// paint can be honoured once that paint returns.
+        static LAST_CANVAS: RefCell<Option<Canvas>> = RefCell::new(None);
+        /// A live listener, if a menu is open.
+        static MENU_KEY_GUARD: RefCell<Option<js_sys::Function>> = RefCell::new(None);
+        /// The bar whose menu is open, so the listener can route to it.
+        static GUARDED_MENUBAR: RefCell<Option<MenuBar>> = RefCell::new(None);
+        /// The app's own key sink, for the keys a menu does not consume.
+        static HOST_KEY_SINK: RefCell<Option<Rc<dyn Fn(u32, char, u32) -> bool>>> =
+            RefCell::new(None);
+    }
+
+    /// Installs the app's key sink, called by the menu key guard for every key
+    /// an open menu does not take.
+    ///
+    /// Set once by the host after the window exists. Until it is, a key typed
+    /// at an open menu that the menu does not want is dropped -- which is what
+    /// the browser did with it anyway.
+    pub fn set_host_key_sink(sink: Rc<dyn Fn(u32, char, u32) -> bool>) {
+        HOST_KEY_SINK.with(|s| *s.borrow_mut() = Some(sink));
+    }
+
+    fn install_menu_key_guard(open: &OpenMenu, menubar: &MenuBar) {
+        let Some(win) = web_sys::window() else {
+            return;
+        };
+        remove_menu_key_guard();
+        GUARDED_MENUBAR.with(|m| *m.borrow_mut() = Some(menubar.clone()));
+        let closure = Closure::<dyn FnMut(KeyboardEvent)>::new(move |evt: KeyboardEvent| {
+            // Modifier keys (Alt on its own, Shift) carry no character: letting
+            // them through keeps the app's modifier tracking working, and they
+            // insert nothing.
+            if matches!(evt.key().as_str(), "Alt" | "Shift" | "Control" | "Meta") {
+                return;
+            }
+            // The insertion has to be stopped on `keydown`, before the input
+            // sees it -- preventing it on `keypress` would be too late, the
+            // text is already queued.
+            evt.prevent_default();
+            let keyval = evt.key_code() as u32;
+            let ch = typed_char(&evt);
+            let mods = gdk_modifier_mask(&evt);
+            let consumed = GUARDED_MENUBAR
+                .with(|m| m.borrow().clone())
+                .map(|bar| bar.handle_menu_key_char(keyval, ch, mods))
+                .unwrap_or(false);
+            if !consumed {
+                // Not a menu key (Ctrl+Q, F1, an arrow the menu does not move
+                // on): hand it to the app, which would otherwise never see it
+                // -- the default is already prevented.
+                let sink = HOST_KEY_SINK.with(|s| s.borrow().clone());
+                if let Some(sink) = sink {
+                    sink(keyval, ch, mods);
+                }
+            }
+        });
+        let func: js_sys::Function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        // The listener owns the JS trampoline for as long as it is attached;
+        // `remove_menu_key_guard` detaches and drops both together.
+        closure.forget();
+        let _ = win.add_event_listener_with_callback("keydown", &func);
+        MENU_KEY_GUARD.with(|g| *g.borrow_mut() = Some(func));
+        let _ = open;
+    }
+
+    fn remove_menu_key_guard() {
+        if let Some(func) = MENU_KEY_GUARD.with(|g| g.borrow_mut().take()) {
+            if let Some(win) = web_sys::window() {
+                let _ = win.remove_event_listener_with_callback("keydown", &func);
+            }
+        }
+        GUARDED_MENUBAR.with(|m| *m.borrow_mut() = None);
+    }
+
+    /// Hide whatever is open and leave nothing marked open.
+    fn close_open_menu(open: &OpenMenu) {
+        remove_menu_key_guard();
+        let previous = open.borrow_mut().take();
+        let Some((toggle, dropdown)) = previous else {
+            return;
+        };
+        if let Some(html) = dropdown.dyn_ref::<HtmlElement>() {
+            let _ = html.style().set_property("display", "none");
+        }
+        if let Some(html) = toggle.dyn_ref::<HtmlElement>() {
+            let _ = html.style().set_property("background", "transparent");
         }
     }
 
@@ -421,6 +721,109 @@ mod wasm_adapter {
         }
     }
 
+    /// The printable character a key event types, or `'\0'` for a key that
+    /// types nothing.
+    ///
+    /// `key()` is the browser's own answer: `"f"`, `"F"`, `"Enter"`, `"Alt"`,
+    /// `"Dead"`. A single-character `key` is a character; everything else is a
+    /// key name, and only `Enter` and `Escape` are routed (as the control
+    /// characters the menu code compares against). This is what makes
+    /// mnemonics work with a non-US layout: `char_from_keyval` maps
+    /// `key_code` to a letter, and `key_code` is the *physical* key, so on a
+    /// QWERTZ keyboard the key marked `Z` reports keyCode 89 (`Y`).
+    fn typed_char(evt: &KeyboardEvent) -> char {
+        let key = evt.key();
+        let mut chars = key.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => c,
+            _ => match key.as_str() {
+                "Enter" => '\r',
+                "Escape" => '\u{1b}',
+                _ => '\0',
+            },
+        }
+    }
+
+    /// The text of a label as a reader sees it: marker and underline markup
+    /// removed, `_File` -> "File" and `<u>F</u>ile` -> "File".
+    fn strip_marker(label: &str) -> String {
+        label
+            .chars()
+            .filter(|c| *c != '_' && *c != '<' && *c != '>')
+            .filter(|c| *c != '/')
+            .collect()
+    }
+
+    /// The letter a label marks for `Alt`, if it marks one.
+    ///
+    /// Two label spellings reach this, because two producers feed the menu
+    /// tree:
+    ///
+    /// * the shared GTK model's `_File` / `S_ave as` -- the character after
+    ///   the underscore;
+    /// * `menu::dom_menu_label`'s rendered markup, `<u>F</u>ile` -- the
+    ///   underlined character carries no underscore at all, so it is read
+    ///   back out of the tag. Reading the marker of a markup label as its
+    ///   first character (the previous behaviour) made `Alt+O` ("Open file")
+    ///   open *Format*, whose label happens to spell out `...O...>Format<`.
+    fn marked_letter(label: &str) -> Option<char> {
+        if let Some(rest) = label.strip_prefix("<u>") {
+            return rest.chars().next();
+        }
+        let i = label.find('_')?;
+        label[i + 1..].chars().next()
+    }
+
+    /// The words a label is addressed by: the label with marker and markup
+    /// removed, split on whitespace.
+    fn label_words(label: &str) -> Vec<String> {
+        strip_marker(label)
+            .split_whitespace()
+            .map(|w| w.to_ascii_lowercase())
+            .collect()
+    }
+
+    /// Whether `ch` addresses a label.
+    ///
+    /// Two rules, in the order a user would try them:
+    ///
+    /// 1. the marked letter -- the underlined character the label
+    ///    advertises (`_File` -> `F`, `S_ave as` -> `A`);
+    /// 2. with `name_letters` set (top-level entries only): any letter of any
+    ///    word in the entry's name. The model marks one letter per label and
+    ///    its choice is not the user's -- `Format` is declared with the root
+    ///    shortcut `R` (`mnemonic_label("Format", "R")`), so the letter the
+    ///    entry advertises is not one a user would guess, and the plain
+    ///    initial of a name is the first letter a user tries.
+    ///
+    /// Items are matched by rule 1 only: their labels come from a table whose
+    /// shortcut column *is* the mark (`"Save as" => SaveAs ("A")` ->
+    /// `S_ave as`), and `"Sort view" ("S")` -> `_Sort view` marks exactly the
+    /// same `S` that `Sheet`'s marked letter does. Inside the open submenu a
+    /// name match would therefore have to pick between `Save as` and `Sort
+    /// view` by declaration order -- a keystroke that fires "Sort view"'s
+    /// prompt out of the Sheet menu, which is what the word matching in this
+    /// function did before it was restricted to the bar.
+
+    /// The marked letter is checked first, and `activate_submenu_by_mnemonic`
+    /// prefers marked matches over name matches, so an entry's own underline
+    /// is never overridden by another entry's name.
+    fn label_matches_mnemonic(label: &str, ch: char, name_letters: bool) -> bool {
+        let ch = ch.to_ascii_lowercase();
+        if marked_letter(label)
+            .map(|c| c.to_ascii_lowercase() == ch)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if !name_letters {
+            return false;
+        }
+        label_words(label)
+            .iter()
+            .any(|word| word.contains(ch))
+    }
+
     /// UTF-16 code-unit offset -> character index, for the DOM's
     /// `selectionStart` / `setSelectionRange` and `Entry::get_position`.
     ///
@@ -468,23 +871,61 @@ mod wasm_adapter {
     struct SendFnPtr(*mut dyn FnMut(*mut c_void));
     unsafe impl Send for SendFnPtr {}
 
+    /// The one registry every function below refers to. It is a module-level
+    /// item, not a `static` inside each function: `static`s declared in a
+    /// function body are separate objects, so `register_action` filling one and
+    /// `invoke_action` reading another made every action a silent no-op -- the
+    /// menu clicked, and nothing happened.
+    static ACTION_REGISTRY: once_cell::sync::Lazy<std::sync::Mutex<HashMap<String, SendFnPtr>>> =
+        once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
     fn register_action(name: &str, f: Box<dyn FnMut(*mut c_void)>) {
-        use once_cell::sync::Lazy;
-        use std::sync::Mutex;
-        static REG: Lazy<Mutex<HashMap<String, SendFnPtr>>> =
-            Lazy::new(|| Mutex::new(HashMap::new()));
-        let mut map = REG.lock().unwrap();
+        let mut map = ACTION_REGISTRY.lock().unwrap();
         let ptr = Box::into_raw(Box::new(f) as Box<dyn FnMut(*mut c_void)>);
-        map.insert(name.to_owned(), SendFnPtr(ptr));
+        // `gtk_application_set_accels_for_action` / `CreateAcceleratorTable`
+        // style: the registry is keyed by the *qualified* name. GTK's group
+        // name comes from `insert_action_group("app", ..)` and NWG's names are
+        // already `app.*`; here the registry is flat, so the prefix is added on
+        // the way in -- and `invoke_action` tries both spellings, because the
+        // menu model stores the action name without it.
+        let key = if name.starts_with("app.") { name.to_owned() } else { format!("app.{name}") };
+        let old = map.insert(key, SendFnPtr(ptr));
+        if let Some(SendFnPtr(previous)) = old {
+            // Re-registering a name replaced the callback; the old box would
+            // otherwise leak on every rebuild of the menu.
+            drop(unsafe { Box::from_raw(previous) });
+        }
+    }
+
+    /// Activate a registered action by name, as one of its widgets would.
+    ///
+    /// The browser-side counterpart of `gtk_widget_activate` / NWG's
+    /// `SendMessage(BM_CLICK)`: the same dispatch a menu item's own handler
+    /// runs, reachable without an element to click. The browser smoke test
+    /// (`scripts/wasm_smoke.mjs`) needs exactly that, because which element
+    /// stands for a given menu item depends on the menu's keyboard state --
+    /// the top-level entries move between the bar and their dropdowns.
+    fn activate_action(name: &str) -> bool {
+        let known = ACTION_REGISTRY
+            .lock()
+            .map(|m| m.contains_key(name) || m.contains_key(&format!("app.{name}")))
+            .unwrap_or(false);
+        if known {
+            invoke_action(name, std::ptr::null_mut());
+        }
+        known
     }
 
     fn invoke_action(name: &str, param: *mut c_void) {
-        use once_cell::sync::Lazy;
-        use std::sync::Mutex;
-        static REG: Lazy<Mutex<HashMap<String, SendFnPtr>>> =
-            Lazy::new(|| Mutex::new(HashMap::new()));
-        if let Ok(mut map) = REG.lock() {
-            if let Some(SendFnPtr(ptr)) = map.get_mut(name) {
+        if let Ok(mut map) = ACTION_REGISTRY.lock() {
+            let qualified;
+            let key = if map.contains_key(name) {
+                name
+            } else {
+                qualified = format!("app.{name}");
+                &qualified
+            };
+            if let Some(SendFnPtr(ptr)) = map.get_mut(key) {
                 let cb: &mut dyn FnMut(*mut c_void) = unsafe { &mut **ptr };
                 cb(param);
             }
@@ -559,9 +1000,74 @@ impl Window {
             self.elem.append_child(child.as_element()).ok();
         }
 
-        pub fn present(&self) {}
+        /// Make the window's root fill the page.
+        ///
+        /// `index.html` gives the document a viewport-high `body` (see the
+        /// page itself); stretching the root to it is what makes a `flex: 1`
+        /// child -- the sheet's row -- fill the screen instead of collapsing
+        /// to its content height. Done here rather than only in the page so
+        /// that a host which pastes the app into its own article still gets a
+        /// full-height window.
+        fn fill_viewport(&self) {
+            set_css(self.elem.as_ref(), "display", "flex");
+            set_css(self.elem.as_ref(), "flex-direction", "column");
+            set_css(self.elem.as_ref(), "box-sizing", "border-box");
+            set_css(self.elem.as_ref(), "height", "100%");
+        }
+
+        pub fn present(&self) {
+            self.fill_viewport();
+            // A browser paints on its own; the only work `present` has to do
+            // beyond the size is to give the keyboard somewhere to go. The
+            // app calls `grab_focus` on the formula entry, so this is a
+            // fallback for a window that never did.
+            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                let body: Option<Element> = doc.body().map(|b| b.into());
+                let active = doc.active_element();
+                if active.is_none() || active == body {
+                    // Not focusable by default, so make it so: a window with
+                    // nothing focused drops the first keypress into the body.
+                    self.elem.set_tab_index(0);
+                    let _ = self.elem.focus();
+                }
+            }
+        }
+
+        /// The size the requested window size is clipped to.
+        ///
+        /// A desktop backend is *asked* for 1200x800 and a window manager may
+        /// grant it, shrink it, or move it onto a smaller monitor. A page has
+        /// no window manager: a root forced to 1200x800 on a 800x600 viewport
+        /// makes the page scroll and puts the status line (and any dialog)
+        /// below the fold. Clipping to the viewport is the smallest of the
+        /// available answers -- scrollbars (which shift the canvas under the
+        /// pointer) and a hidden root (which draws nothing) are the others.
+        ///
+        /// The `min` is applied to the *request*, not to a hard minimum, so a
+        /// caller that asks for less than the viewport (a phone-sized build on
+        /// a desktop) still gets what it asked for.
+        fn clipped_to_viewport(w: i32, h: i32) -> (i32, i32) {
+            let (vw, vh) = web_sys::window()
+                .map(|win| {
+                    (
+                        win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(f64::INFINITY),
+                        win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(f64::INFINITY),
+                    )
+                })
+                .unwrap_or((f64::INFINITY, f64::INFINITY));
+            // 1px of slack: a fractional viewport (125% zoom) rounds up in
+            // `inner_width` and down in layout, and a 1px overflow is a
+            // scrollbar.
+            let vw = vw.floor() - 1.0;
+            let vh = vh.floor() - 1.0;
+            let w = if w > 0 { (w as f64).min(vw).max(1.0) as i32 } else { 0 };
+            let h = if h > 0 { (h as f64).min(vh).max(1.0) as i32 } else { 0 };
+            (w, h)
+        }
 
         pub fn set_default_size(&self, w: i32, h: i32) {
+            self.fill_viewport();
+            let (w, h) = Self::clipped_to_viewport(w, h);
             if w > 0 {
                 set_css(self.elem.as_ref(), "width", &format!("{}px", w));
             }
@@ -578,7 +1084,14 @@ impl Window {
         /// may shrink it to nothing. Setting `min-width`/`min-height` as well
         /// is what actually holds it, and it is the DOM's version of
         /// `gtk_window_set_size` (not `set_default_size`).
+        ///
+        /// Clipped to the viewport for the reason given on
+        /// [`Self::clipped_to_viewport`]. Unlike `set_default_size` it does
+        /// *not* call `fill_viewport`, because the one caller that forces a
+        /// size (a movie window sized to its frame) wants exactly that size,
+        /// not "the page, clipped".
         pub fn resize(&self, w: i32, h: i32) {
+            let (w, h) = Self::clipped_to_viewport(w, h);
             if w > 0 {
                 set_css(self.elem.as_ref(), "min-width", &format!("{}px", w));
                 set_css(self.elem.as_ref(), "width", &format!("{}px", w));
@@ -617,35 +1130,11 @@ impl Window {
         /// the unload without a user-gesture-registered handler, so this
         /// reports rather than prevents -- the same "tell the app, let it
         /// save" contract `quit_main_loop` already uses.
-        pub fn on_close(&self, cb: Box<dyn FnMut()>) {
-            *self.close_cb.borrow_mut() = Some(cb);
-            let cell = self.close_cb.clone();
-            let closure = Closure::<dyn FnMut(Event)>::new(move |_evt: Event| {
-                if let Some(f) = cell.borrow_mut().as_mut() {
-                    f();
-                }
-            });
-            if let Some(win) = web_sys::window() {
-                let _ = win.add_event_listener_with_callback("beforeunload", closure.as_ref().unchecked_ref());
-            }
-            self.closures.borrow_mut().push(Box::new(closure));
-        }
-
-        /// Re-run the DOM work that a native backend would do in a redraw.
-        ///
-        /// GTK calls `queue_draw` on the widget tree and NWG
-        /// `RedrawWindow(RDW_ALLCHILDREN)`; neither has a DOM equivalent,
-        /// because a browser repaints on its own. The closest honest answer
-        /// is to invalidate the window's own box model, which is what makes a
-        /// caller that has changed layout see the result. The child canvases
-        /// are the caller's to redraw: they own their own `queue_redraw`.
-        pub fn queue_redraw(&self) {
-            // Reading offsetWidth/Height flushes pending style and layout, so
-            // anything the caller changed has been measured by the time this
-            // returns -- the same guarantee `gtk_widget_queue_draw` offers
-            // for the frame that follows.
-            let _ = (self.elem.offset_width(), self.elem.offset_height());
-        }
+        /// The window-level key fallback, the counterpart of GTK's
+        /// `EventControllerKey` on the toplevel and NWG's `WM_KEYDOWN` at the
+        /// frame: a key that no focused child claimed still arrives here, on
+        /// `document` so that it fires wherever focus happens to be. The
+        /// callback returns non-zero to consume the key.
         pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) {
             *self.event_key_cb.borrow_mut() = Some(cb);
             let cb2 = self.event_key_cb.clone();
@@ -671,102 +1160,58 @@ impl Window {
                 });
             self.closures.borrow_mut().push(Box::new(closure));
         }
-    }
 
-    pub fn create_window() -> Result<Window, Error> {
-        let div: HtmlDivElement = create_element("div").dyn_into().map_err(|e| {
-            Error::Backend(format!("create_window: {:?}", e))
-        })?;
-        set_css(div.as_ref(), "all", "initial");
-        body().append_child(div.as_ref()).map_err(|e| {
-            Error::Backend(format!("create_window append: {:?}", e))
-        })?;
-        Ok(Window {
-            elem: div,
-            event_key_cb: Rc::new(RefCell::new(None)),
-            close_cb: Rc::new(RefCell::new(None)),
-            closures: Rc::new(RefCell::new(Vec::new())),
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // Button
-    // -----------------------------------------------------------------------
-    pub struct Button {
-        elem: HtmlButtonElement,
-        closures: Rc<RefCell<Vec<Box<dyn Any>>>>,
-        next_id: Rc<RefCell<u64>>,
-    }
-
-    impl AsElement for Button {
-        fn as_element(&self) -> &Element {
-            self.elem.as_ref()
+        /// Re-run the DOM work that a native backend would do in a redraw.
+        ///
+        /// GTK calls `queue_draw` on the widget tree and NWG
+        /// `RedrawWindow(RD_ALLCHILDREN)`; neither has a DOM equivalent,
+        /// because a browser repaints on its own. The closest honest answer
+        /// is to invalidate the window's own box model, which is what makes a
+        /// caller that has changed layout see the result. The child canvases
+        /// are the caller's to redraw: they own their own `queue_redraw`.
+        pub fn queue_redraw(&self) {
+            // Reading offsetWidth/Height flushes pending style and layout, so
+            // anything the caller changed has been measured by the time this
+            // returns -- the same guarantee `gtk_widget_queue_draw` offers
+            // for the frame that follows.
+            let _ = (self.elem.offset_width(), self.elem.offset_height());
         }
-    }
 
-    impl Widget for Button {
-        fn raw_handle(&self) -> *mut c_void {
-            &self.elem as *const HtmlButtonElement as *mut c_void
-        }
-    }
-
-    impl Clone for Button {
-        fn clone(&self) -> Self {
-            Button {
-                elem: self.elem.clone(),
-                closures: self.closures.clone(),
-                next_id: self.next_id.clone(),
-            }
-        }
-    }
-
-    impl Button {
-        pub fn on_click(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
-            let cb = Rc::new(RefCell::new(f));
-            let cb2 = cb.clone();
-            let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |_: MouseEvent| {
-                (cb2.borrow_mut())();
+        pub fn on_close(&self, cb: Box<dyn FnMut()>) {
+            *self.close_cb.borrow_mut() = Some(cb);
+            let cell = self.close_cb.clone();
+            let closure = Closure::<dyn FnMut(Event)>::new(move |_evt: Event| {
+                if let Some(f) = cell.borrow_mut().as_mut() {
+                    f();
+                }
             });
-            self.elem
-                .add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
-                .map_err(|e| Error::Backend(format!("on_click: {:?}", e)))?;
-            let id = *self.next_id.borrow();
-            *self.next_id.borrow_mut() += 1;
+            if let Some(win) = web_sys::window() {
+                let _ = win.add_event_listener_with_callback("beforeunload", closure.as_ref().unchecked_ref());
+            }
             self.closures.borrow_mut().push(Box::new(closure));
-            Ok(id)
         }
 
-        pub fn emit_clicked(&self) -> Result<u64, Error> {
-            self.elem.click();
-            Ok(0)
+        /// Close the window, as the browser understands it: remove it from the
+        /// document.
+        ///
+        /// `quit_main_loop` also tries `window.close()`, which a browser
+        /// refuses for a tab the script did not open -- so without this, "Exit"
+        /// leaves a full set of menus and a status line on screen that still
+        /// look interactive but are backed by an app that has already tidied
+        /// up. Removing the root makes the quit visible, and leaves the page
+        /// (and `document.title`, which a test polls) intact.
+        pub fn hide(&self) {
+            let _ = self.elem.remove();
         }
 
-        pub fn set_visible(&self, v: bool) {
-            set_css(self.elem.as_ref(), "display", if v { "" } else { "none" });
-        }
-
-        /// `flex-grow` + `align-self: stretch`. A `<button>` sizes to its
-        /// label, so without these it stays that width inside a flex row
-        /// instead of taking the leftover space.
-        pub fn set_hexpand(&self, expand: bool) {
-            if expand {
-                set_css(self.elem.as_ref(), "flex-grow", "1");
-                set_css(self.elem.as_ref(), "align-self", "stretch");
-            } else {
-                set_css(self.elem.as_ref(), "flex-grow", "0");
-            }
-        }
-
-        /// See [`Button::set_hexpand`].
-        pub fn set_vexpand(&self, expand: bool) {
-            if expand {
-                set_css(self.elem.as_ref(), "flex-shrink", "1");
-                set_css(self.elem.as_ref(), "align-self", "stretch");
-            } else {
-                set_css(self.elem.as_ref(), "flex-shrink", "0");
-            }
-        }
-
+        /// Re-run the DOM work that a native backend would do in a redraw.
+        ///
+        /// GTK calls `queue_draw` on the widget tree and NWG
+        /// `RedrawWindow(RDW_ALLCHILDREN)`; neither has a DOM equivalent,
+        /// because a browser repaints on its own. The closest honest answer
+        /// is to invalidate the window's own box model, which is what makes a
+        /// caller that has changed layout see the result. The child canvases
+        /// are the caller's to redraw: they own their own `queue_redraw`.
         pub fn set_size_request(&self, w: i32, h: i32) {
             if w > 0 {
                 set_css(self.elem.as_ref(), "width", &format!("{}px", w));
@@ -802,6 +1247,110 @@ impl Window {
         }
     }
 
+    pub fn create_window() -> Result<Window, Error> {
+        let div: HtmlDivElement = create_element("div").dyn_into().map_err(|e| {
+            Error::Backend(format!("create_window: {:?}", e))
+        })?;
+        set_css(div.as_ref(), "all", "initial");
+        body().append_child(div.as_ref()).map_err(|e| {
+            Error::Backend(format!("create_window append: {:?}", e))
+        })?;
+        // Publish the action registry to the page: `window.__corro_activate_action(name)`
+        // runs the same dispatch a menu item's click handler runs, and answers
+        // whether the name was registered. This is the browser's stand-in for
+        // the automation hook GTK and NWG get from their widget trees, and it is
+        // what the smoke test uses instead of depending on DOM layout.
+        if let Some(win) = web_sys::window() {
+            let f = Closure::<dyn FnMut(String) -> bool>::new(|name: String| activate_action(&name));
+            let _ = js_sys::Reflect::set(
+                &win,
+                &wasm_bindgen::JsValue::from_str("__corro_activate_action"),
+                f.as_ref(),
+            );
+            f.forget();
+        }
+        Ok(Window {
+            elem: div,
+            event_key_cb: Rc::new(RefCell::new(None)),
+            close_cb: Rc::new(RefCell::new(None)),
+            closures: Rc::new(RefCell::new(Vec::new())),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Button
+    // -----------------------------------------------------------------------
+    pub struct Button {
+        elem: HtmlButtonElement,
+        click_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
+        closures: Rc<RefCell<Vec<Box<dyn Any>>>>,
+        next_id: Rc<RefCell<u64>>,
+    }
+
+    impl AsElement for Button {
+        fn as_element(&self) -> &Element {
+            self.elem.as_ref()
+        }
+    }
+
+    impl Widget for Button {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.elem as *const HtmlButtonElement as *mut c_void
+        }
+    }
+
+    impl AsRef<*mut c_void> for Button {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
+        }
+    }
+
+    impl Clone for Button {
+        fn clone(&self) -> Self {
+            Button {
+                elem: self.elem.clone(),
+                click_cb: self.click_cb.clone(),
+                closures: self.closures.clone(),
+                next_id: self.next_id.clone(),
+            }
+        }
+    }
+
+    impl Button {
+        pub fn set_label(&self, label: &str) {
+            self.elem.set_text_content(Some(label));
+        }
+
+        pub fn get_label(&self) -> Option<String> {
+            self.elem.text_content()
+        }
+
+        pub fn on_click(&self, cb: Box<dyn FnMut()>) {
+            *self.click_cb.borrow_mut() = Some(cb);
+            let cell = self.click_cb.clone();
+            let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |_evt: MouseEvent| {
+                if let Some(f) = cell.borrow_mut().as_mut() {
+                    f();
+                }
+            });
+            self.elem
+                .add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
+                .ok();
+            self.closures.borrow_mut().push(Box::new(closure));
+        }
+
+        /// Programmatic activation, as `gtk_button_clicked` / `BM_CLICK` do.
+        ///
+        /// `elem.click()` rather than a call to the stored callback: that is
+        /// what a user's click does, so it also runs whatever else is listening
+        /// (a checkbox's default toggle, a form's `submit`), and it fires the
+        /// same path a test or a movie replay driver expects.
+        pub fn emit_clicked(&self) -> Result<(), Error> {
+            self.elem.click();
+            Ok(())
+        }
+    }
+
     pub fn create_button(label: &str) -> Result<Button, Error> {
         let btn: HtmlButtonElement = create_element("button").dyn_into().map_err(|e| {
             Error::Backend(format!("create_button: {:?}", e))
@@ -809,6 +1358,7 @@ impl Window {
         btn.set_text_content(Some(label));
         Ok(Button {
             elem: btn,
+            click_cb: Rc::new(RefCell::new(None)),
             closures: Rc::new(RefCell::new(Vec::new())),
             next_id: Rc::new(RefCell::new(1)),
         })
@@ -1582,24 +2132,40 @@ impl AsElement for MenuBar {
         /// Open the submenu whose first letter is `keyval`, and report
         /// whether one matched.
         ///
-        /// GTK matches a mnemonic with a trailing `_` in the label
-        /// (`"_File"`); the DOM has no such convention, so the first
-        /// character of the label is the mnemonic -- the same rule a browser
-        /// menu uses, and the one that matches what the GTK build's labels
-        /// already spell out (`Menu::append` receives the label with the
-        /// marker stripped, see `build_menu_model`).
+        /// The rules are in `label_matches_mnemonic`: the marked letter
+        /// first, then -- for a top-level entry, where the model's marks
+        /// collide (`File` and `Format` are both marked `F`) -- the letters
+        /// of the entry's own name.
         pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
             let ch = match char_from_keyval(keyval) {
-                Some(c) => c.to_ascii_lowercase(),
+                Some(c) => c,
                 None => return false,
             };
-            let idx = self.entries.borrow().iter().position(|e| {
-                e.label
-                    .chars()
-                    .next()
+            self.activate_submenu_by_char(ch)
+        }
+
+        /// Open the submenu `ch` addresses (see `label_matches_mnemonic`).
+        fn activate_submenu_by_char(&self, ch: char) -> bool {
+            let ch = ch.to_ascii_lowercase();
+            // A marked match beats a name match: the model underlines exactly
+            // one letter per entry, and that underline is the accelerator the
+            // label advertises (`_File` marks `F`), so `F` may never fall
+            // through to Format just because File appears first. Only when no
+            // entry is *marked* with the letter does the name fallback below
+            // decide, which is what makes `Alt+E`/`Alt+I`/`Alt+O`/`Alt+H`
+            // work when the model marked something else entirely.
+            let entries = self.entries.borrow();
+            let marked = entries.iter().position(|e| {
+                marked_letter(&e.label)
                     .map(|c| c.to_ascii_lowercase() == ch)
                     .unwrap_or(false)
             });
+            let idx = marked.or_else(|| {
+                entries
+                    .iter()
+                    .position(|e| label_matches_mnemonic(&e.label, ch, true))
+            });
+            drop(entries);
             match idx {
                 Some(i) => {
                     self.open_submenu(i);
@@ -1617,16 +2183,19 @@ impl AsElement for MenuBar {
         /// position-callback -- gets it here by overriding the offsets.
         pub fn popup_submenu_by_mnemonic_at(&self, keyval: u32, screen_x: i32, screen_y: i32) -> bool {
             let ch = match char_from_keyval(keyval) {
-                Some(c) => c.to_ascii_lowercase(),
+                Some(c) => c,
                 None => return false,
             };
             let entries = self.entries.borrow();
-            let idx = entries.iter().position(|e| {
-                e.label
-                    .chars()
-                    .next()
-                    .map(|c| c.to_ascii_lowercase() == ch)
+            let marked = entries.iter().position(|e| {
+                marked_letter(&e.label)
+                    .map(|c| c.to_ascii_lowercase() == ch.to_ascii_lowercase())
                     .unwrap_or(false)
+            });
+            let idx = marked.or_else(|| {
+                entries
+                    .iter()
+                    .position(|e| label_matches_mnemonic(&e.label, ch, true))
             });
             drop(entries);
             match idx {
@@ -1656,29 +2225,45 @@ impl AsElement for MenuBar {
             }
         }
 
+        /// WASM positions the popup itself, relative to its own bar, so the
+        /// only translation needed here is the anchor's on-screen origin (a
+        /// browser has no screen coordinates of its own -- see
+        /// `Canvas::screen_origin`).
+        pub fn popup_at(&self, label: &str, anchor: &Canvas, x: f64, y: f64) -> bool {
+            let keyval = match label.chars().next() {
+                Some(c) => c as u32,
+                None => return false,
+            };
+            let origin = anchor.screen_origin().unwrap_or((0, 0));
+            self.popup_submenu_by_mnemonic_at(keyval, origin.0 + x as i32, origin.1 + y as i32)
+        }
         /// Activate the item in the open submenu whose label starts with
         /// `keyval`. Requires a submenu to be open, which is what
         /// `menu_active` reports.
         pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
-            let Some(ch) = char_from_keyval(keyval) else {
-                return false;
-            };
-            let ch = ch.to_ascii_lowercase();
+            match char_from_keyval(keyval) {
+                Some(ch) => self.activate_submenu_item_by_char(ch),
+                None => false,
+            }
+        }
+
+        /// Activate the open submenu's item that `ch` marks.
+        fn activate_submenu_item_by_char(&self, ch: char) -> bool {
             let open = self.open.borrow();
             let Some((_, _)) = open.as_ref() else {
                 return false;
             };
             drop(open);
-            // Find the entry holding the match, then dispatch its action.
+            // Find the item whose marked letter matches, then dispatch its
+            // action. The marked letter (not the first character) is what the
+            // user reads off the label: `Save as` is accelerated by `a`, which
+            // the shared menu tree declares, and matching the first character
+            // made every such item unreachable by its own mnemonic.
             let found = self.entries.borrow().iter().enumerate().find_map(|(entry_idx, e)| {
-                e.items.iter().position(|(label, _)| {
-                    label
-                        .chars()
-                        .next()
-                        .map(|c| c.to_ascii_lowercase() == ch)
-                        .unwrap_or(false)
-                })
-                .map(|item_idx| (entry_idx, item_idx))
+                e.items
+                    .iter()
+                    .position(|(label, _)| label_matches_mnemonic(label, ch, false))
+                    .map(|item_idx| (entry_idx, item_idx))
             });
             match found {
                 Some((entry_idx, item_idx)) => {
@@ -1707,18 +2292,44 @@ impl AsElement for MenuBar {
         /// `activate_submenu_by_mnemonic`) and reports `false` otherwise, so
         /// the caller falls through to normal key handling.
         pub fn handle_mnemonic_key(&self, keyval: u32) -> bool {
+            if keyval == crate::core::key::ESCAPE {
+                return self.handle_mnemonic_char('\u{1b}');
+            }
+            if keyval == crate::core::key::DOWN || keyval == crate::core::key::UP {
+                return self.handle_mnemonic_char(if keyval == crate::core::key::DOWN {
+                    '\u{1f}'
+                } else {
+                    '\u{1e}'
+                });
+            }
+            match char_from_keyval(keyval) {
+                Some(ch) => self.handle_mnemonic_char(ch),
+                None => false,
+            }
+        }
+
+        /// A keystroke while a submenu is open: Escape closes it, Up/Down move
+        /// the selection (passed as the non-character sentinels `\u{1e}` /
+        /// `\u{1f}`), and any other character activates the item it marks.
+        fn handle_mnemonic_char(&self, ch: char) -> bool {
             if !self.menu_active() {
                 return false;
             }
-            if keyval == crate::core::key::ESCAPE {
-                self.menu_close();
-                return true;
+            match ch {
+                '\u{1b}' => {
+                    self.menu_close();
+                    true
+                }
+                '\u{1f}' => {
+                    self.move_selection(true);
+                    true
+                }
+                '\u{1e}' => {
+                    self.move_selection(false);
+                    true
+                }
+                _ => self.activate_submenu_item_by_char(ch),
             }
-            if keyval == crate::core::key::DOWN || keyval == crate::core::key::UP {
-                self.move_selection(keyval == crate::core::key::DOWN);
-                return true;
-            }
-            self.activate_submenu_item_by_mnemonic(keyval)
         }
 
         /// Handle any menu-related key event.
@@ -1728,14 +2339,35 @@ impl AsElement for MenuBar {
         /// submenu; otherwise this defers to `handle_mnemonic_key`, so the
         /// navigation rules live in one place.
         pub fn handle_menu_key(&self, keyval: u32, modifiers: u32) -> bool {
+            self.handle_menu_key_char(
+                keyval,
+                char::from_u32(keyval).unwrap_or('\0'),
+                modifiers,
+            )
+        }
+
+        /// [`handle_menu_key`](Self::handle_menu_key), given the typed
+        /// character as well as the key code, for a host whose key codes are
+        /// not character values.
+        ///
+        /// A page's key codes are (A-Z map to 0x41-0x5A on a US layout), but
+        /// the DOM reports the *physical* key, so on another layout the
+        /// labelled letter and the code disagree; the caller that has the
+        /// event passes `key()` through [`typed_char`].
+        pub fn handle_menu_key_char(&self, keyval: u32, ch: char, modifiers: u32) -> bool {
             const ALT_MASK: u32 = 0x8;
-            if modifiers & ALT_MASK != 0 {
-                let opened = self.activate_submenu_by_mnemonic(keyval);
-                if opened {
-                    return true;
-                }
+            let ch = if ch == '\0' {
+                char_from_keyval(keyval).unwrap_or('\0')
+            } else {
+                ch
+            };
+            if ch == '\0' {
+                return false;
             }
-            self.handle_mnemonic_key(keyval)
+            if modifiers & ALT_MASK != 0 && self.activate_submenu_by_char(ch) {
+                return true;
+            }
+            self.handle_mnemonic_char(ch)
         }
 
         /// Whether a keyboard menu is open. Callers use this to skip normal
@@ -1744,37 +2376,24 @@ impl AsElement for MenuBar {
             self.open.borrow().is_some()
         }
 
-        /// Close the open submenu and clear the selection.
+        /// Close the open submenu, its DOM dropdown, and clear the selection.
+        ///
+        /// The DOM work goes through [`close_open_menu`], the same helper the
+        /// click handlers use, so the bar's state and the page cannot diverge.
         pub fn menu_close(&self) {
-            let open = self.open.borrow_mut().take();
-            let Some((toggle, dropdown)) = open else {
-                return;
-            };
-            if let Some(html) = dropdown.dyn_ref::<HtmlElement>() {
-                let _ = html.style().set_property("display", "none");
-            }
-            if let Some(html) = toggle.dyn_ref::<HtmlElement>() {
-                // Drop the "is open" marker, which is also what the
-                // background highlight keys off.
-                let _ = html.style().set_property("background", "transparent");
-            }
+            close_open_menu(&self.open);
             *self.selected.borrow_mut() = 0;
         }
 
         /// Show submenu `idx` and hide any other.
         fn open_submenu(&self, idx: usize) {
-            self.menu_close();
+            close_open_menu(&self.open);
             let entries = self.entries.borrow();
             let Some(entry) = entries.get(idx) else {
                 return;
             };
-            if let Some(html) = entry.dropdown.dyn_ref::<HtmlElement>() {
-                let _ = html.style().set_property("display", "block");
-            }
-            if let Some(html) = entry.toggle.dyn_ref::<HtmlElement>() {
-                let _ = html.style().set_property("background", "#e8e8e8");
-            }
-            *self.open.borrow_mut() = Some((entry.toggle.clone(), entry.dropdown.clone()));
+            open_menu_entry(&self.open, &entry.dropdown, Some(&entry.toggle));
+            install_menu_key_guard(&self.open, self);
             *self.selected.borrow_mut() = 0;
         }
 
@@ -1826,18 +2445,42 @@ impl AsElement for MenuBar {
         s.set_property("border-bottom", "1px solid #ccc").ok();
 
         let mut entries: Vec<MenuEntry> = Vec::new();
+        // One open-state cell for the whole bar, shared with the click
+        // handlers (see `OpenMenu`).
+        let open_handle: OpenMenu = Rc::new(RefCell::new(None));
         for item in &model.items {
             match item {
                 MenuItem::Item { label, action } => {
                     let btn: HtmlButtonElement = create_element("button").dyn_into().unwrap();
-                    btn.set_text_content(Some(label));
+                    set_menu_label(btn.as_ref(), label);
                     let action_name = action.clone();
+                    let menu = open_handle.clone();
                     let closure =
-                        Closure::<dyn FnMut(MouseEvent)>::new(move |_: MouseEvent| {
+                        Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
+                            // Any open submenu closes when an action runs --
+                            // the same rule the dropdown items follow.
+                            close_open_menu(&menu);
                             invoke_action(&action_name, std::ptr::null_mut());
+                            evt.stop_propagation();
                         });
                     btn.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
                         .ok();
+                    // A menu item is not a text input: without `mousedown`
+                    // prevented the browser moves focus to the button on
+                    // press, and the formula entry the app put focus in loses
+                    // it. The shared GUI then reports `has_focus() == false`
+                    // for the entry and every shortcut typed afterwards is
+                    // treated as cell text instead of as an accelerator.
+                    let keep_focus = Closure::<dyn FnMut(MouseEvent)>::new(|evt: MouseEvent| {
+                        // See the item handler: the press must not become a
+                        // click outside, nor move focus out of the formula
+                        // entry.
+                        evt.stop_propagation();
+                        evt.prevent_default();
+                    });
+                    btn.add_event_listener_with_callback("mousedown", keep_focus.as_ref().unchecked_ref())
+                        .ok();
+                    keep_focus.forget();
                     closure.forget();
                     let s = btn.style();
                     s.set_property("background", "transparent").ok();
@@ -1864,7 +2507,7 @@ impl AsElement for MenuBar {
                     set_css(&wrapper, "position", "relative");
 
                     let toggle: HtmlButtonElement = create_element("button").dyn_into().unwrap();
-                    toggle.set_text_content(Some(label));
+                    set_menu_label(toggle.as_ref(), label);
                     let s = toggle.style();
                     s.set_property("background", "transparent").ok();
                     s.set_property("border", "none").ok();
@@ -1887,11 +2530,25 @@ impl AsElement for MenuBar {
                                 let item = create_element("div");
                                 set_css(&item, "padding", "4px 12px");
                                 set_css(&item, "cursor", "pointer");
-                                item.set_text_content(Some(label));
+                                set_menu_label(&item, label);
                                 let action_name = action.clone();
+                                // Close first, then invoke: an action can
+                                // rebuild or replace the menubar (`Exit`
+                                // removes the whole window), and a menu left
+                                // "open" after a click would keep a dropdown
+                                // on screen over the next screen the action
+                                // draws. Also what every desktop menubar does.
+                                let menu = open_handle.clone();
                                 let cl =
-                                    Closure::<dyn FnMut(MouseEvent)>::new(move |_: MouseEvent| {
+                                    Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
+                                        close_open_menu(&menu);
                                         invoke_action(&action_name, std::ptr::null_mut());
+                                        // The menu must not swallow the click
+                                        // that is closing it: the document
+                                        // listener below would otherwise see
+                                        // this same event and treat it as a
+                                        // click outside.
+                                        evt.stop_propagation();
                                     });
                                 item.add_event_listener_with_callback(
                                     "click",
@@ -1899,6 +2556,29 @@ impl AsElement for MenuBar {
                                 )
                                 .ok();
                                 cl.forget();
+                                // See the top-level menu button: pressing an
+                                // item must not steal focus from the formula
+                                // entry, or the app stops seeing accelerators.
+                                //
+                                // It must also not reach the document-level
+                                // "click outside" listener, which would close
+                                // the menu on *press* -- before the click that
+                                // picks the item ever fires. Suppressing the
+                                // focus change and stopping propagation happen
+                                // together here for that reason: both are
+                                // "this press belongs to the item".
+                                let keep = Closure::<dyn FnMut(MouseEvent)>::new(
+                                    |evt: MouseEvent| {
+                                        evt.stop_propagation();
+                                        evt.prevent_default();
+                                    },
+                                );
+                                item.add_event_listener_with_callback(
+                                    "mousedown",
+                                    keep.as_ref().unchecked_ref(),
+                                )
+                                .ok();
+                                keep.forget();
                                 dropdown.append_child(&item).ok();
                                 // Recorded so the keyboard API can dispatch by
                                 // mnemonic: the DOM item has no way to tell
@@ -1909,20 +2589,39 @@ impl AsElement for MenuBar {
                         }
                     }
 
+                    // The toggle drives the shared open-state, not just its own
+                    // `display`: closing only the dropdown left the menubar
+                    // believing a menu was still open, so Escape and the
+                    // keyboard mnemonics kept being routed to it and normal
+                    // typing was swallowed until the page was reloaded.
+                    // Keep the document-level "click outside" listener (below)
+                    // from closing the menu this click is about to open: the
+                    // press is swallowed at the toggle. Without it, every
+                    // mousedown on a toggle closed the open menu and the
+                    // following click reopened the same one, so a second click
+                    // on File could never close it.
+                    let swallow = Closure::<dyn FnMut(MouseEvent)>::new(|evt: MouseEvent| {
+                        evt.stop_propagation();
+                    });
+                    toggle
+                        .add_event_listener_with_callback("mousedown", swallow.as_ref().unchecked_ref())
+                        .ok();
+                    swallow.forget();
+
                     let dd = dropdown.clone();
+                    let tg = toggle.clone();
+                    let menu = open_handle.clone();
                     let toggle_closure =
-                        Closure::<dyn FnMut(MouseEvent)>::new(move |_: MouseEvent| {
-                            if let Some(html) = dd.dyn_ref::<HtmlElement>() {
-                                let disp = html
-                                    .style()
-                                    .get_property_value("display")
-                                    .unwrap_or_default();
-                                if disp == "none" {
-                                    html.style().set_property("display", "block").ok();
-                                } else {
-                                    html.style().set_property("display", "none").ok();
-                                }
+                        Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
+                            // Second click on the same toggle closes it; any
+                            // other toggle closes what is open and opens this.
+                            if menu_open_is(&menu, &dd) {
+                                close_open_menu(&menu);
+                            } else {
+                                close_open_menu(&menu);
+                                open_menu_entry(&menu, &dd, Some(tg.as_ref()));
                             }
+                            evt.stop_propagation();
                         });
                     toggle
                         .add_event_listener_with_callback(
@@ -1947,10 +2646,49 @@ impl AsElement for MenuBar {
             }
         }
 
+        // The two other ways a menu closes, both DOM-level because a menu has
+        // no modal loop of its own:
+        //
+        //   * a click anywhere outside it (the page, the sheet canvas, another
+        //     window's chrome) -- the `click outside` rule every menubar has;
+        //   * `Escape`, wherever focus is.
+        //
+        // Both go through `close_open_menu`, so the bar's `open` cell (which
+        // decides whether keys are routed as mnemonics) is cleared with the
+        // DOM, and typing works again after a menu is dismissed.
+        {
+            let menu = open_handle.clone();
+            let dismiss = Closure::<dyn FnMut(Event)>::new(move |evt: Event| {
+                if !menu_active_in(&menu) {
+                    return;
+                }
+                // A click inside the open menu, or on the bar, is handled by
+                // the handlers above (they stop propagation); anything that
+                // reaches the document is outside.
+                close_open_menu(&menu);
+                // Keep the click that dismissed the menu from also acting on
+                // whatever it landed on: the first click after a menu should
+                // close it, not press a cell.
+                evt.stop_propagation();
+                evt.prevent_default();
+            });
+            if let Some(win) = web_sys::window() {
+                if let Some(doc) = win.document() {
+                    let _ = doc.add_event_listener_with_callback(
+                        "mousedown",
+                        dismiss.as_ref().unchecked_ref(),
+                    );
+                }
+            }
+            // Leaked like the canvas listeners: the menubar lives for the
+            // page's lifetime.
+            dismiss.forget();
+        }
+
         Ok(MenuBar {
             elem: bar,
             entries: Rc::new(RefCell::new(entries)),
-            open: Rc::new(RefCell::new(None)),
+            open: open_handle,
             selected: Rc::new(RefCell::new(0)),
             closures: Rc::new(RefCell::new(Vec::new())),
         })
@@ -2732,6 +3470,22 @@ impl SimpleAction {
     // -----------------------------------------------------------------------
     pub struct WasmDrawContext {
         ctx: web_sys::CanvasRenderingContext2d,
+        /// The context state already set, so a repeated value is not written
+        /// again.
+        ///
+        /// A canvas keeps `font` and `fillStyle` between calls, and assigning
+        /// either parses a CSS value -- 6662 fill-style writes and 380 font
+        /// writes per frame for a handful of distinct values, every one of them
+        /// across the wasm/JS boundary. Skipping a write that would not change
+        /// anything is measured: it takes the per-cell cost out of the frame.
+        state: RefCell<FrameState>,
+    }
+
+    /// See [`WasmDrawContext::state`].
+    #[derive(Default)]
+    struct FrameState {
+        font: Option<String>,
+        fill: Option<String>,
     }
 
     impl WasmDrawContext {
@@ -2740,7 +3494,21 @@ impl SimpleAction {
             let slant_str = if slant != 0 { "italic " } else { "" };
             let size_str = format!("{}px", size);
             let f = format!("{}{} {} {}", slant_str, weight_str, size_str, font);
-            let _ = self.ctx.set_font(&f);
+            let mut state = self.state.borrow_mut();
+            if state.font.as_ref() != Some(&f) {
+                let _ = self.ctx.set_font(&f);
+                state.font = Some(f);
+            }
+        }
+
+        /// Set `fillStyle`, unless the context already has that colour.
+        fn set_fill(&self, r: f64, g: f64, b: f64, a: f64) {
+            let colour = Self::rgba(r, g, b, a);
+            let mut state = self.state.borrow_mut();
+            if state.fill.as_ref() != Some(&colour) {
+                let _ = self.ctx.set_fill_style_str(&colour);
+                state.fill = Some(colour);
+            }
         }
 
         fn rgba(r: f64, g: f64, b: f64, a: f64) -> String {
@@ -2750,32 +3518,92 @@ impl SimpleAction {
 
     impl crate::core::DrawContext for WasmDrawContext {
         fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64) {
-            let _ = self.ctx.set_fill_style_str(&Self::rgba(r, g, b, a));
+            // A fill with no area is a no-op everywhere else (Cairo and GDI
+            // both ignore it), and here it *throws*: `fillRect` rejects a
+            // non-finite argument, and one call site passes the width of an
+            // empty string's underline. Ignoring it keeps a frame painting
+            // instead of aborting at the first empty cell.
+            if !(w > 0.0 && h > 0.0) {
+                return;
+            }
+            self.set_fill(r, g, b, a);
             self.ctx.fill_rect(x, y, w, h);
         }
 
         fn stroke_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64, lw: f64) {
+            // A stroke straddles its path, so a 1px line at an integer
+            // coordinate is half outside the shape it outlines and half
+            // outside the cell -- and under a scale it is antialiased across
+            // two device pixels at 50%. Inset by half the line width: the path
+            // then falls on the pixel boundary the way GDI/Cairo's
+            // `stroke_rect` at these coordinates is drawn.
+            if !(w > 0.0 && h > 0.0) {
+                return;
+            }
+            // Sub-pixel widths are drawn as a filled edge instead: a 0.5px
+            // stroke is what the shared renderer asks for on a cell boundary
+            // (`stroke_rect(.., 0.5)`), and a canvas hairline is antialiased
+            // across two device pixels at half the requested opacity -- faint
+            // enough that a grid whose cells are all the same fill looks like
+            // one blank pane. A 1px fill at the same alpha is the same line,
+            // drawn at the intensity that was asked for.
+            //
+            // Only the horizontal edge is drawn for a wide, shallow box, which
+            // is what every 0.5px call in this codebase is: a cell's bottom
+            // rule, the underline of a hyperlink, the top edge of a band.
+            // Drawing all four sides of a cell would put a hairline down every
+            // column boundary at twice the intensity the caller asked for, and
+            // on a grid whose columns are all the same fill that reads as a
+            // change to the layout rather than to the line.
+            if lw < 1.0 {
+                let _ = self.ctx.set_fill_style_str(&Self::rgba(r, g, b, a));
+                if w >= h {
+                    self.ctx.fill_rect(x.floor(), y.floor(), w.round().max(1.0), 1.0);
+                } else {
+                    self.ctx.fill_rect(x.floor(), y.floor(), 1.0, h.round().max(1.0));
+                }
+                // The snap below is for the *filled* edge; the 0.5px cell rule
+                // that callers also draw is deliberately left as a stroke. A
+                // filled hairline reads as a hard gridline and changes the
+                // layout the eyes see; a stroked one is the faint rule the
+                // shared renderer means.
+                return;
+            }
+            let inset = lw / 2.0;
             let _ = self.ctx.set_stroke_style_str(&Self::rgba(r, g, b, a));
             self.ctx.set_line_width(lw);
-            self.ctx.stroke_rect(x, y, w, h);
+            self.ctx.stroke_rect(x + inset, y + inset, w - lw, h - lw);
         }
 
         fn draw_text_styled(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64,
                             r: f64, g: f64, b: f64, a: f64, slant: i32, weight: i32) {
             self.set_font(font, size, slant, weight);
-            let _ = self.ctx.set_fill_style_str(&Self::rgba(r, g, b, a));
+            self.set_fill(r, g, b, a);
+            // `y` is the text *top*, as on GTK, and there are two ways to
+            // honour that in a DOM canvas: add the ascent to get the baseline,
+            // or set `textBaseline = "top"` and pass `y` through. The second is
+            // what this does, because `top` is defined as the top of the *em
+            // box*, i.e. exactly the origin the shared renderer positions
+            // against -- no metric has to be re-derived, and the glyphs land
+            // inside the caller's box rather than above it. (An earlier version
+            // added an ascent to `y` and then nudged the result; the nudge was
+            // a fudge factor for the mismatch it had introduced, and it is gone
+            // with the ascent.)
+            let _ = self.ctx.set_text_baseline("top");
             let _ = self.ctx.fill_text(text, x, y);
         }
 
         fn text_extents_styled(&self, text: &str, font: &str, size: f64, slant: i32, weight: i32) -> (f64, f64, f64, f64) {
-            let weight_str = if weight != 0 { "bold" } else { "" };
-            let slant_str = if slant != 0 { "italic " } else { "" };
-            let size_str = format!("{}px", size);
-            let f = format!("{}{} {} {}", slant_str, weight_str, size_str, font);
-            self.ctx.save();
-            let _ = self.ctx.set_font(&f);
-            let metrics = self.ctx.measure_text(text).expect("measure_text failed");
-            self.ctx.restore();
+            // Set the font directly rather than save/restore around it: a
+            // measure must not disturb the caller's font *within a frame*,
+            // but the next draw sets the font again for its own text (and
+            // `set_font` skips a redundant write), so the save/restore pair --
+            // two more cross-boundary calls per measured string, and 62 per
+            // frame here -- buys nothing.
+            self.set_font(font, size, slant, weight);
+            let Some(metrics) = self.ctx.measure_text(text).ok() else {
+                return (0.0, 0.0, 0.0, 0.0);
+            };
             let w = metrics.width();
             let xb = -metrics.actual_bounding_box_left();
             let yb = -metrics.actual_bounding_box_ascent();
@@ -2783,12 +3611,25 @@ impl SimpleAction {
             (xb, yb, w, h)
         }
 
+        /// Paint the whole surface.
+        ///
+        /// This has to ignore the current path, clip and transform, where
+        /// `fill_rect` honours all three: the caller's clip is not reset
+        /// between frames (nothing un-`clip`s in this adapter), so a `clear`
+        /// that filled a rect would be clipped to the *previous* frame's
+        /// clip -- and a first frame clipped to a stale region leaves the rest
+        /// of the canvas as the browser cleared it. `fillRect` under an
+        /// identity transform over the backing store's own pixel size is the
+        /// one operation that always covers everything.
         fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
+            let _ = self.ctx.save();
+            let _ = self.ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
             let _ = self.ctx.set_fill_style_str(&Self::rgba(r, g, b, a));
             let canvas = self.ctx.canvas().unwrap();
             let w = canvas.width() as f64;
             let h = canvas.height() as f64;
             self.ctx.fill_rect(0.0, 0.0, w, h);
+            let _ = self.ctx.restore();
         }
 
         /// Blit a straight-alpha RGBA8 image at `(x, y)`, scaled by `scale`.
@@ -2918,6 +3759,18 @@ impl SimpleAction {
         gesture_cb: Rc<RefCell<Option<Box<dyn FnMut(crate::core::Gesture)>>>>,
         /// `(x, y, button, modifier mask)`, for a release.
         release_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64, u32, u32)>>>>,
+        /// The live CSS-box size, mirrored into the backing store by
+        /// [`Canvas::sync_backing_store`]. See that method for why the two
+        /// sizes are not the same number.
+        ///
+        /// `Cell` (not `RefCell`) on purpose: this is read and written from
+        /// inside the draw path and from a `ResizeObserver` callback, and both
+        /// can run while a `draw_cb` borrow is live. A `try_borrow` would have
+        /// to degrade to "skip this frame", which is the blank-canvas bug
+        /// again, one layer down.
+        css_size: Rc<Cell<(f64, f64)>>,
+        /// A frame is already scheduled; see [`Canvas::queue_redraw`].
+        redraw_pending: Rc<Cell<bool>>,
         closures: Rc<RefCell<Vec<Box<dyn Any>>>>,
     }
 
@@ -2951,6 +3804,8 @@ impl SimpleAction {
                 key_raw_cb: self.key_raw_cb.clone(),
                 gesture_cb: self.gesture_cb.clone(),
                 release_cb: self.release_cb.clone(),
+                css_size: self.css_size.clone(),
+                redraw_pending: self.redraw_pending.clone(),
                 closures: self.closures.clone(),
             }
         }
@@ -2959,28 +3814,341 @@ impl SimpleAction {
     impl Canvas {
         pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
             *self.draw_cb.borrow_mut() = Some(cb);
+            // Register the size source *after* the callback: a ResizeObserver
+            // reports the element's current box as soon as it is observed, so
+            // a canvas that already has a size draws in this same turn.
+            self.observe_css_size();
             self.queue_redraw();
         }
 
-        pub fn queue_redraw(&self) {
-            if let Some(ref mut draw_fn) = *self.draw_cb.borrow_mut() {
-                let ctx = self.elem.get_context("2d")
-                    .ok().flatten()
-                    .and_then(|o| o.dyn_into::<web_sys::CanvasRenderingContext2d>().ok());
-                if let Some(ctx) = ctx {
-                    let w = self.elem.width() as i32;
-                    let h = self.elem.height() as i32;
-                    let mut dc = WasmDrawContext { ctx };
-                    draw_fn(&mut dc, w, h);
+        /// Mirror the canvas's CSS box into its backing store, returning
+        /// `(device_width, device_height)`.
+        ///
+        /// A `<canvas>` has two sizes and they are not the same number:
+        /// `width`/`height` attributes are the backing store in *device*
+        /// pixels, while CSS `width`/`height` are the element's box in *CSS*
+        /// pixels. Draw code works in the backing store; pointer events report
+        /// CSS pixels. Leaving the backing store at its default 300×150 while
+        /// the box is stretched to a phone screen therefore draws one small
+        /// image into the corner of a large, otherwise blank element.
+        ///
+        /// The CSS size is read from `getBoundingClientRect`, not from the
+        /// `width`/`height` attributes, precisely so a stylesheet (flex
+        /// growth, `height: 100%`) decides the size -- the same division of
+        /// labour GTK has, where the allocation comes from the box and the
+        /// widget asks for it.
+        ///
+        /// At least 1px in each direction: a zero-sized backing store makes
+        /// `getContext('2d')` paint into nothing, and a display:none canvas
+        /// reports exactly zero.
+        fn sync_backing_store(&self) -> (i32, i32) {
+            self.measure_with_backing_store().1
+        }
+
+        /// The box, and the backing-store size it implies.
+        ///
+        /// `.0` is the CSS size the *element* was laid out at; `.1` is the
+        /// device size the *canvas* is. They differ by `devicePixelRatio` and
+        /// by the fractional-pixel rounding, which is exactly why the caller
+        /// that assigns `width`/`height` (and so resets the canvas) is the one
+        /// that needs both.
+        fn measure_with_backing_store(&self) -> ((f64, f64), (i32, i32)) {
+            // Skip measuring a canvas that is not in the layout: a hidden
+            // one reports 0x0, which would put the backing store at 1x1 and
+            // hand the draw callback a surface that has to be redrawn from
+            // scratch the moment the canvas is shown. `visibility`/`opacity`
+            // are left out on purpose -- those keep the box, so the size is
+            // real and the redraw is useful.
+            let hidden = js_sys::Reflect::get(self.elem.as_ref(), &wasm_bindgen::JsValue::from_str("offsetParent"))
+                .map(|v| v.is_null() || v.is_undefined())
+                .unwrap_or(false)
+                && self.elem.client_width() == 0
+                && self.elem.client_height() == 0;
+            if hidden {
+                let w = self.elem.width().max(1) as i32;
+                let h = self.elem.height().max(1) as i32;
+                return (self.css_size.get(), (w, h));
+            }
+            let rect = self.elem.get_bounding_client_rect();
+            let css_w = rect.width().max(0.0);
+            let css_h = rect.height().max(0.0);
+            self.css_size.set((css_w, css_h));
+            // `devicePixelRatio` is the number of device pixels per CSS pixel;
+            // on a 2x display a 400px-wide canvas needs an 800px backing store
+            // or every glyph is upscaled and soft. A page zoom changes it, so
+            // it is read per resize rather than cached.
+            let dpr = web_sys::window()
+                .map(|w| w.device_pixel_ratio())
+                .unwrap_or(1.0)
+                .clamp(1.0, 4.0);
+            // Snap to whole device pixels, not up: a canvas is an inline
+            // replaced element whose box is driven by the *attribute* size
+            // when CSS leaves that dimension to the content, so a backing store
+            // rounded up from a fractional box grows the box, which rounds the
+            // next store up again -- a ladder that ends with the sheet taller
+            // than the page. Rounding to nearest is a fixed point of that
+            // relation: a box at 612.5px yields a 612px (or 613px) store, and
+            // the box then stays where the layout put it.
+            let dw = ((css_w * dpr).round() as u32).max(1) as i32;
+            let dh = ((css_h * dpr).round() as u32).max(1) as i32;
+            ((css_w, css_h), (dw, dh))
+        }
+
+        /// Assign the backing store, and draw if it moved.
+        ///
+        /// Assigning `width`/`height` *resets* the canvas: the bitmap is
+        /// cleared and the 2d context goes back to its defaults (transform,
+        /// clip, fill, font). A frame already on screen therefore must not be
+        /// measured again unless it is about to be redrawn -- and a `queue_redraw`
+        /// that resets the surface and then cannot draw (no context) would
+        /// leave the canvas blank. So the reset and the draw are one step: the
+        /// size is compared first, and only a real change re-enters the draw
+        /// callback with the new surface.
+        ///
+        /// Returns the size to report to the caller: the *box* size while the
+        /// backing store is unchanged (that is the size on screen), the new
+        /// device size when the store was reset for it.
+        fn sync_and_redraw(&self) -> Option<(i32, i32)> {
+            let (css, device) = self.measure_with_backing_store();
+            let unchanged = self.elem.width() as i32 == device.0 && self.elem.height() as i32 == device.1;
+            if unchanged {
+                return None;
+            }
+            self.elem.set_width(device.0 as u32);
+            self.elem.set_height(device.1 as u32);
+            let _ = css;
+            Some(device)
+        }
+
+        /// Re-draw whenever the element's box changes, from the browser's own
+        /// resize notifications.
+        ///
+        /// GTK gets this for free: the container allocates the drawing area
+        /// and `set_draw_func` runs for every frame. A `ResizeObserver` is the
+        /// DOM's equivalent -- it fires once when observation starts (with the
+        /// current box) and again after every change, including the ones a
+        /// stylesheet causes that no window `resize` event would report
+        /// (chrome appearing, a scrollbar vanishing).
+        ///
+        /// Called once from `set_draw_callback`, which is once per canvas.
+        fn observe_css_size(&self) {
+            let elem = self.elem.clone();
+            let size = self.css_size.clone();
+            let draw = self.draw_cb.clone();
+            let closure = Closure::<dyn FnMut(js_sys::Array)>::new(move |_entries: js_sys::Array| {
+                let rect = elem.get_bounding_client_rect();
+                // Skip the notification when the box did not actually change:
+                // a redraw of the whole grid is not free, and observing an
+                // element reports its size even if nothing moved.
+                let new = (rect.width().max(0.0), rect.height().max(0.0));
+                if size.get() == new {
+                    return;
+                }
+                size.set(new);
+                // Re-enter through the same path a caller's `queue_redraw`
+                // takes, so the backing store, the draw callback and the
+                // size the caller is told about cannot disagree.
+                if let Some(draw_fn) = draw.borrow_mut().as_mut() {
+                    let dpr = web_sys::window()
+                        .map(|w| w.device_pixel_ratio())
+                        .unwrap_or(1.0)
+                        .clamp(1.0, 4.0);
+                    let dw = ((rect.width() * dpr).ceil() as u32).max(1);
+                    let dh = ((rect.height() * dpr).ceil() as u32).max(1);
+                    elem.set_width(dw);
+                    elem.set_height(dh);
+                    if let Some(ctx) = elem
+                        .get_context("2d")
+                        .ok()
+                        .flatten()
+                        .and_then(|o| o.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
+                    {
+                        // Same device-pixel transform as `queue_redraw`: the
+                        // draw callback works in backing-store pixels, and the
+                        // context's units are backing-store pixels, so the
+                        // scale makes the caller's CSS-pixel geometry come out
+                        // at the right physical size.
+                        let _ = ctx.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0);
+                        let mut dc = WasmDrawContext { ctx, state: RefCell::new(FrameState::default()) };
+                        // One save/restore pair per frame, so a clip the caller
+                        // set cannot outlive the frame that set it: `clip` only
+                        // ever narrows, and `restore` is the DOM's only un-clip.
+                        // The caller's `clear` runs its own save/restore with an
+                        // identity transform, so a stale clip would otherwise
+                        // survive into it and leave everything outside the old
+                        // region unpainted.
+                        let _ = dc.ctx.save();
+                        draw_fn(&mut dc, dw as i32, dh as i32);
+                        let _ = dc.ctx.restore();
+                        let _ = dc.ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+                    }
+                }
+            });
+            if let Some(win) = web_sys::window() {
+                if let Ok(ro) = js_sys::Reflect::get(&win, &wasm_bindgen::JsValue::from_str("ResizeObserver"))
+                    .and_then(|c| c.dyn_into::<js_sys::Function>())
+                {
+                    if let Ok(obj) = js_sys::Reflect::construct(&ro, &js_sys::Array::new()) {
+                        let observe = js_sys::Reflect::get(&obj, &wasm_bindgen::JsValue::from_str("observe"))
+                            .ok()
+                            .and_then(|f| f.dyn_into::<js_sys::Function>().ok());
+                        if let Some(observe) = observe {
+                            let _ = observe.call1(&obj, self.elem.as_ref());
+                        }
+                        // The observer must outlive this call: a dropped
+                        // `Closure` frees the JS trampoline the observer still
+                        // points at. One per canvas, for the life of the page.
+                        let _ = js_sys::Reflect::set(
+                            &obj,
+                            &wasm_bindgen::JsValue::from_str("onresize"),
+                            closure.as_ref(),
+                        );
+                        closure.forget();
+                        return;
+                    }
                 }
             }
+            // No ResizeObserver (a pre-2019 engine): size once from the box
+            // and leave a later resize to `queue_redraw`, which re-measures.
+            let _ = self.sync_backing_store();
+        }
+
+
+        /// Schedule a repaint, coalescing every request made before the next
+        /// animation frame into one draw.
+        ///
+        /// A desktop toolkit works this way: `gtk_widget_queue_draw` only marks
+        /// the widget, and the frame arrives later, once. Drawing at the point
+        /// of the call is what made the browser build slow -- one keypress asks
+        /// for a repaint from every handler it runs through (the window
+        /// handler, the canvas handler, the entry, `sync_chrome_labels`, the
+        /// status line), and each request was a full grid render: three
+        /// 2000-cell frames for one arrow key, each one sent to the compositor.
+        /// Coalescing turns that into one.
+        pub fn queue_redraw(&self) {
+            if self.draw_cb.borrow().is_none() {
+                return;
+            }
+            // Requested while a frame is being painted: it belongs to the
+            // frame after it, which `flush_pending_frame` schedules once the
+            // paint returns.
+            if FRAME_OPEN.with(|f| f.get()) {
+                REDRAW_AFTER_FRAME.with(|f| f.set(true));
+                self.redraw_pending.set(true);
+                return;
+            }
+            // One of many requests before the frame.
+            if self.redraw_pending.get() {
+                return;
+            }
+            self.redraw_pending.set(true);
+            let canvas = self.clone();
+            let run = move || {
+                canvas.redraw_pending.set(false);
+                canvas.draw_now();
+            };
+            let Some(win) = web_sys::window() else {
+                // No frame scheduler: draw now, so "drawn when I return" holds.
+                run();
+                return;
+            };
+            let cb = Closure::<dyn FnMut()>::new(run);
+            if win
+                .request_animation_frame(cb.as_ref().unchecked_ref())
+                .is_ok()
+            {
+                // The scheduled frame owns the callback until it runs.
+                cb.forget();
+                return;
+            }
+            // `requestAnimationFrame` refuses outside a document: draw now
+            // rather than never.
+            let canvas = self.clone();
+            canvas.redraw_pending.set(false);
+            canvas.draw_now();
+        }
+
+        /// Draw the current frame, in this turn.
+        fn draw_now(&self) {
+            if self.draw_cb.borrow().is_none() {
+                return;
+            }
+            let Some(ctx) = self
+                .elem
+                .get_context("2d")
+                .ok()
+                .flatten()
+                .and_then(|o| o.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
+            else {
+                return;
+            };
+            // The CSS box decides the size; the backing store follows it. See
+            // `sync_and_redraw` for why the reset and the draw are one step:
+            // assigning `width`/`height` clears the canvas, so painting before
+            // that assignment would be erased by it.
+            let (w, h) = match self.sync_and_redraw() {
+                Some(device) => device,
+                None => (self.elem.width() as i32, self.elem.height() as i32),
+            };
+            // Draw in device pixels: the 2d context's units are backing-store
+            // pixels, so the transform maps them back to CSS pixels for a caller
+            // that thinks in points (text sizes, hit tests), and a
+            // `devicePixelRatio`-aware canvas is crisp rather than upscaled.
+            let dpr = web_sys::window()
+                .map(|w| w.device_pixel_ratio())
+                .unwrap_or(1.0)
+                .clamp(1.0, 4.0);
+            let _ = ctx.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0);
+            let mut dc = WasmDrawContext { ctx, state: RefCell::new(FrameState::default()) };
+            // One save/restore pair per frame, so a clip the caller set cannot
+            // outlive the frame that set it. The wasm adapter's `clip` narrows
+            // the context's clip region, and `restore` is the DOM's only
+            // un-clip; without this the next frame's `clear` (which runs its own
+            // save/restore with an identity transform) would still be clipped to
+            // the previous frame's region.
+            let _ = dc.ctx.save();
+            // A repaint requested *during* this paint belongs to the next
+            // frame: flagging the frame is what stops the app's own
+            // "schedule a redraw" (86 call sites, several reached from the
+            // draw itself) from being swallowed as "already pending".
+            LAST_CANVAS.with(|c| *c.borrow_mut() = Some(self.clone()));
+            FRAME_OPEN.with(|f| f.set(true));
+            if let Some(draw_fn) = self.draw_cb.borrow_mut().as_mut() {
+                draw_fn(&mut dc, w, h);
+            }
+            FRAME_OPEN.with(|f| f.set(false));
+            let _ = dc.ctx.restore();
+            let _ = dc.ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
         }
 
         pub fn set_size_request(&self, w: i32, h: i32) {
-            if w > 0 { self.elem.set_width(w as u32); }
-            if h > 0 { self.elem.set_height(h as u32); }
-            set_css(self.elem.as_ref(), "width", &format!("{}px", w));
-            set_css(self.elem.as_ref(), "height", &format!("{}px", h));
+            set_css(self.elem.as_ref(), "min-width", &format!("{}px", w.max(0)));
+            set_css(self.elem.as_ref(), "min-height", &format!("{}px", h.max(0)));
+            // The element also needs a size of its own to fill: a `<canvas>`
+            // is a replaced element with an intrinsic 300x150, and inside a
+            // flex column that is what it gets unless told otherwise.
+            set_css(self.elem.as_ref(), "width", "100%");
+            set_css(self.elem.as_ref(), "height", "100%");
+            set_css(self.elem.as_ref(), "box-sizing", "border-box");
+        }
+
+        /// The size this canvas is drawn at, in backing-store pixels.
+        ///
+        /// Measured, not remembered. The app keeps its own copy of the canvas
+        /// size for hit-testing, and the two have to agree with the surface the
+        /// browser will hand the draw callback -- which can change without any
+        /// app event (a scrollbar, an orientation change, DevTools docking).
+        /// Reading the box here is the only way for the app to notice before
+        /// the click that needs it. The box, not the backing store: the grid
+        /// is drawn in style pixels (see `local_point`).
+        pub fn measure(&self) -> (i32, i32) {
+            // The style box. The app hit-tests the pointer against this and
+            // draws the grid at this scale; the backing store is that box
+            // times `devicePixelRatio` and describes a *surface*, not a
+            // layout -- and it is assigned by the first frame, so reading it
+            // before then answered 300x150.
+            let (css, _device) = self.measure_with_backing_store();
+            ((css.0.round().max(1.0)) as i32, (css.1.round().max(1.0)) as i32)
         }
 
         pub fn set_content_size(&self, w: i32, h: i32) {
@@ -3030,8 +4198,11 @@ impl SimpleAction {
         ///   check rather than bookkeeping.
         /// * `wheel` -> [`Gesture::Scroll`].
         ///
-        /// Coordinates are `offset_x`/`offset_y`, i.e. widget-relative, which
-        /// is what `Gesture` documents and what the other backends deliver.
+        /// Coordinates are the event's `offset_x`/`offset_y`, i.e.
+        /// widget-relative, which is what `Gesture` documents and what the
+        /// other backends deliver — then scaled from CSS pixels to
+        /// backing-store pixels by [`local_point`], so a gesture lands on the
+        /// cell it was aimed at on a hi-DPI display or a zoomed page.
         /// `getBoundingClientRect` would give page coordinates, and
         /// subtracting it per event would be a way to be off by a scroll
         /// position.
@@ -3047,13 +4218,16 @@ impl SimpleAction {
             // pointerdown / pointerup -> Button
             for (event, pressed) in [("pointerdown", true), ("pointerup", false)] {
                 let cell = self.gesture_cb.clone();
+                let size = self.css_size.clone();
+                let elem = self.elem.clone();
                 let closure =
                     Closure::<dyn FnMut(web_sys::PointerEvent)>::new(move |evt: web_sys::PointerEvent| {
+                        let (x, y) = local_point(evt.offset_x() as f64, evt.offset_y() as f64, &size, &elem);
                         let gesture = crate::core::Gesture::Button {
                             button: button_from_dom(evt.button()),
                             pressed,
-                            x: evt.offset_x() as f64,
-                            y: evt.offset_y() as f64,
+                            x,
+                            y,
                             mods: modifiers_from(&evt),
                         };
                         // `try_borrow_mut` so a handler that re-enters (by
@@ -3075,11 +4249,12 @@ impl SimpleAction {
             // pointermove -> Hover or Drag
             {
                 let cell = self.gesture_cb.clone();
+                let size = self.css_size.clone();
+                let elem = self.elem.clone();
                 let closure = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
                     move |evt: web_sys::PointerEvent| {
                         let mods = modifiers_from(&evt);
-                        let x = evt.offset_x() as f64;
-                        let y = evt.offset_y() as f64;
+                        let (x, y) = local_point(evt.offset_x() as f64, evt.offset_y() as f64, &size, &elem);
                         // `buttons` is a bitmask: 1 = primary, 2 = secondary,
                         // 4 = middle. Any bit set means a drag; none means a
                         // hover. The DOM makes this distinction directly,
@@ -3105,6 +4280,59 @@ impl SimpleAction {
                 self.closures.borrow_mut().push(Box::new(closure));
             }
 
+            // `scroll` -> Scroll, for a drag the DOM reports as a scroll.
+            //
+            // A touchpad two-finger drag and a touch swipe arrive as native
+            // `scroll`, not `wheel` (the browser converts the swipe into a
+            // scroll of the element under the finger). Without this listener
+            // neither moves the sheet. The delta is the *change* in
+            // `scrollLeft`/`scrollTop`, so the element does not move and the
+            // app receives the same pixels a wheel would have delivered; the
+            // position is the element's centre, because a scroll event carries
+            // no pointer coordinates of its own.
+            {
+                let cell = self.gesture_cb.clone();
+                let elem = self.elem.clone();
+                let last: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
+                let size = self.css_size.clone();
+                let closure = Closure::<dyn FnMut(Event)>::new(move |_evt: Event| {
+                    // Scroll positions round to whole pixels, so a horizontal
+                    // scroll that keeps `scrollTop` fixed must report a zero
+                    // vertical delta rather than a phantom one.
+                    let now = (elem.scroll_left() as f64, elem.scroll_top() as f64);
+                    let (lx, ly) = last.get();
+                    let (dx, dy) = if now.0 < lx || now.1 < ly {
+                        // The element was scrolled programmatically (a
+                        // `ScrollIntoView`), not by the user: there is no
+                        // gesture to report.
+                        (0.0, 0.0)
+                    } else {
+                        (now.0 - lx, now.1 - ly)
+                    };
+                    last.set(now);
+                    if dx == 0.0 && dy == 0.0 {
+                        return;
+                    }
+                    let cx = elem.client_width() as f64 / 2.0;
+                    let cy = elem.client_height() as f64 / 2.0;
+                    let gesture = crate::core::Gesture::Scroll {
+                        delta: crate::core::ScrollDelta { dx, dy },
+                        x: local_point(cx, cy, &size, &elem).0,
+                        y: local_point(cx, cy, &size, &elem).1,
+                        mods: crate::core::Modifiers::default(),
+                    };
+                    if let Ok(mut slot) = cell.try_borrow_mut() {
+                        if let Some(f) = slot.as_mut() {
+                            f(gesture);
+                        }
+                    }
+                });
+                self.elem
+                    .add_event_listener_with_callback("scroll", closure.as_ref().unchecked_ref())
+                    .ok();
+                self.closures.borrow_mut().push(Box::new(closure));
+            }
+
             // wheel -> Scroll
             {
                 let cell = self.gesture_cb.clone();
@@ -3113,6 +4341,7 @@ impl SimpleAction {
                 // call. `HtmlCanvasElement` is a JsCast handle, so cloning it
                 // is a refcount bump on the same DOM node.
                 let elem = self.elem.clone();
+                let size = self.css_size.clone();
                 let closure =
                     Closure::<dyn FnMut(web_sys::WheelEvent)>::new(move |evt: web_sys::WheelEvent| {
                         // `deltaMode` is 0 for pixels, 1 for lines, 2 for pages.
@@ -3135,8 +4364,8 @@ impl SimpleAction {
                         };
                         let gesture = crate::core::Gesture::Scroll {
                             delta: crate::core::ScrollDelta { dx, dy },
-                            x: evt.offset_x() as f64,
-                            y: evt.offset_y() as f64,
+                            x: local_point(evt.offset_x() as f64, evt.offset_y() as f64, &size, &elem).0,
+                            y: local_point(evt.offset_x() as f64, evt.offset_y() as f64, &size, &elem).1,
                             mods: crate::core::Modifiers {
                                 shift: evt.shift_key(),
                                 ctrl: evt.ctrl_key(),
@@ -3161,11 +4390,13 @@ impl SimpleAction {
         pub fn on_click_button(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
             *self.click_button_cb.borrow_mut() = Some(cb);
             let cell = self.click_button_cb.clone();
+            let size = self.css_size.clone();
+            let elem = self.elem.clone();
             let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
                 if let Some(f) = cell.borrow_mut().as_mut() {
                     f(
-                        evt.offset_x() as f64,
-                        evt.offset_y() as f64,
+                        local_point(evt.offset_x() as f64, evt.offset_y() as f64, &size, &elem).0,
+                        local_point(evt.offset_x() as f64, evt.offset_y() as f64, &size, &elem).1,
                         evt.button() as u32,
                         gdk_modifier_mask_mouse(&evt),
                     );
@@ -3185,11 +4416,13 @@ impl SimpleAction {
         pub fn on_motion(&self, cb: Box<dyn FnMut(f64, f64, u32)>) {
             *self.motion_cb.borrow_mut() = Some(cb);
             let cell = self.motion_cb.clone();
+            let size = self.css_size.clone();
+            let elem = self.elem.clone();
             let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
                 if let Some(f) = cell.borrow_mut().as_mut() {
                     f(
-                        evt.offset_x() as f64,
-                        evt.offset_y() as f64,
+                        local_point(evt.offset_x() as f64, evt.offset_y() as f64, &size, &elem).0,
+                        local_point(evt.offset_x() as f64, evt.offset_y() as f64, &size, &elem).1,
                         gdk_modifier_mask_mouse(&evt),
                     );
                 }
@@ -3223,11 +4456,13 @@ impl SimpleAction {
         pub fn on_release(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
             *self.release_cb.borrow_mut() = Some(cb);
             let cell = self.release_cb.clone();
+            let size = self.css_size.clone();
+            let elem = self.elem.clone();
             let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
                 if let Some(f) = cell.borrow_mut().as_mut() {
                     f(
-                        evt.offset_x() as f64,
-                        evt.offset_y() as f64,
+                        local_point(evt.offset_x() as f64, evt.offset_y() as f64, &size, &elem).0,
+                        local_point(evt.offset_x() as f64, evt.offset_y() as f64, &size, &elem).1,
                         evt.button() as u32,
                         gdk_modifier_mask_mouse(&evt),
                     );
@@ -3271,9 +4506,25 @@ impl SimpleAction {
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
             *self.click_cb.borrow_mut() = Some(cb);
             let cb2 = self.click_cb.clone();
+            let size = self.css_size.clone();
+            let elem = self.elem.clone();
             let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
-                if let Some(ref mut f) = *cb2.borrow_mut() {
-                    f(evt.offset_x() as f64, evt.offset_y() as f64);
+                // Take the callback *out* while it runs, and put it back
+                // afterwards.
+                //
+                // Calling it under `borrow_mut` made any re-entry from inside
+                // the handler a `RefCell` double-borrow -- a panic that aborts
+                // the wasm module, on a plain click. Re-entry is ordinary here:
+                // the press handler can open the in-grid aggregate dropdown,
+                // which paints and repaints through this same adapter. With
+                // the callback moved out, a nested press finds the slot empty
+                // and is skipped ("the press is already being handled"), and
+                // the outer call restores it on the way out.
+                let taken = cb2.borrow_mut().take();
+                if let Some(mut f) = taken {
+                    let (x, y) = local_point(evt.offset_x() as f64, evt.offset_y() as f64, &size, &elem);
+                    f(x, y);
+                    *cb2.borrow_mut() = Some(f);
                 }
             });
             self.elem
@@ -3344,6 +4595,8 @@ impl SimpleAction {
             key_raw_cb: Rc::new(RefCell::new(None)),
             gesture_cb: Rc::new(RefCell::new(None)),
             release_cb: Rc::new(RefCell::new(None)),
+            css_size: Rc::new(Cell::new((0.0, 0.0))),
+            redraw_pending: Rc::new(Cell::new(false)),
             closures: Rc::new(RefCell::new(Vec::new())),
         })
     }
@@ -3515,6 +4768,10 @@ impl SimpleAction {
                 self.elem.remove_child(&c).ok();
             }
             self.elem.append_child(child.as_element()).ok();
+            // The child is the drawing surface the gesture stream is attached
+            // to, and this element is the one that actually scrolls. See
+            // `forward_scroll_from` for why the two have to be connected.
+            forward_scroll_from(&self.elem, child.as_element());
         }
 
         /// Push the viewport position and domain into the scroll offset.

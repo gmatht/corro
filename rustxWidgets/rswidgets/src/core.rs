@@ -1164,6 +1164,106 @@ impl ZoomState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Popup placement (shared by every backend's menu popup)
+// ---------------------------------------------------------------------------
+//
+// A context menu must open *at the pointer* -- that is what every native
+// toolkit does, and an app that has to compute the point itself will get it
+// subtly wrong. But it also must not hang off the edge of the screen or hide
+// under the taskbar.
+//
+// That decision is the same on every platform, so it lives here rather than in
+// any one backend: a per-backend implementation is how the same behaviour ends
+// up inconsistent across platforms (one clamping, one flipping, one ignoring
+// the taskbar), which reads to a user as the menu "appearing at a random
+// position". Backends keep only the platform parts -- measuring the menu and
+// reading the work area -- and call this once with those numbers.
+
+/// A rectangle in absolute screen pixels.
+///
+/// The origin is the top-left of the *work area* on a single-display setup;
+/// a backend that supports multiple monitors reports the monitor the popup will
+/// appear on, which may have a non-zero origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// Where a popup should actually be drawn, after keeping it on screen.
+///
+/// **The contract:** the popup's top-left goes at `(x, y)` -- the pointer --
+/// unless that would put part of it off screen or under the taskbar, in which
+/// case it flips to the other side of that edge.
+///
+/// Flipping rather than clamping is deliberate:
+///
+/// * Clamping (`x = min(x, right - w)`) moves a popup that *would* have fit,
+///   so a menu near the bottom-right would drift up and left even though only
+///   one axis had a problem.
+/// * Clamping the top edge when flipping up would push the *bottom* back under
+///   the taskbar whenever the popup is taller than the space above the
+///   pointer. Pinning the bottom edge instead keeps the whole box inside.
+///
+/// Only the axis that does not fit is touched: a popup that overflows the
+/// right edge keeps the pointer's `y` exactly.
+///
+/// `work_area` is the monitor rectangle with the taskbar removed, never the
+/// raw screen: a popup whose bottom lands on the taskbar is off-screen in
+/// every sense that matters even though every pixel is inside `rcMonitor`.
+///
+/// A popup larger than the work area cannot be made fully visible either way;
+/// it is pinned to the work area's top-left so the start of the menu stays
+/// reachable and nothing is pushed past the far edge.
+pub fn place_popup(x: i32, y: i32, w: i32, h: i32, work_area: ScreenRect) -> (i32, i32) {
+    let w = w.max(0);
+    let h = h.max(0);
+    let avail_w = (work_area.right - work_area.left).max(0);
+    let avail_h = (work_area.bottom - work_area.top).max(0);
+
+    let x = if w > avail_w {
+        // Cannot fit on any axis: pin to the left edge.
+        work_area.left
+    } else if x < work_area.left {
+        // Left of the work area: pull in. Checked BEFORE the overflow test,
+        // because a pointer just inside the left edge can still overflow the
+        // right edge on a narrow work area -- and in that case flipping left is
+        // what would go off-screen, so staying at the pointer is correct.
+        work_area.left
+    } else if x + w > work_area.right {
+        // Would overflow the right edge -> flip to the left of the pointer,
+        // floored at the work area's left edge so the result is never negative.
+        (x - w).max(work_area.left)
+    } else {
+        x
+    };
+
+    let y = if h > avail_h {
+        work_area.top
+    } else if y < work_area.top {
+        work_area.top
+    } else if y + h > work_area.bottom {
+        // Would overflow the bottom edge (i.e. land on or behind the taskbar)
+        // -> flip above the pointer.
+        let flipped = y - h;
+        if flipped + h <= work_area.bottom {
+            flipped
+        } else {
+            // Taller than the space above the pointer: pin the *bottom* to the
+            // work area's bottom edge, which keeps the box inside and lets the
+            // list scroll.
+            work_area.bottom - h
+        }
+    } else {
+        y
+    };
+
+    (x, y)
+}
+
 /// Cross-platform 2D drawing surface.
 /// Each backend implements this trait with its own drawing primitives.
 pub trait DrawContext {
@@ -2668,7 +2768,22 @@ pub fn save_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])], _cu
     pub fn try_quit(&self) -> Result<(), String> {
         crate::backends_gtk_adapter::quit_main_loop().map_err(|e| format!("{e}"))
     }
-    #[cfg(not(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+    pub fn try_quit(&self) -> Result<(), String> {
+        // A browser is the one backend where quitting has real work to do:
+        // set the quit title and take the app's root off the page. Returning
+        // `Ok(())` here, as every other non-GTK backend does, meant the wasm
+        // "Exit" (and Ctrl+Q) went through `save_before_quit` and stopped --
+        // no `CORRO_QUIT`, no visible quit. See
+        // `backends_wasm_adapter::quit_main_loop`.
+        crate::backends_wasm_adapter::quit_main_loop();
+        Ok(())
+    }
+    #[cfg(not(any(
+        target_arch = "wasm32",
+        feature = "gtk4-rs",
+        all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))
+    )))]
     pub fn try_quit(&self) -> Result<(), String> {
         Ok(())
     }
@@ -2706,6 +2821,102 @@ impl From<Box<dyn crate::backends::BackendApp>> for App {
 mod tests {
     use super::*;
 
+#[test]
+    fn popup_keeps_the_mouse_point_when_it_fits() {
+        // Plenty of room in every direction: the popup lands exactly on the
+        // mouse, which is the whole contract.
+        let work = ScreenRect { left: 0, top: 0, right: 1920, bottom: 1040 };
+        assert_eq!(place_popup(500, 300, 200, 150, work), (500, 300));
+        // Flush against the far corner with room to spare is still exact.
+        assert_eq!(
+            place_popup(1920 - 200, 1040 - 150, 200, 150, work),
+            (1720, 890)
+        );
+    }
+
+    #[test]
+    fn popup_flips_left_and_up_rather_than_drifting() {
+        let work = ScreenRect { left: 0, top: 0, right: 1920, bottom: 1040 };
+        // Near the right edge: flip left, mouse's y untouched.
+        assert_eq!(place_popup(1900, 300, 200, 150, work), (1700, 300));
+        // Near the bottom: flip up, mouse's x untouched.
+        assert_eq!(place_popup(500, 1000, 200, 150, work), (500, 850));
+        // Both at once: both axes flip.
+        assert_eq!(place_popup(1900, 1000, 200, 150, work), (1700, 850));
+    }
+
+    #[test]
+    fn popup_never_lands_on_the_taskbar() {
+        // Work area is the screen minus a 40px taskbar at the bottom.
+        let work = ScreenRect { left: 0, top: 0, right: 1920, bottom: 1000 };
+        // A menu opened low on the screen must have its BOTTOM at or above
+        // 1000 -- inside rcMonitor (1080) but under the taskbar, which is the
+        // bug being pinned.
+        for mouse_y in 900..1080 {
+            let (x, y) = place_popup(100, mouse_y, 200, 150, work);
+            assert!(
+                y + 150 <= work.bottom,
+                "menu from y={mouse_y} placed at ({x},{y}) is {}px under the taskbar",
+                work.bottom - (y + 150)
+            );
+            assert!(x >= work.left && x + 200 <= work.right, "menu off-screen horizontally at ({x},{y})");
+        }
+    }
+
+    #[test]
+    fn popup_handles_a_non_zero_work_area_origin() {
+        // Secondary monitor / any work area not at the origin: every decision
+        // is relative to work_area, not to (0,0).
+        let work = ScreenRect { left: 1920, top: 0, right: 3840, bottom: 1040 };
+        assert_eq!(place_popup(2500, 300, 200, 150, work), (2500, 300));
+        // Right edge of THAT monitor flips left.
+        assert_eq!(place_popup(3830, 300, 200, 150, work), (3630, 300));
+        // A mouse left of the work area's left edge is pulled in, not left
+        // off-screen.
+        assert_eq!(place_popup(100, 300, 200, 150, work), (1920, 300));
+    }
+
+    #[test]
+    fn popup_larger_than_the_work_area_pins_to_its_top_left() {
+        // A very long menu on a short screen cannot fit either way; pin it to
+        // the work area's top-left rather than pushing it off the bottom.
+        let work = ScreenRect { left: 0, top: 0, right: 400, bottom: 300 };
+        let (x, y) = place_popup(380, 290, 500, 900, work);
+        assert_eq!((x, y), (0, 0), "oversized menu must pin to the work-area top-left");
+    }
+
+    #[test]
+    fn popup_near_an_edge_only_moves_when_a_flip_would_go_off_screen() {
+        let work = ScreenRect { left: 0, top: 0, right: 800, bottom: 600 };
+        // x=10 with w=200 fits comfortably -- nothing to do, and the popup
+        // must stay on the mouse rather than being clamped to the edge.
+        assert_eq!(place_popup(10, 100, 200, 150, work), (10, 100));
+        // Now the narrow case: the popup is wide enough that a left flip from
+        // x=10 would go off-screen. Here the overflow really is unavoidable,
+        // so pin to the left edge instead of returning a negative x.
+        let narrow = ScreenRect { left: 0, top: 0, right: 150, bottom: 600 };
+        let (x, _y) = place_popup(10, 100, 200, 150, narrow);
+        assert_eq!(x, 0, "a flip that would go off-screen must pin to the left edge");
+        assert!(x >= narrow.left, "never negative");
+        // Same at the bottom: a tall popup near y=20 on a short work area.
+        let short = ScreenRect { left: 0, top: 0, right: 800, bottom: 100 };
+        let (_x2, y2) = place_popup(100, 20, 200, 150, short);
+        assert_eq!(y2, 0, "unavoidable overflow must pin to the top edge");
+        // And a case that genuinely flips and stays put: right edge, fits
+        // above the left edge.
+        assert_eq!(place_popup(790, 100, 200, 150, work), (590, 100));
+    }
+
+    #[test]
+    fn popup_ignores_zero_or_negative_sizes_without_panicking() {
+        let work = ScreenRect { left: 0, top: 0, right: 800, bottom: 600 };
+        // A size we failed to measure (0, or -1 from a failed call) must not
+        // panic and must not move the popup off its point.
+        assert_eq!(place_popup(100, 100, 0, 0, work), (100, 100));
+        assert_eq!(place_popup(100, 100, -5, -5, work), (100, 100));
+    }
+
+    
     // NOTE: the translator is process-global, so these tests must not run
     // concurrently with each other. `cargo test` runs tests in one binary on
     // multiple threads; keep all translator-dependent assertions in ONE test.

@@ -314,11 +314,28 @@ mod nwg_adapter {
         }
     }
 
-    /// Current outer size of a control, if measurable.
+    /// Current size of a control for dialog layout, if measurable.
+    ///
+    /// Uses the **client** rect, not `GetWindowRect`. For most controls the
+    /// two differ only by the frame, but for a ComboBox the difference is the
+    /// whole bug this comment exists to prevent: the window height of a
+    /// ComboBox *includes its drop-down list* (Win32 anchors the list to the
+    /// window's bottom-left corner, which is only possible if the window is
+    /// tall enough to contain it). So `GetWindowRect` on a combo returns
+    /// "closed field + every list item", which grows with the item count.
+    ///
+    /// A dialog that sized its row from that would place the combo, then
+    /// Windows would drop the list below the combo's new bottom -- moving it
+    /// every time the row height changed. The list would then land somewhere
+    /// different each time the dialog re-laid-out, which is what a "dropdown
+    /// that appears at a random position" report is.
+    ///
+    /// The client rect is the closed field alone, so the row height is stable
+    /// regardless of how many items the combo holds.
     fn control_size(hwnd: winapi::shared::windef::HWND) -> Option<(i32, i32)> {
         unsafe {
             let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
-            if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) == 0 {
+            if winapi::um::winuser::GetClientRect(hwnd, &mut rect) == 0 {
                 return None;
             }
             Some((rect.right - rect.left, rect.bottom - rect.top))
@@ -598,6 +615,105 @@ mod nwg_adapter {
             }
         }
         pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
+        /// Strip or restore the title bar and border.
+        ///
+        /// `false` clears `WS_CAPTION|WS_THICKFRAME|WS_SYSMENU|WS_MINIMIZEBOX
+        /// |WS_MAXIMIZEBOX`, which is what a borderless/overlay window needs.
+        /// `true` puts the standard frame back.
+        ///
+        /// `SWP_FRAMECHANGED` is not optional: without it Windows keeps the
+        /// cached non-client area and the old frame stays on screen even
+        /// though the style bits are gone. That is the whole reason this is
+        /// not a one-line style edit.
+        ///
+        /// Applied post-creation on the live HWND rather than at
+        /// `CreateWindowEx` time, so an existing window (already shown, with
+        /// children laid out) can be made borderless without being rebuilt.
+        pub fn set_decorated(&self, decorated: bool) {
+            let hwnd = self.hwnd();
+            if hwnd.is_null() {
+                return;
+            }
+            unsafe {
+                // GetWindowLongW is i32 but the style constants are u32, so
+                // cast the flags down (same shape as Label::set_xalign, which
+                // casts the style up instead).
+                let frame = (winapi::um::winuser::WS_CAPTION
+                    | winapi::um::winuser::WS_THICKFRAME
+                    | winapi::um::winuser::WS_SYSMENU
+                    | winapi::um::winuser::WS_MINIMIZEBOX
+                    | winapi::um::winuser::WS_MAXIMIZEBOX) as i32;
+                let style = winapi::um::winuser::GetWindowLongW(hwnd as _, winapi::um::winuser::GWL_STYLE);
+                let new = if decorated {
+                    style | frame
+                } else {
+                    style & !frame
+                };
+                if new != style {
+                    winapi::um::winuser::SetWindowLongW(hwnd as _, winapi::um::winuser::GWL_STYLE, new);
+                }
+                winapi::um::winuser::SetWindowPos(
+                    hwnd as _,
+                    std::ptr::null_mut(), 0, 0, 0, 0,
+                    winapi::um::winuser::SWP_FRAMECHANGED
+                        | winapi::um::winuser::SWP_NOMOVE
+                        | winapi::um::winuser::SWP_NOSIZE
+                        | winapi::um::winuser::SWP_NOZORDER
+                        | winapi::um::winuser::SWP_NOACTIVATE,
+                );
+            }
+        }
+        /// Keep this toplevel above all non-topmost windows.
+        ///
+        /// Two operations, both needed: `WS_EX_TOPMOST` marks the window as
+        /// topmost, but the z-order is only actually changed by moving it to
+        /// `HWND_TOPMOST` / `HWND_NOTOPMOST`. Setting only the exstyle leaves
+        /// the window where it was, so it is still covered.
+        pub fn set_keep_above(&self, keep_above: bool) {
+            let hwnd = self.hwnd();
+            if hwnd.is_null() {
+                return;
+            }
+            unsafe {
+                let ex = winapi::um::winuser::GetWindowLongW(hwnd as _, winapi::um::winuser::GWL_EXSTYLE);
+                let topmost = winapi::um::winuser::WS_EX_TOPMOST as i32;
+                let new = if keep_above { ex | topmost } else { ex & !topmost };
+                if new != ex {
+                    winapi::um::winuser::SetWindowLongW(hwnd as _, winapi::um::winuser::GWL_EXSTYLE, new);
+                }
+                winapi::um::winuser::SetWindowPos(
+                    hwnd as _,
+                    if keep_above {
+                        winapi::um::winuser::HWND_TOPMOST
+                    } else {
+                        winapi::um::winuser::HWND_NOTOPMOST
+                    },
+                    0, 0, 0, 0,
+                    winapi::um::winuser::SWP_NOMOVE
+                        | winapi::um::winuser::SWP_NOSIZE
+                        | winapi::um::winuser::SWP_NOACTIVATE,
+                );
+            }
+        }
+        /// Move the toplevel to a screen position.
+        ///
+        /// This is the only window-level position setter the NWG adapter
+        /// exposes: `set_default_size` and `resize` only touch size (with
+        /// `SWP_NOMOVE`), so a caller positioning an overlay has no other
+        /// way in. Coordinates are screen pixels.
+        pub fn set_position(&self, x: i32, y: i32) {
+            let hwnd = self.hwnd();
+            if hwnd.is_null() {
+                return;
+            }
+            unsafe {
+                winapi::um::winuser::SetWindowPos(
+                    hwnd as _,
+                    std::ptr::null_mut(), x, y, 0, 0,
+                    winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_NOZORDER,
+                );
+            }
+        }
         pub fn hwnd(&self) -> *mut c_void {
             self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
         }
@@ -2245,9 +2361,17 @@ mod nwg_adapter {
     #[derive(Clone)]
     pub struct DropDown {
         pub(crate) inner: Rc<nwg::ComboBox<String>>,
-        pub(crate) _handler: Rc<nwg::EventHandler>,
         // Stable hwnd snapshot for AsRef (see Window).
         hwnd: *mut c_void,
+        /// Fired when the user picks a different item. Populated by
+        /// `connect_changed`; the `WM_COMMAND` handler installed at creation
+        /// reads it. Shared with that handler (see
+        /// `backends::nwg::bind_command_notify`).
+        pub(crate) changed_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
+        /// The `WM_COMMAND` handler. Held (not dropped) because dropping an
+        /// `nwg::RawEventHandler` unbinds the subclass; a clone shares it so
+        /// the control and its clones never fight over unbinding.
+        _notify_handler: Rc<Option<nwg::RawEventHandler>>,
     }
 
     impl DropDown {
@@ -2271,7 +2395,8 @@ mod nwg_adapter {
         pub fn get_active(&self) -> u32 {
             self.inner.selection().unwrap_or(0) as u32
         }
-        pub fn connect_changed(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
+        pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
+            *self.changed_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
         }
         pub fn set_hexpand(&self, _expand: bool) {}
@@ -2327,9 +2452,14 @@ mod nwg_adapter {
     }
 
     pub fn create_dropdown(parent: *mut c_void, items: &[&str]) -> Result<DropDown, Error> {
-        let (inner, handler) = crate::backends::nwg::create_dropdown(parent, items)
+        let (inner, changed_cb, notify) = crate::backends::nwg::create_dropdown(parent, items)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(DropDown { hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler) })
+        Ok(DropDown {
+            hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void,
+            inner: Rc::new(inner),
+            changed_cb,
+            _notify_handler: Rc::new(notify),
+        })
     }
 
     // ========== CheckButton ==========
@@ -2337,9 +2467,17 @@ mod nwg_adapter {
     #[derive(Clone)]
     pub struct CheckButton {
         pub(crate) inner: Rc<nwg::CheckBox>,
-        pub(crate) _handler: Rc<nwg::EventHandler>,
         // Stable hwnd snapshot for AsRef (see Window).
         hwnd: *mut c_void,
+        /// Fired when the user toggles the box. Populated by
+        /// `connect_toggled`; the `WM_COMMAND` handler installed at creation
+        /// reads it. Shared with that handler (see
+        /// `backends::nwg::bind_command_notify`).
+        pub(crate) toggled_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
+        /// The `WM_COMMAND` handler. Held (not dropped) because dropping an
+        /// `nwg::RawEventHandler` unbinds the subclass; a clone shares it so
+        /// the control and its clones never fight over unbinding.
+        _notify_handler: Rc<Option<nwg::RawEventHandler>>,
     }
 
     impl CheckButton {
@@ -2351,7 +2489,8 @@ mod nwg_adapter {
         }
         pub fn set_label(&self, label: &str) { self.inner.set_text(label); }
         pub fn get_label(&self) -> Option<String> { Some(self.inner.text()) }
-        pub fn connect_toggled(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
+        pub fn connect_toggled(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
+            *self.toggled_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
         }
     }
@@ -2363,9 +2502,14 @@ mod nwg_adapter {
     }
 
     pub fn create_checkbutton(parent: *mut c_void) -> Result<CheckButton, Error> {
-        let (inner, handler) = crate::backends::nwg::create_checkbox(parent, "Check")
+        let (inner, toggled_cb, notify) = crate::backends::nwg::create_checkbox(parent, "Check")
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(CheckButton { hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler) })
+        Ok(CheckButton {
+            hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void,
+            inner: Rc::new(inner),
+            toggled_cb,
+            _notify_handler: Rc::new(notify),
+        })
     }
 
     // ========== RadioButton ==========
@@ -2373,9 +2517,17 @@ mod nwg_adapter {
     #[derive(Clone)]
     pub struct RadioButton {
         pub(crate) inner: Rc<nwg::RadioButton>,
-        pub(crate) _handler: Rc<nwg::EventHandler>,
         // Stable hwnd snapshot for AsRef (see Window).
         hwnd: *mut c_void,
+        /// Fired when the user picks this radio. Populated by
+        /// `connect_toggled`; the `WM_COMMAND` handler installed at creation
+        /// reads it. Shared with that handler (see
+        /// `backends::nwg::bind_command_notify`).
+        pub(crate) toggled_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
+        /// The `WM_COMMAND` handler. Held (not dropped) because dropping an
+        /// `nwg::RawEventHandler` unbinds the subclass; a clone shares it so
+        /// the control and its clones never fight over unbinding.
+        _notify_handler: Rc<Option<nwg::RawEventHandler>>,
     }
 
     impl RadioButton {
@@ -2392,7 +2544,8 @@ mod nwg_adapter {
         }
         pub fn set_label(&self, label: &str) { self.inner.set_text(label); }
         pub fn get_label(&self) -> Option<String> { Some(self.inner.text()) }
-        pub fn connect_toggled(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
+        pub fn connect_toggled(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
+            *self.toggled_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
         }
         pub fn set_hexpand(&self, _expand: bool) {}
@@ -2409,9 +2562,14 @@ mod nwg_adapter {
     /// (WS_GROUP): arrows then move selection natively within the group.
     /// Without it every radio is independent and arrows do nothing.
     pub fn create_radiobutton(parent: *mut c_void, group_start: bool) -> Result<RadioButton, Error> {
-        let (inner, handler) = crate::backends::nwg::create_radiobutton(parent, "Radio", group_start)
+        let (inner, toggled_cb, notify) = crate::backends::nwg::create_radiobutton(parent, "Radio", group_start)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(RadioButton { hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler) })
+        Ok(RadioButton {
+            hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void,
+            inner: Rc::new(inner),
+            toggled_cb,
+            _notify_handler: Rc::new(notify),
+        })
     }
 
     // ========== TextView ==========
@@ -3023,11 +3181,23 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
 
         /// This canvas's top-left in screen coordinates, or `None`.
         ///
-        /// Not implemented for the NWG backend: the caller then opens a context
-        /// menu unpositioned instead of guessing an origin. See the GTK
-        /// backend's `screen_origin`.
+        /// `ClientToScreen(0, 0)` on the canvas' own HWND, so a caller can
+        /// turn a widget-relative click into the screen point a popup wants.
+        /// Returns `None` only if the hwnd is gone (`ClientToScreen` failing
+        /// is not otherwise distinguished — a stale hwnd is a use-after-free
+        /// bug in the caller, not something to paper over here).
         pub fn screen_origin(&self) -> Option<(i32, i32)> {
-            None
+            let hwnd = self.hwnd;
+            if hwnd.is_null() {
+                return None;
+            }
+            unsafe {
+                let mut pt = winapi::shared::windef::POINT { x: 0, y: 0 };
+                if winapi::um::winuser::ClientToScreen(hwnd as _, &mut pt) == 0 {
+                    return None;
+                }
+                Some((pt.x, pt.y))
+            }
         }
 
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
@@ -3983,6 +4153,16 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
         pub(crate) _items: Rc<Vec<nwg::MenuItem>>,
         pub(crate) _raw_handler: Rc<nwg::RawEventHandler>,
         pub(crate) action_registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
+        /// The top-level drop-downs, in menu-bar order: their Win32 label and
+        /// their `HMENU`. `popup_submenu_by_mnemonic_at` needs the `HMENU`
+        /// to pop, and the label to resolve an Alt+letter to an entry — the
+        /// OS picks the first entry whose `&`-marker matches, so this table
+        /// must stay in bar order for that scan to agree with the OS.
+        top_level: Rc<Vec<(String, *mut std::ffi::c_void)>>,
+        /// The toplevel HWND, for the popup's owner. A menu must be owned by
+        /// the window it belongs to, or it is dismissed as soon as that window
+        /// loses focus and floats above other apps' windows when it should not.
+        owner_hwnd: *mut c_void,
     }
 
     impl Clone for MenuBar {
@@ -3992,6 +4172,8 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                 _items: self._items.clone(),
                 _raw_handler: self._raw_handler.clone(),
                 action_registry: self.action_registry.clone(),
+                top_level: self.top_level.clone(),
+                owner_hwnd: self.owner_hwnd,
             }
         }
     }
@@ -4009,22 +4191,220 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
         }
     }
 
-    // Keyboard-menu shims required by common.rs: native Win32 menus handle
+    /// The `HMENU` of the top-level drop-down at bar position `pos`.
+///
+/// Resolved through the window's real menu bar (`GetMenu` + `GetSubMenu`)
+/// rather than from the `HMENU`s captured at build time: NWG's `Drop`
+/// destroys a menu's handles, and a rebuild leaves the captured values
+/// dangling. Asking the window each time is what keeps the popup pointing at
+/// the menu that is actually installed — the failure mode being a popup that
+/// lands somewhere unrelated, or not at all.
+unsafe fn submenu_handle(menu_bar: &MenuBar, pos: usize) -> *mut std::ffi::c_void {
+    if menu_bar.owner_hwnd.is_null() {
+        return std::ptr::null_mut();
+    }
+    let bar = winapi::um::winuser::GetMenu(menu_bar.owner_hwnd as _);
+    if bar.is_null() {
+        return std::ptr::null_mut();
+    }
+    let sub = winapi::um::winuser::GetSubMenu(bar, pos as i32);
+    sub as *mut std::ffi::c_void
+}
+
+/// The monitor work area for `owner`, plus the menu's own measured size.
+///
+/// The work area (screen minus the taskbar) is the bound a popup must stay
+/// inside. NWG's vendored Win95 build has no `GetMonitorInfoW` (see
+/// `vendor/native-windows-gui/README-WIN95.md`), and the public
+/// `monitor_rect_from_window` returns `rcMonitor` — which *includes* the
+/// taskbar, so it cannot detect a popup hiding under it. `SPI_GETWORKAREA` is
+/// used instead: it predates Win95 and reports the taskbar-excluded rectangle
+/// everywhere.
+unsafe fn popup_geometry(
+    owner: *mut c_void,
+    hmenu: *mut std::ffi::c_void,
+) -> (crate::core::ScreenRect, i32, i32) {
+    let mut wa: winapi::shared::windef::RECT = std::mem::zeroed();
+    let got = winapi::um::winuser::SystemParametersInfoA(
+        winapi::um::winuser::SPI_GETWORKAREA,
+        0,
+        &mut wa as *mut _ as *mut winapi::ctypes::c_void,
+        0,
+    ) != 0;
+    let work = if got && wa.right > wa.left && wa.bottom > wa.top {
+        crate::core::ScreenRect {
+            left: wa.left,
+            top: wa.top,
+            right: wa.right,
+            bottom: wa.bottom,
+        }
+    } else {
+        // Last resort: the primary screen size. Still on-screen, just possibly
+        // able to slip under a taskbar.
+        crate::core::ScreenRect {
+            left: 0,
+            top: 0,
+            right: winapi::um::winuser::GetSystemMetrics(
+                winapi::um::winuser::SM_CXSCREEN,
+            ),
+            bottom: winapi::um::winuser::GetSystemMetrics(
+                winapi::um::winuser::SM_CYSCREEN,
+            ),
+        }
+    };
+
+    let n = winapi::um::winuser::GetMenuItemCount(hmenu as _);
+    let count = if n > 0 { n } else { 1 };
+    let mut row_h = 0i32;
+    let mut width = 0i32;
+    // Measure every item: the popup is as wide as its widest, and as tall as
+    // all of them stacked. `GetMenuItemRect`'s third parameter is the item
+    // index as a `u32` (unlike the i32 index other menu calls take), and its
+    // rect is the *item's row within the popup*, so its width alone is not the
+    // popup width -- hence the floor below.
+    for i in 0..count {
+        let mut r: winapi::shared::windef::RECT = std::mem::zeroed();
+        // Signature is GetMenuItemRect(hWnd, hMenu, uItem, rect): the owner
+        // window comes first even for a popup menu, and the item index is a
+        // `UINT`, not the `i32` most menu calls take.
+        if winapi::um::winuser::GetMenuItemRect(
+            owner as _,
+            hmenu as _,
+            i as u32,
+            &mut r,
+        ) != 0
+        {
+            row_h = row_h.max(r.bottom - r.top);
+            width = width.max(r.right - r.left);
+        }
+    }
+    if width <= 0 {
+        width = 200;
+    }
+    let height = if row_h > 0 { row_h * count } else { 20 * count };
+    (work, width, height)
+}
+
+// Keyboard-menu shims required by common.rs: native Win32 menus handle
     // Alt+letter mnemonics in the OS (see the `&` prefixes in
     // `create_menubar`), so the manual popover-navigation contract is a
     // no-op here — matching the documented "On NWG ... this is a no-op".
     impl MenuBar {
-        pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool {
-            false
+        pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
+            // Open at the mouse-free default: the bar's own top-left, so the
+            // caller that wants a position passes one (see
+            // `popup_submenu_by_mnemonic_at`) and this stays a "just open it".
+            let (x, y) = self.bar_origin().unwrap_or((0, 0));
+            self.popup_submenu_by_mnemonic_at(keyval, x, y)
         }
         /// Open the submenu whose mnemonic is `keyval` at a screen position.
         ///
-        /// The NWG backend builds real Win32 menus but exposes no programmatic
-        /// popup-at-position call, so this reports "not opened" rather than
-        /// pretending: the caller shows an "unavailable" status. `activate_submenu_by_mnemonic`
-        /// above is already a no-op on this backend for the same reason.
-        pub fn popup_submenu_by_mnemonic_at(&self, _keyval: u32, _x: i32, _y: i32) -> bool {
-            false
+        /// `x`/`y` are absolute screen pixels — the caller is expected to have
+        /// added the widget's `screen_origin` to its widget-relative click
+        /// point, exactly as the GTK path does.
+        ///
+        /// Three steps, all required for the menu to land where asked:
+        ///
+        /// 1. Resolve `keyval` to a top-level entry. The OS scans the bar
+        ///    left to right and takes the first `&`-marked match, so we scan
+        ///    the same way (see `find_win32_top_level_mnemonic`) — picking a
+        ///    later entry would open the wrong menu.
+        /// 2. `TrackPopupMenuEx` on that entry's `HMENU`, at `(x, y)`,
+        ///    without `TPM_LEFTALIGN`/`TPM_TOPALIGN` so the corner is the
+        ///    exact point the caller asked for.
+        /// 3. `PostMessageW(WM_NULL)` to the owner afterwards. Without it the
+        ///    popup can be dismissed by the very click-release that opened it,
+        ///    and the menu flashes then vanishes.
+        ///
+        /// `TPM_RETURNCMD` is deliberately *not* set: the menu item's
+        /// activation is dispatched by the `WM_MENUCOMMAND`/`WM_COMMAND`
+        /// handler bound in `create_menubar`, which is the same path a
+        /// mouse-opened menu uses. Returning the id here as well would
+        /// dispatch twice.
+        /// The cross-backend entry point: resolve the anchor to screen
+        /// coordinates, then apply the shared placement rule
+        /// (`core::place_popup`) with this backend's measured menu size.
+        pub fn popup_at(&self, label: &str, anchor: &Canvas, x: f64, y: f64) -> bool {
+            let keyval = match label.chars().next() {
+                Some(c) => c as u32,
+                None => return false,
+            };
+            let Some((ox, oy)) = anchor.screen_origin() else {
+                // No origin: open unpositioned rather than guessing one, which
+                // is what the pre-`popup_at` code did when `screen_origin`
+                // returned `None`.
+                return self.activate_submenu_by_mnemonic(keyval);
+            };
+            self.popup_submenu_by_mnemonic_at(keyval, ox + x as i32, oy + y as i32)
+        }
+        pub fn popup_submenu_by_mnemonic_at(&self, keyval: u32, x: i32, y: i32) -> bool {
+            let Some(pos) = crate::win32_portable::find_win32_top_level_mnemonic(
+                &self.top_level.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+                keyval,
+            ) else {
+                return false;
+            };
+            let Some(&(_, _)) = self.top_level.get(pos) else {
+                return false;
+            };
+            let hmenu = unsafe { submenu_handle(self, pos) };
+            if hmenu.is_null() || self.owner_hwnd.is_null() {
+                return false;
+            }
+            // Place the popup before showing it: `TrackPopupMenuEx` takes no
+            // size, so the "would it go off-screen?" decision needs the menu's
+            // measured size up front. `popup_geometry` runs the menu once with
+            // TPM_NONOTIFY to measure it, which is also why the placeholder
+            // HWND below must be a real handle and not 0.
+            let (work, mw, mh) = unsafe { popup_geometry(self.owner_hwnd, hmenu) };
+            // The placement RULE is shared with every backend
+            // (`core::place_popup`); only the measuring above is Win32-specific.
+            let (px, py) = crate::core::place_popup(x, y, mw, mh, work);
+            unsafe {
+                let flags = winapi::um::winuser::TPM_RIGHTBUTTON
+                    | winapi::um::winuser::TPM_NONOTIFY;
+                // TrackPopupMenuEx(hmenu, flags, x, y, hwnd, owner): `hwnd`
+                // is a placeholder HWND (the MS docs use HWND_DESKTOP) and is
+                // ignored unless TPM_NONOTIFY is set — it is not a "reserved".
+                let cmd = winapi::um::winuser::TrackPopupMenuEx(
+                    hmenu as _,
+                    flags,
+                    px,
+                    py,
+                    winapi::um::winuser::HWND_DESKTOP,
+                    self.owner_hwnd as _,
+                );
+                // Drain the click that opened us, else it dismisses the menu
+                // on the very same release.
+                winapi::um::winuser::PostMessageW(
+                    self.owner_hwnd as _,
+                    winapi::um::winuser::WM_NULL,
+                    0,
+                    0,
+                );
+                // 0 means the user dismissed without picking. A non-zero value
+                // was NOT handled here (see TPM_RETURNCMD above), so report
+                // "opened" either way: the action was dispatched by the
+                // handler, and reporting false would make the caller show a
+                // spurious "menu unavailable".
+                let _ = cmd;
+                true
+            }
+        }
+
+        /// Top-left of the menu bar's owner window, in screen pixels, for
+        /// callers that want a default popup position.
+        fn bar_origin(&self) -> Option<(i32, i32)> {
+            if self.owner_hwnd.is_null() {
+                return None;
+            }
+            unsafe {
+                let mut pt = winapi::shared::windef::POINT { x: 0, y: 0 };
+                if winapi::um::winuser::ClientToScreen(self.owner_hwnd as _, &mut pt) == 0 {
+                    return None;
+                }
+                Some((pt.x, pt.y))
+            }
         }
         pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool {
             false
@@ -4035,6 +4415,11 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
         }
         pub fn handle_menu_key(&self, _keyval: u32, _modifiers: u32) -> bool {
             false
+        }
+        /// [`handle_menu_key`](Self::handle_menu_key) with the typed character
+        /// supplied separately; this backend's key codes are already characters.
+        pub fn handle_menu_key_char(&self, keyval: u32, _ch: char, modifiers: u32) -> bool {
+            self.handle_menu_key(keyval, modifiers)
         }
         pub fn menu_active(&self) -> bool {
             false
@@ -4120,6 +4505,9 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
         let mut items: Vec<nwg::MenuItem> = Vec::new();
 
         // Build top-level menubar entries (File, Edit, Help, ...)
+        // `top_level` is in bar order; `popup_submenu_by_mnemonic_at` scans it
+        // the way the OS scans the bar.
+        let mut top_level: Vec<(String, *mut std::ffi::c_void)> = Vec::new();
         for item in &data {
             if let Some(ref children) = item.submenu {
                 let mut menu = nwg::Menu::default();
@@ -4134,6 +4522,7 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
                     window_hwnd as *mut std::ffi::c_void as _,
                     menu_hmenu,
                 );
+                top_level.push((item.label.clone(), menu_hmenu as *mut std::ffi::c_void));
                 menus.push(menu);
                 build_and_index(&menu_handle, children, &mut index, &mut id_index, &mut menus, &mut items)
                     .map_err(|e| Error::Backend(format!("{}", e)))?;
@@ -4194,7 +4583,14 @@ fn win32_mods(w: usize) -> crate::core::Modifiers {
             },
         ).map_err(|e| Error::Backend(format!("{}", e)))?;
 
-        Ok(MenuBar { _menus: Rc::new(menus), _items: Rc::new(items), _raw_handler: Rc::new(raw_handler), action_registry })
+        Ok(MenuBar {
+            _menus: Rc::new(menus),
+            _items: Rc::new(items),
+            _raw_handler: Rc::new(raw_handler),
+            action_registry,
+            top_level: Rc::new(top_level),
+            owner_hwnd: window_hwnd,
+        })
     }
 
     // -- SimpleAction: stores callback by action name --

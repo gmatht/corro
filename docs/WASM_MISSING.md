@@ -3,10 +3,10 @@
 Status: **implemented**. Every row below is either `[x]`, or `[-]` with a
 reason. The `wasm32` target now compiles, for both the widget crate and the
 app.
-Last updated: 2026-09-28.
+Last updated: 2026-10-30 (§9 was written after driving the menus in a browser).
 
 The `wasm32` backend (`rustxWidgets/rswidgets/src/backends_wasm_adapter.rs`,
-1759 lines) renders the shared GUI pipeline as DOM. It is nominally a
+4339 lines) renders the shared GUI pipeline as DOM. It is nominally a
 first-class backend: `core.rs` and `common.rs` have `#[cfg(target_arch =
 "wasm32")]` arms everywhere. This document enumerates **every** gap found,
 ranked by severity, and tracks which are implemented.
@@ -326,7 +326,9 @@ that is not a gap.
 | G3 | `ScrolledWindow` cfg-tail is more inert than the adapter | **Fixed.** The `common.rs` wasm tail forwarded all five instead of discarding them (and declared `set_vexpand` twice). `set_child` needed a `Canvas`-taking shim, because the shared GUI passes a `Canvas` while the adapter takes `&impl AsElement`. |
 | G4 | `DropDown` has no `Option` selection | **Fixed.** `set_active(Option<u32>)` maps to `selectedIndex` including `-1`; `active() -> Option<u32>` reads it back. `set_offset` added via `transform: translate`, which composes with the position `add_overlay` established. |
 | G5 | `Entry::has_focus` always false | **Fixed** — `document.activeElement`. This was not neutral: it is what chooses push-vs-append while typing, so always-false made every keystroke push. The caret (`get_position`/`set_position`) was `None`/inert and now uses `selectionStart`/`setSelectionRange`, converting between the DOM's UTF-16 offsets and the character indices the shared API documents. |
-| G6 | `MenuBar` submenu dropdowns ignore keyboard state | **Fixed.** All eight required methods are implemented over a new `MenuEntry` registry (label, toggle, dropdown, items) that `create_menubar` now fills: Alt+letter opens, a printable key activates the item it starts, Escape closes, Up/Down move the selection, and choosing an item closes the menu. |
+| G6 | `MenuBar` submenu dropdowns ignore keyboard state | **Fixed.** All eight required methods are implemented over a new `MenuEntry` registry (label, toggle, dropdown, items) that `create_menubar` now fills: Alt+letter opens, a printable key activates the item it is marked with, Escape closes, Up/Down move the selection, and choosing an item closes the menu. |
+| G9 | Alt+letter opened the wrong menu, and only some letters worked | **Fixed.** Two causes. (a) The mnemonic was taken as the label's *first* character, but the labels the shared tree hands over are marked by `mnemonic_label`, so the mark — not the first character — is the accelerator: `Alt+O` opened File (`_File`, first letter F, but the string contains an `O`) while `Alt+F`, the letter File underlines, opened nothing. The adapter now reads the mark (`_File` → `F`, `S_ave as` → `A`, and `<u>F</u>ile` → `F` for a label that is already rendered markup). (b) `Format` is declared with the root shortcut `R` (`"Format" => ("R")`, chosen so `Alt+F` is unambiguous across backends), so its only advertised letter was `R`; a top-level entry now also accepts the letters of its own name, with a marked match always winning. Measured in headless Chromium against `web/index.html`, reading `display` on every dropdown: `F`→File, `E`→Edit, `I`→Insert, `O`→Format, `S`→Sheet, `H`→Help, and with the formula entry focused `Alt+F`→File, `Alt+U`→Format (`Format` contains a `u`), `Alt+N`→Insert (`Mitosis (Row)` is the only entry whose name has an `N`).
+| G10 | In-menu mnemonics closed the menu and typed the letter into the cell | **Fixed.** The formula entry keeps focus while a menu is open, so the browser delivered the keystroke to a text input, and a `keydown` that nobody prevented inserts the character — measured on a bare page with one focused input and no listeners: not prevented in, `S` out; prevented in, nothing out. The app's own window handler returned `0` (not handled) for that path, so nothing prevented it. `MenuBar::open_submenu` now installs a `window` `keydown` listener that runs before the app's handlers, prevents the default and routes the key to `handle_menu_key`; it is removed the moment the menu closes. Verified with the formula entry focused: `Alt+F` then `N` logged `menu_action new_file` and typed nothing, and `Alt+S` then `B` logged `balance_books`; a letter no item marks is still typed (the open menu does not consume it). |
 | G7 | `TextView::append_text` is O(document) | **Not fixed, and not fixable here.** Read-modify-write is the only thing a `<textarea>` offers; the same limitation is documented in `ZORK_MISSING.md` for the terminal backend. A high-rate log pane should reimplement against the native handle. |
 | G8 | No `ScrolledWindow::on_scroll`, so the reentrancy guard was untested | **Fixed.** `on_scroll` is a real `scroll` listener reporting the scrolled *fraction*, which is the shape `scroll_to_cursor` already clamps; `scroll_to` scales the cell-index domain by the scrollable extent. The `syncing_scroll` guard in `gui_backend.rs` now has something to guard. |
 
@@ -452,3 +454,187 @@ the shapes a browser can satisfy, and the File menu uses them.
 * `Spreadsheet` / `create_fixed` / `create_application` — reachable only from
   GTK `core.rs` arms today; wiring them into `core.rs` for WASM is a
   separate decision from making the backend itself complete.
+
+---
+
+## 8. [x] Running it in a browser
+
+Everything above says the backend *exists*. This section is how to see it, and
+what changed once "does it render a spreadsheet?" was asked of a real browser
+rather than of the type checker.
+
+### How to run
+
+```sh
+scripts/serve-wasm.sh                 # builds, serves http://127.0.0.1:8099/
+scripts/wasm-smoke.sh                 # builds, serves, drives it headless, stops
+```
+
+`serve-wasm.sh` installs the `wasm32-unknown-unknown` target for `+stable` if
+it is missing, builds `--features wasm --no-default-features`, checks the
+`wasm-bindgen` CLI against the version pinned in `Cargo.toml`, and runs the
+glue into `web/`. `web/index.html` is the host page; `web/` ignores the
+generated `.js`/`.wasm`, so a build never dirties the tree.
+
+`wasm_smoke.mjs` speaks the DevTools protocol over Node's own `WebSocket`: no
+npm packages, no Playwright install, nothing downloaded. It finds a
+Chromium-compatible binary in `~/.cache/ms-playwright`, on `PATH`, or via
+`--browser`. It is **not** part of `cargo test`, and `.github/workflows/wasm.yml`
+still only builds: a test that needs a browser should be asked for.
+
+### What the smoke test asserts, and why each one is there
+
+| Check | The bug it would have caught |
+|-------|------------------------------|
+| the app starts (`gui_started` in `window.__corro_output`) | a module that instantiates but whose `main` panics |
+| the canvas box is laid out | a canvas pinned to 1x1 (`set_size_request(1, 1)`) |
+| backing store = box width x `devicePixelRatio` | the 300x150 default stretched by CSS |
+| the sheet is painted (colour variety over the grid area) | a frame cleared after it was drawn, or never drawn |
+| File > Replay is addressable | a menu bar whose items were never built |
+| the action reaches the app (`menu_action`) | the registry split across two `static`s |
+| Ctrl+Q sets `document.title = "CORRO_QUIT"` | `try_quit` returning `Ok(())` and quitting nothing |
+| the quit is logged | a quit that skips its own bookkeeping |
+| no uncaught page error | `process::exit` / `window.close()` aborting under a callback |
+
+### What the browser found that the enumeration could not
+
+None of these are "missing methods"; every one is a method that existed and
+behaved in a way a type checker cannot see.
+
+* **The canvas was pinned to 1x1.** `gui_backend.rs` calls
+  `canvas.set_size_request(1, 1)` meaning "no minimum" (GTK's
+  `gtk_widget_set_size_request`), and the adapter translated that into
+  `width: 1px`. The whole grid painted into one pixel. `set_size_request` is
+  now a *minimum* on wasm (`min-width`/`min-height`, box 100%).
+* **Nothing sized the backing store from the box.** The canvas kept its
+  300x150 default however large its CSS box was. `Canvas::sync_backing_store`
+  now reads the box (`getBoundingClientRect`), multiplies by
+  `devicePixelRatio`, rounds to nearest, assigns `width`/`height`, and a
+  `ResizeObserver` re-enters the draw when the box changes — once per canvas,
+  because a page has no frame clock. Rounding to *nearest*, not up, matters:
+  a canvas takes its height from the attribute when the layout only stretches
+  it, so rounding up fed the box's own size back in and the sheet grew taller
+  on every frame.
+* **Text was drawn above its cell.** `fillText` takes a *baseline*, GTK takes
+  a text *top*. Every string landed one ascent too high — for 12px text in a
+  20px row, entirely outside its cell, i.e. a blank grid. Fixed with
+  `textBaseline = "top"`, which is the em-box top the shared renderer already
+  means.
+* **Nothing was drawn at all, twice over.** `queue_redraw` reset the canvas
+  (assigning `width` clears it) *after* the draw, erasing every frame; and the
+  adapter's `clear` honoured the caller's clip, which nothing ever reset, so a
+  stale clip region could cover the whole surface. The reset now happens
+  before the draw, one `save`/`restore` brackets each frame, and `clear` paints
+  the backing store under an identity transform.
+* **Menu items silently did nothing.** `invoke_action` and `register_action`
+  each declared *their own* `static REG` inside the function body, so
+  registration filled one map and dispatch read another. Hoisting it to
+  `ACTION_REGISTRY` made every menu action work — not just on the smoke test's
+  path.
+* **Exit did nothing.** `App::try_quit` on wasm was the `Ok(())` fallback every
+  non-GTK backend uses, so File > Exit logged the quit and stopped. It now
+  calls `quit_main_loop` (title + the app's root off the page), and
+  `save_before_quit` no longer reaches `std::process::exit`, which aborts a
+  wasm module.
+* **Two panics on the way in and out.** `CoreApp::default_unsaved_dir` fell
+  through to `std::env::temp_dir()`, which Panics on wasm32, on the first commit
+  (`unsaved_auto_create` is now off there); and `window.close()`'s refusal for
+  a script-opened-none tab was reported to the console *after* the caller had
+  exited, i.e. as an uncaught exception (the call is gone; a page cannot close
+  itself).
+* **A click landed a factor of `dpr` from the cell under it.** The shared GUI
+  hit-tests in backing-store pixels; the adapter reported CSS pixels. One
+  `local_point` conversion now scales every pointer and gesture path, and
+  `GuiState::sync_canvas_size` keeps the hit-test size current when the
+  browser resizes the canvas on its own.
+* **Wheel and touchpad scrolling did nothing.** The `scroll` container, not
+  the canvas inside it, is what the browser scrolls; `on_gesture` listens on
+  the canvas. A third listener (`scroll`) forwards the deltas, and
+  `ScrolledWindow::set_child` wires it up.
+
+The rule this leaves: for a backend with no browser in CI, "it compiles" and
+"its methods exist" are both weaker than they read. The smoke test is cheap
+because the *contract* was already there (`window.__corro_output`,
+`CORRO_QUIT`); it has a hook added for it (`window.__corro_activate_action`,
+the DOM stand-in for `gtk_widget_activate`), and nothing else in the app
+depends on either.
+
+## 9. [x] Menu keyboard interaction (driven, not assumed)
+
+Three bugs, found by opening the menus in a real browser and reading the
+`display` of every dropdown back, then typing. Each has a row in §5 (G6, G9,
+G10); this section is the run itself.
+
+**What was wrong.**
+
+1. `Alt+Shift+F`, the browser's own shortcut, was reported as opening Format
+   instead of File. It opens File, and so does `Alt+F` -- the mnemonic was
+   being taken from the label's *first character*, while the shared tree marks
+   labels with `mnemonic_label` (`_File`, `S_ave as`). The first character
+   happens to be the wrong letter for two entries (`_File`'s first character is
+   `_`) and meaningless for every other, which is why the other menus' keys
+   "did nothing". `Format` is declared with the root shortcut `R` so that
+   `Alt+F` is unambiguous across backends, so the only letter the model
+   *marks* for it is one nobody would try.
+2. With the formula entry focused (it always is), the letter that was not
+   matched opened nothing **and** was typed into the cell.
+3. A key that *did* match an open menu's item closed the menu and then the same
+   letter was typed, because the letter was never prevented from reaching the
+   focused input.
+
+**Why (2) and (3) happen at all** -- measured, not inferred. A page with one
+focused `<input>` and no listeners at all: a `keydown` that nobody prevents
+inserts the character (`rawKeyDown` without `preventDefault` -> the input
+holds `S`); the same event with `preventDefault` -> nothing. The insertion is
+the browser's default action for `keydown`, and the only thing that stops it is
+preventing that event -- which the DOM's menu path did not do, because the
+app's own window handler answers `0` ("not handled") for a key a menu did not
+consume.
+
+**What changed.**
+
+- `label_matches_mnemonic` reads the *mark* (`_File` -> `F`, `S_ave as` ->
+  `A`, and `<u>F</u>ile` -> `F` when the label is already rendered markup, which
+  is what the bar receives -- `set_menu_label` now emits that markup instead of
+  writing the underscore into the text). A top-level entry additionally accepts
+  the letters of its own first word, and a marked match always wins, so
+  `File`/`Format` are separated by what the labels underline rather than by
+  declaration order.
+- While a menu is open the bar installs one `keydown` listener on `window`
+  that prevents the default, routes the key to the menu, and hands whatever
+  the menu does not consume to the app's own key sink
+  (`set_host_key_sink`, set by `run_gui_with_movie`) -- so `Ctrl+Q` still
+  quits with a menu open. The listener is removed when the menu closes.
+- The menu is given the *character* the event reports (`key()`), not the
+  physical key code: on a QWERTZ keyboard the key marked `Z` reports keyCode
+  89 (`Y`), so matching by code would break mnemonics on every non-US layout.
+
+**The run** (headless Chromium against `web/index.html`, the module built by
+`scripts/serve-wasm.sh`; `F`/`E`/`I`/`O`/`S`/`H` are what a user types):
+
+```
+Alt+F: seen=["f:true:70"] dropdowns(display)=[File:block, Edit:none, Insert:none, Format:none, Sheet:none, Help:none]
+Alt+E: seen=["e:true:69"] dropdowns(display)=[File:none, Edit:block, Insert:none, Format:none, Sheet:none, Help:none]
+Alt+I: seen=["i:true:73"] dropdowns(display)=[File:none, Edit:none, Insert:block, Format:none, Sheet:none, Help:none]
+Alt+O: seen=["o:true:79"] dropdowns(display)=[File:none, Edit:none, Insert:none, Format:block, Sheet:none, Help:none]
+Alt+S: seen=["s:true:83"] dropdowns(display)=[File:none, Edit:none, Insert:none, Format:none, Sheet:block, Help:none]
+Alt+H: seen=["h:true:72"] dropdowns(display)=[File:none, Edit:none, Insert:none, Format:none, Sheet:none, Help:block]
+```
+
+With the formula entry focused, `Alt+F` then `N`, and `Alt+S` then `B`
+(unmodified keys, the way a menubar is used):
+
+```
+Alt+F ▸ "New" (N): opened=["NewOpen fileSave asSort "] -> after=[] | output tail="KEY: MENU  ACTION: menu_action  DETAIL: new_file" | input="F"
+Alt+S ▸ "Balance books" (B): opened=["Prev sheetNext sheetNew "] -> after=[] | output tail="KEY: MENU  ACTION: menu_action  DETAIL: balance_books" | input=""
+Alt+F ▸ "Save as" (A): opened=["NewOpen fileSave asSort "] -> after=[] | output tail="KEY: ESCAPE  ACTION: cancel_edit  DETAIL: cell=R999999999C702 mode=edit" | input=""   (File marks S for "Save as", not A)
+```
+
+And `Ctrl+Q` with a menu open still quits (the log shows the action fired by
+the quit path):
+
+```
+menu open: ["NewOpen fi"]
+title after Ctrl+Q with a menu open: CORRO_QUIT
+output: KEY: MENU  ACTION: quit  DETAIL: ... | KEY: MENU  ACTION: fx_text_on_exit ...
+```

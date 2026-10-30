@@ -1,0 +1,9 @@
+# Build artefacts of `scripts/serve-wasm.sh`.
+#
+# They are generated from `rustxWidgets/rswidgets` + `src` on every run, so
+# committing them would commit a stale copy of the app: a `git status` full of
+# a 6 MB `.wasm` after every build, and a reviewer with no way to tell whether
+# the committed module still matches the source.
+*.js
+*.wasm
+*.ts

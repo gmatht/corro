@@ -3897,19 +3897,65 @@ impl Dialog {
 }
 
 // ---- DropDown (combo box) ----
+
+/// Which GTK widget a [`DropDown`] actually wraps.
+///
+/// Decided **once**, in `DropDown::new`, and stored on the widget. The earlier
+/// code re-derived the answer per call (`symbols.gtk_drop_down_new.is_some()`)
+/// and got it wrong: GTK3's `libgtk-3` really does export
+/// `gtk_drop_down_new` (added in GTK 3.24 as a compatibility shim), so on
+/// every Linux box the probe reported "GTK4" while the widget was a
+/// `GtkComboBoxText`.
+///
+/// The visible damage was in `connect_changed`, which read the probe to pick a
+/// signal name: it connected `notify::selected` instead of `changed`.
+/// `GtkComboBox` has no `selected` property (it has `active`), so
+/// `g_signal_connect_data` failed and the returned error was discarded as
+/// `.ok()` at every call site -- the callback silently never fired. A
+/// programmatic `set_active` emitted "changed" on a dead connection, so even
+/// the one case that looked like it worked came from an unrelated handler.
+/// Selecting an item in the popup therefore updated nothing: this is why the
+/// Sort View dialog's "pick a column, click Add" never appended a column on
+/// Linux.
+///
+/// GTK3's `GtkComboBox` also reports `get_active() == GTK_INVALID_LIST_POSITION`
+/// (-1) when nothing is selected, whereas GTK4's `GtkDropDown` reports
+/// `GTK_INVALID_LIST_POSITION` as well but has no equivalent `active`
+/// property -- so the setter/getter fallback keyed on the same wrong probe.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DropDownBackend {
+    /// GTK4 `GtkDropDown`: `selected` property, so `notify::selected`.
+    Gtk4DropDown,
+    /// GTK3 `GtkComboBoxText`: `active` property, so `changed`.
+    Gtk3ComboBox,
+}
+
 pub struct DropDown {
     inner: *mut c_void,
     loader: Arc<Loader>,
     _not_send: PhantomData<Rc<()>>,
     // For GTK4, we keep a reference to the string list so it stays alive
     string_list: Option<*mut c_void>,
+    /// Which widget `inner` actually is. See [`DropDownBackend`].
+    backend: DropDownBackend,
 }
 
 impl DropDown {
     pub fn new(loader: Arc<Loader>, items: &[&str]) -> Result<Self, Error> {
         let symbols = &loader.symbols;
-        // Try GTK4 DropDown API first
-        if let (Some(dd_new), Some(sl_new)) = (symbols.gtk_drop_down_new, symbols.gtk_string_list_new) {
+        // The GTK4 path is chosen by the *loader*, not by "does this libgtk
+        // export gtk_drop_down_new": libgtk-3 exports that symbol too (GTK
+        // 3.24 ships it as a forwarder), so the symbol probe took the GTK4
+        // branch on a GTK3 widget and every method below then used the wrong
+        // property. `loader.version()` is the answer the loader already
+        // committed to when it chose which libgtk to open.
+        let is_gtk4 = loader.version() == Version::Gtk4;
+        if is_gtk4 {
+            let (Some(dd_new), Some(sl_new)) =
+                (symbols.gtk_drop_down_new, symbols.gtk_string_list_new)
+            else {
+                return Err(Error::MissingSymbol("gtk_drop_down_new".into()));
+            };
             let c_strings: Vec<CString> = items.iter().map(|s| CString::new(*s).unwrap()).collect();
             let mut raw_ptrs: Vec<*const u8> = c_strings.iter().map(|c| c.as_ptr() as *const u8).collect();
             raw_ptrs.push(std::ptr::null());
@@ -3922,9 +3968,15 @@ impl DropDown {
                 return Err(Error::Other("gtk_drop_down_new returned null".into()));
             }
             unsafe { take_ownership(&symbols, &loader.version, inner); }
-            Ok(DropDown { inner, loader, _not_send: PhantomData, string_list: Some(string_list) })
+            Ok(DropDown {
+                inner,
+                loader,
+                _not_send: PhantomData,
+                string_list: Some(string_list),
+                backend: DropDownBackend::Gtk4DropDown,
+            })
         }
-        // Fall back to GTK3 ComboBoxText API
+        // GTK3 ComboBoxText
         else if let (Some(ct_new), Some(ct_append)) = (symbols.gtk_combo_box_text_new, symbols.gtk_combo_box_text_append_text) {
             let inner = unsafe { ct_new() };
             if inner.is_null() {
@@ -3935,7 +3987,13 @@ impl DropDown {
                 unsafe { ct_append(inner, c.as_ptr() as *const u8); }
             }
             unsafe { take_ownership(&symbols, &loader.version, inner); }
-            Ok(DropDown { inner, loader, _not_send: PhantomData, string_list: None })
+            Ok(DropDown {
+                inner,
+                loader,
+                _not_send: PhantomData,
+                string_list: None,
+                backend: DropDownBackend::Gtk3ComboBox,
+            })
         } else {
             Err(Error::MissingSymbol("gtk_drop_down_new or gtk_combo_box_text_new".into()))
         }
@@ -3944,38 +4002,85 @@ impl DropDown {
     pub fn set_active(&self, index: u32) {
         guard_widget!(self, "DropDown", "set_active");
         let symbols = &self.loader.symbols;
-        if let Some(set_sel) = symbols.gtk_drop_down_set_selected {
-            unsafe { set_sel(self.inner, index); }
-        } else if let Some(set_act) = symbols.gtk_combo_box_set_active {
-            unsafe { set_act(self.inner, index as i32); }
+        // Dispatch on what the widget IS (recorded in `new`), not on which
+        // symbol happens to be present: libgtk-3 exports the GTK4 symbols too,
+        // so the symbol probe made a GtkComboBoxText call
+        // `gtk_drop_down_set_selected` on a GtkComboBox.
+        match self.backend {
+            DropDownBackend::Gtk4DropDown => {
+                if let Some(set_sel) = symbols.gtk_drop_down_set_selected {
+                    unsafe { set_sel(self.inner, index); }
+                }
+            }
+            DropDownBackend::Gtk3ComboBox => {
+                if let Some(set_act) = symbols.gtk_combo_box_set_active {
+                    unsafe { set_act(self.inner, index as i32); }
+                }
+            }
         }
     }
 
     pub fn get_active(&self) -> i32 {
         guard_widget_or!(self, "DropDown", "get_active", -1);
         let symbols = &self.loader.symbols;
-        if let Some(get_sel) = symbols.gtk_drop_down_get_selected {
-            unsafe { get_sel(self.inner) as i32 }
-        } else if let Some(get_act) = symbols.gtk_combo_box_get_active {
-            unsafe { get_act(self.inner) }
-        } else { -1 }
+        match self.backend {
+            DropDownBackend::Gtk4DropDown => symbols
+                .gtk_drop_down_get_selected
+                .map(|f| unsafe { f(self.inner) as i32 })
+                .unwrap_or(-1),
+            DropDownBackend::Gtk3ComboBox => symbols
+                .gtk_combo_box_get_active
+                .map(|f| unsafe { f(self.inner) })
+                .unwrap_or(-1),
+        }
     }
 
     pub fn connect_changed<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
         guard_widget_or!(self, "DropDown", "connect_changed", Err(Error::Other("dropdown dropped".into())));
         let boxed: Box<dyn FnMut()> = Box::new(f);
-        if self.loader.symbols.gtk_drop_down_new.is_some() {
-            // "notify::selected" has 3 args: (object, pspec, user_data)
-            let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "notify::selected", boxed, 3) };
-            match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
-        } else {
-            // GtkComboBoxText "changed" has 2 args: (widget, user_data)
-            let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "changed", boxed, 2) };
-            match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+        // The signal to listen on is the one the WRAPPED widget actually has:
+        // GtkDropDown has a `selected` property (notify::selected), while
+        // GtkComboBox has `active` and emits "changed". Asking for
+        // `notify::selected` on a combo makes `g_signal_connect_data` fail --
+        // and every caller discards this Result with `.ok()`, so the failure
+        // was invisible and the callback simply never ran.
+        match self.backend {
+            DropDownBackend::Gtk4DropDown => {
+                // "notify::selected" has 3 args: (object, pspec, user_data)
+                let res = unsafe {
+                    crate::signals::connect_signal(
+                        &self.loader.symbols,
+                        self.inner,
+                        "notify::selected",
+                        boxed,
+                        3,
+                    )
+                };
+                match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+            }
+            DropDownBackend::Gtk3ComboBox => {
+                // GtkComboBoxText "changed" has 2 args: (widget, user_data)
+                let res = unsafe {
+                    crate::signals::connect_signal(
+                        &self.loader.symbols,
+                        self.inner,
+                        "changed",
+                        boxed,
+                        2,
+                    )
+                };
+                match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+            }
         }
     }
 
-    pub fn is_gtk4(&self) -> bool { self.string_list.is_some() }
+    /// Whether this is the GTK4 `GtkDropDown` (vs the GTK3 combo). Now read
+    /// from the recorded backend, so it cannot disagree with the branch
+    /// `connect_changed` took.
+    pub fn is_gtk4(&self) -> bool { self.backend == DropDownBackend::Gtk4DropDown }
+
+    /// The recorded backend, for callers that need to name it.
+    pub fn backend(&self) -> DropDownBackend { self.backend }
 
     /// Whether the size-request symbol is actually resolved at runtime.
     pub fn has_size_request_symbol(&self) -> bool {
@@ -4090,7 +4195,13 @@ impl Clone for DropDown {
                 if let Some(sl) = self.string_list { gref(sl); }
             }
         }
-        DropDown { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData, string_list: self.string_list }
+        DropDown {
+            inner: self.inner,
+            loader: self.loader.clone(),
+            _not_send: PhantomData,
+            string_list: self.string_list,
+            backend: self.backend,
+        }
     }
 }
 

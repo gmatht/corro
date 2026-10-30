@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>corro</title>
+<!--
+  corro in a browser: the host page for the `wasm` feature.
+
+  The app draws itself into a <canvas> and its own DOM; this page supplies the
+  three things a browser will not infer: a viewport-high document (so the
+  sheet's row can grow), a dark-on-light default, and the module import.
+
+  `web/corro.js` and `web/corro_bg.wasm` are generated next to this file by
+  `scripts/serve-wasm.sh` and are not committed; opening this file directly
+  from disk will fail with a module-loading error, because an ES module cannot
+  be fetched over `file://`. Serve it:
+
+      scripts/serve-wasm.sh            # builds, then http://127.0.0.1:8099/
+
+  `window.__corro_output` is created here, before the app starts, because the
+  app appends to it (`append_wasm_output_line`) and the smoke test
+  (`scripts/wasm_smoke.mjs`) reads it. It is a plain string so that a test can
+  read it after the module has finished; `document.title` becoming
+  "CORRO_QUIT" is the other half of that contract, and is set by
+  `quit_main_loop`.
+-->
+<style>
+  html, body { margin: 0; height: 100%; }
+  body {
+    /* The window's root is `height: 100%` of this element. `100%` of a body
+       with no height collapses to the content height, which is why it is set
+       here rather than left to the app. */
+    height: 100%;
+    background: #fff;
+    color: #111;
+    font-family: system-ui, sans-serif;
+    /* A spreadsheet is a touch target: no double-tap zoom or rubber-banding
+       while a cell is being selected. */
+    touch-action: none;
+    overscroll-behavior: none;
+  }
+  body > div { height: 100%; }
+  #corro-fatal {
+    font: 13px/1.4 ui-monospace, monospace;
+    white-space: pre-wrap;
+    padding: 12px;
+    color: #900;
+  }
+</style>
+</head>
+<body>
+<script type="module">
+  window.__corro_output = window.__corro_output || "";
+
+  const fatal = (err) => {
+    // A wasm instantiation failure happens before the app exists, so this is
+    // the only place the message can be shown; without it the page is blank
+    // and the browser console is the sole record.
+    const pre = document.createElement("pre");
+    pre.id = "corro-fatal";
+    pre.textContent = "corro failed to start:\n" + (err && err.stack || err);
+    document.body.appendChild(pre);
+    throw err;
+  };
+
+  try {
+    // `wasm-bindgen --target web` emits a default export that fetches and
+    // instantiates the sibling `.wasm`; the app's `main` runs before it
+    // resolves.
+    const { default: init } = await import("./corro.js");
+    await init();
+  } catch (err) {
+    fatal(err);
+  }
+</script>
+</body>
+</html>

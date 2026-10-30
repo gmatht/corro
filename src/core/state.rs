@@ -525,6 +525,19 @@ impl CoreApp {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home).join(".corro/unsaved");
         }
+        // A browser has no environment and no filesystem: every `var` above
+        // failed, and `std::env::temp_dir` -- the desktop fallback -- is a
+        // `panic!` on wasm32 ("no filesystem"), not a returned path. This
+        // function is reached from `commit_sheet_op`, i.e. from an ordinary
+        // cell edit, so that panic aborted the whole module the first time a
+        // user typed into a cell and pressed Enter. The empty path is the
+        // honest answer for a host that writes no file: `save_to_path` then
+        // fails as an ordinary error instead of aborting.
+        #[cfg(target_arch = "wasm32")]
+        {
+            return PathBuf::new();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         std::env::temp_dir().join("corro/unsaved")
     }
 

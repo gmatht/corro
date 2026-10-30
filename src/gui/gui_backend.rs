@@ -92,6 +92,16 @@ fn log_ui_action(action: &str, detail: &str) {
 }
 
 fn log_key_action(keyval: u32, action: &str, detail: &str) {
+    // A page has no `std::fs`, and this is the one log a browser can carry:
+    // the same line goes to `window.__corro_output`, which is where the
+    // browser smoke test (`scripts/wasm_smoke.mjs`) reads what the app did.
+    // Without it a wasm run leaves no trace at all -- every other diagnostic
+    // in this file writes to a path.
+    #[cfg(target_arch = "wasm32")]
+    rswidgets::backends_wasm_adapter::append_wasm_output_line(&format!(
+        "KEY: {}  ACTION: {action}  DETAIL: {detail}",
+        key_name(keyval)
+    ));
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true).append(true)
         .open(KEYLOG_PATH)
@@ -630,6 +640,21 @@ fn save_before_quit(state: &GuiState) {
     if state.editing.get() {
         commit_edit(state);
     }
+    // A page has no process to exit: `App::try_quit` on wasm is
+    // `backends_wasm_adapter::quit_main_loop` (quit title + the app's root off
+    // the page), and `std::process::exit` below must not run there -- it aborts
+    // the wasm module ("unreachable"), turning an ordinary Ctrl+Q into an
+    // uncaught exception in the console.
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Everything that has to happen before the quit -- the two log lines
+        // above, the snapshot and committing an in-flight edit -- has
+        // happened; this is the quit itself. The page stays open, because a
+        // page cannot close itself; the title is what says it quit.
+        let _ = state.rxapp.try_quit();
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     match state.rxapp.try_quit() {
         Ok(()) => std::process::exit(0),
         Err(e) => {
@@ -658,10 +683,30 @@ impl GuiState {
     pub(crate) fn canvas_handle(&self) -> &Canvas {
         &self.canvas
     }
+
+    /// Hand the widget the size the app's last key or click measured.
+    ///
+    /// The two have to agree or a click lands in the wrong cell: the shared GUI
+    /// hit-tests against `canvas_size`, while the adapter reports pointer
+    /// positions in *backing-store* pixels. On GTK every resize goes through
+    /// the app's own event path, which measures the allocation. A browser can
+    /// resize the canvas on its own -- a scrollbar appearing, an orientation
+    /// change, DevTools docking -- and without this the first click after such
+    /// a resize would be hit-tested against the size before it. Called before
+    /// the first paint, because the draw callback runs inside
+    /// `set_draw_callback`, before this state is shared.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn sync_canvas_size(&self) {
+        let (w, h) = self.canvas.measure();
+        self.canvas_size.set((w, h));
+    }
 }
 
 pub(crate) struct GuiState {
     app: *mut super::App,
+    /// The widget toolkit. Not read on wasm: the browser quits itself (there
+    /// is no main loop to ask), so `save_before_quit` never touches it there.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) rxapp: rswidgets::App,
     pub(crate) window: Window,
     /// Menu bar handle: lets modal flows (e.g. the special-char picker)
@@ -735,6 +780,19 @@ pub(crate) struct GuiState {
     clicked: Cell<bool>,
     entry_processed_key: Cell<bool>,
     last_alt_keyval: Cell<u32>,
+    // Whether the formula entry holds keyboard focus right now, tracked via
+    // its focus in/out events (wired next to its key handler below). Gates
+    // the entry_processed_key arming in the window handler: the flag is only
+    // meaningful when the entry can observe the same event (it clears the
+    // flag when it fires later in the same dispatch), and arming it while
+    // focus sits elsewhere (canvas, menu button, body) leaves it uncleared,
+    // so the NEXT press is wrongly skipped -- every second arrow press
+    // silently lost on wasm whenever the entry is not focused.
+    // Starts true: setup grabs entry focus before present(), matching
+    // entry_seen below. Backends without focus events (pancurses, zork)
+    // never fire them, so the initial value holds there and arming is
+    // exactly as before on those streams.
+    entry_focused: Cell<bool>,
     // Tracks whether the entry widget's key handler has ever fired. Gates the
     // entry_processed_key protocol below: that flag is only meaningful when
     // both the window and the entry can observe the same event (double-fire
@@ -1152,6 +1210,11 @@ fn paint_col_headers(
         let fill = if hl { pal.gutter_selected() } else { pal.gutter() };
         let fill = (fill.0, fill.1, fill.2, 1.0);
         dc.fill_rect(cx, 0.0, cw, header_h(), fill.0, fill.1, fill.2, fill.3);
+        // The rule under this header. Without it the column headers of a
+        // default sheet (all the same width, all the same gutter fill) run into
+        // the first data band with no edge between them.
+        let g = pal.gridline();
+        dc.fill_rect(cx, header_h() - 1.0, cw, 1.0, g.0, g.1, g.2, 1.0);
         let (_, _, tw, _) = dc.text_extents_styled(&col_name, "monospace", font_size(), 0, 1);
         // Label and padlock center as a unit, so the icon fits inside its
         // own column instead of dangling past the gridline: the column is
@@ -1543,30 +1606,19 @@ fn open_sheet_context_menu(state_rc: &Rc<GuiState>, x: f64) {
         sync_chrome_labels(state);
         return;
     };
-    // 'S' is the Sheet menu's mnemonic (see `menu_bar`); the loader uppercases
-    // it against the mnemonic index built from the same tree.
-    let keyval = 's' as u32;
-    // Screen coordinates for the popup: the click x is widget-relative, and
-    // `gtk_menu_popup` wants root coordinates. `None` (widget not yet realized,
-    // or a backend without the origin symbols) means open unpositioned, which
-    // still shows the menu.
-    let origin = state.tab_bar.borrow().as_ref()
-        .and_then(|tb| tb.canvas().screen_origin());
-    let menubar = menubar.clone();
-    let tab_y = (tab_h() as f64 / 2.0) as i32;
-    let tab_x = x.round() as i32;
-
-    // Open it inline: this runs from the button *release*, so no button is
-    // still held and GTK gives the menu its own input grab normally. Opening
-    // from the press (even deferred to an idle turn) left the menu visible but
-    // inert, because the release that followed dismissed it.
-    let opened = match origin {
-        Some((ox, oy)) => menubar.popup_submenu_by_mnemonic_at(keyval, ox + tab_x, oy + tab_y),
-        None => menubar.activate_submenu_by_mnemonic(keyval),
+    // Anchor the popup on the tab strip and give it the click's x, so the menu
+    // appears under the pointer. rswidgets resolves the strip's on-screen
+    // origin, measures the menu and keeps it off the screen edge / taskbar, so
+    // nothing here has to know any of that.
+    let Some(tab_bar) = state.tab_bar.borrow().clone() else {
+        state.app_mut().core.status = crate::core::state::SHEET_MENU_UNAVAILABLE.to_string();
+        sync_chrome_labels(state);
+        return;
     };
-    crate::debug_log::log(&format!(
-        "TABCTXMENU x={tab_x} origin={origin:?} opened={opened}"
-    ));
+    // '_Sheet' is the top-level entry's label (see `menu_bar`); the popup is
+    // opened by name, so this no longer has to know the Sheet menu's mnemonic.
+    let opened = menubar.popup_at("_Sheet", tab_bar.canvas(), x, 0.0);
+    crate::debug_log::log(&format!("TABCTXMENU x={x} opened={opened}"));
     if !opened {
         // A backend whose menus cannot be opened programmatically (the mobile
         // and terminal ones report `false`). Say so rather than swallowing the
@@ -1920,7 +1972,22 @@ fn handle_extrapolate_key(key: u32, state: &GuiState) -> bool {
     }
 }
 
+/// The key handling shared by every host: tail the log, route by mode, then
+/// act.
+///
+/// `keyval` is the host's key code, but **the character is not**:
+/// `char::from_u32(keyval)` is only the typed character on the DOM, where
+/// `core::key::*` are raw `KeyboardEvent::key_code` values (A-Z are 0x41-0x5A,
+/// so the low byte *is* the letter). GTK/NWG/pancurses pass their own codes,
+/// so a host whose codes are not character values passes the character it
+/// decoded (see [`handle_key_char`]).
 fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
+    handle_key_char(keyval, char::from_u32(keyval).unwrap_or('\0'), state_rc, mods)
+}
+
+/// [`handle_key`], with the typed character supplied separately from the key
+/// code.
+fn handle_key_char(keyval: u32, ch: char, state_rc: &Rc<GuiState>, mods: u32) -> bool {
     let state: &GuiState = &**state_rc;
     // Tail external changes on every keystroke (parity with the TUI loop,
     // which polls sync_external each iteration): another window's committed
@@ -1944,6 +2011,11 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
         state.canvas.queue_redraw();
     }
     state.last_key.set(keyval);
+    // `ch` (the typed character) is only used by the wasm menu routing in the
+    // host's key callback -- `handle_key` itself decides on the key code. Keep
+    // the parameter on every host: it is the host that knows whether its codes
+    // are characters, and that is exactly the fact this signature records.
+    let _ = ch;
     let app = state.app_mut();
     let key = normalize(keyval);
     match state.mode.get() {
@@ -2711,8 +2783,14 @@ fn recompute_viewport(state: &GuiState) {
     // "corrected" the cursor on the next frame and undid the centring a click
     // had just performed.
     let (prev_r, prev_c) = state.viewport_anchor.get().unwrap_or((0, 0));
-    let (display_rows, _) = ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), prev_r);
-    let (col_ixs, _) = ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), prev_c);
+    // One row past what the viewport holds. The scroll container can be a few
+    // pixels taller than `rows * row_h()` -- a browser lays a canvas out at
+    // fractional device pixels (a 612.5px CSS box becomes a 612px backing
+    // store), and the frame is then painted into a surface whose last few
+    // pixels would otherwise be paper. An extra row is one `visible_*` entry
+    // the renderer clips anyway; a clipped edge is permanent.
+    let (display_rows, _) = ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get() + 1, prev_r);
+    let (col_ixs, _) = ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get() + 1, prev_c);
     if !display_rows.contains(&cursor_row) || !col_ixs.contains(&cursor_col) {
         let new_row = if cursor_row > display_rows.last().copied().unwrap_or(hr) {
             display_rows.first().copied().unwrap_or(hr)
@@ -6218,6 +6296,7 @@ pub fn run_gui_with_movie(
         entry_processed_key: Cell::new(false),
         last_alt_keyval: Cell::new(0),
         entry_seen: Cell::new(true),
+        entry_focused: Cell::new(true),
         clipboard: RefCell::new(String::new()),
         pending_scope: Cell::new(0),
         padlocks: RefCell::new(Vec::new()),
@@ -6398,6 +6477,22 @@ pub fn run_gui_with_movie(
     // the handle_key call (which would double characters in edit_buf).
     // On NWG the window's raw handler fires independently of the entry's
     // (only when no child has focus) so no doubling occurs.
+    // The menubar's key guard prevents the default for every key typed while a
+    // menu is open (it has to, or the browser types it into the formula entry),
+    // and the app's window handler therefore never sees those keys. This is
+    // how it gets the ones the menu does not consume -- Ctrl+Q above all.
+    // Only the DOM has that guard; other backends' menus consume keys
+    // natively.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let shared_sink = shared.clone();
+        rswidgets::backends_wasm_adapter::set_host_key_sink(std::rc::Rc::new(
+            move |keyval: u32, ch: char, mods: u32| -> bool {
+                handle_key_char(keyval, ch, &shared_sink, mods)
+            },
+        ));
+    }
+
     {
         let state_w = shared.clone();
         win.on_event_key(Box::new(move |keyval: u32, state: u32| -> i32 {
@@ -6422,6 +6517,12 @@ pub fn run_gui_with_movie(
                 s.return_pressed.set(false);
             }
 
+            // The typed character, from the key code: that is a character on
+            // the DOM, and on GTK the keyval is an X11 keysym -- GDK_KEY_a is
+            // 0x61 and GDK_KEY_0 is 0x30, so a letter or digit reads back as
+            // itself, which is all the two uses below (`Ctrl+Q`, an Alt+
+            // mnemonic) ever ask of it. Non-ASCII keysyms fall back to `\0`,
+            // which matches neither.
             let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
             let alt_held = (state & 0x8) != 0;
             let ctrl_held = (state & 0x4) != 0;
@@ -6442,9 +6543,38 @@ pub fn run_gui_with_movie(
             // propagates the event to the toplevel default handler which
             // activates the mnemonic.  (GTK4's adapter ignores Alt+letter and
             // already propagated, so this is a no-op there.)
-            if alt_held && (32..=126).contains(&keyval) {
-                append_keylog(&format!("Alt+letter keyval={keyval} propagating to GTK mnemonics\n"));
-                return 0;
+            //
+            // WASM is the exception: a page has no native mnemonic engine, so
+            // propagating here dropped the key entirely -- Alt+F typed "F"
+            // into the cell and opened nothing, although the wasm menubar has
+            // a working `handle_menu_key` (Alt+letter opens, arrows and
+            // mnemonics navigate). So on wasm the fallback is what the key is
+            // routed to.
+            //
+            // `ch` above is only the typed character where the key codes are
+            // character values -- on wasm (DOM `keyCode`), not on GTK, whose
+            // keyvals are `GDK_KEY_*` X11 keysyms (GDK_KEY_0 is 0x30 only by
+            // coincidence of a few letters, and GDK_KEY_a is 0x61). So the
+            // wasm arm routes the character, not the keyval: the DOM also
+            // reports the *physical* key, and on a non-US layout the labelled
+            // letter and the code disagree.
+            if alt_held {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let typed = ch != '\0' && ch.is_ascii_alphanumeric();
+                    append_keylog(&format!("Alt+letter keyval={keyval} routed to the DOM menubar\n"));
+                    if typed && menubar_cb.handle_menu_key_char(keyval, ch, state) {
+                        s.last_alt_keyval.set(keyval);
+                        s.entry_processed_key.set(true);
+                        return 1;
+                    }
+                    return 0;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    append_keylog(&format!("Alt+letter keyval={keyval} propagating to GTK mnemonics\n"));
+                    return 0;
+                }
             }
 
             // Check whether the entry already processed this printable
@@ -6489,7 +6619,8 @@ pub fn run_gui_with_movie(
                 if nk == s.last_alt_keyval.get() {
                     return 1;
                 }
-                let consumed = menubar_cb.handle_menu_key(keyval, state);
+                // The character, not the keyval: see the Alt block above.
+                let consumed = menubar_cb.handle_menu_key_char(keyval, ch, state);
                 if consumed {
                     // Mark this printable key as processed so the BUBBLE-phase
                     // fallthrough (handle_key) doesn't re-process it.  Without
@@ -6559,13 +6690,17 @@ pub fn run_gui_with_movie(
         // deep instead of [A1).
         // Gated on entry_seen AND live focus: arming when the entry cannot
         // observe would linger uncleared and wrongly skip a later genuine
-        // keypress there.
+        // keypress there. The focus half is entry_focused, tracked via the
+        // entry's own focus events: entry_seen is a sticky ever-fired
+        // witness (and starts true), so on its own it cannot tell a focused
+        // entry from one the user clicked away from several presses ago.
         let entry_also_observes = (32..=126).contains(&nk)
             || matches!(
                 nk,
                 RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN | HOME | END | PAGE_UP | PAGE_DOWN | BACKSPACE | DELETE
             );
         if entry_also_observes
+            && s.entry_focused.get()
             && (cfg!(feature = "gtk4") || (!cfg!(windows) && s.entry_seen.get()))
         {
             s.entry_processed_key.set(true);
@@ -6660,6 +6795,24 @@ pub fn run_gui_with_movie(
                 _ => false,
             }
         }));
+        // Live focus witness for the entry_processed_key protocol: the
+        // window handler arms its same-event guard only while the entry can
+        // actually observe the event (it clears the flag when it fires
+        // later in the same dispatch). Without this, arming while focus
+        // sits elsewhere leaves the flag uncleared and the next press is
+        // skipped -- the wasm "press twice to move once".
+        {
+            let shared_focus_in = shared.clone();
+            formula_entry.connect_focus_in_event(move |_e| {
+                shared_focus_in.entry_focused.set(true);
+                0
+            })?;
+            let shared_focus_out = shared.clone();
+            formula_entry.connect_focus_out_event(move |_e| {
+                shared_focus_out.entry_focused.set(false);
+                0
+            })?;
+        }
     }
 
 // Assemble layout
@@ -6689,6 +6842,10 @@ pub fn run_gui_with_movie(
     // gtk_drawing_area_set_draw_func stores the callback in widget instance
     // data and works correctly whether the DrawingArea is realized or not;
     // the callback is invoked on the first frame clock tick after realization.
+    // See `GuiState::sync_canvas_size`: the first paint happens inside
+    // `set_draw_callback`, so the hit-test size has to be current before it.
+    #[cfg(target_arch = "wasm32")]
+    shared.sync_canvas_size();
     let shared_draw = shared.clone();
     eprintln!("PHASE: before_set_draw_callback");
     let _ = std::fs::write("/tmp/gui_setup_phase1.txt", "before_set_draw_callback\n");
@@ -6709,6 +6866,14 @@ pub fn run_gui_with_movie(
         // visible_col_indices passes) so the sheet always fills the canvas
         // after menus/chrome, at any window size. Hardcoded counts leave a
         // huge blank area whenever the canvas outgrows them.
+        //
+        // One pass, sized from `w`/`h` -- the surface this frame is about to
+        // paint -- rather than from `canvas_size`, which is the size the last
+        // key or click measured. A desktop only resizes on a user gesture,
+        // which is followed by one of those measurements; a browser also
+        // resizes the canvas on its own (a scrollbar appearing, an orientation
+        // change, DevTools docking), and a frame sized from the stale number
+        // painted a grid that stopped short of the new surface.
         {
             let app = shared_draw.app_ref();
             shared_draw.data_cols.set(cols_to_fill_px(
@@ -6736,6 +6901,11 @@ pub fn run_gui_with_movie(
         // Test marker: 8x8 square of 0xFEEDBE at top-left, drawn AFTER render_grid
         // so it appears on top of the grid background and is visible in screenshots.
         dc.fill_rect(0.0, 0.0, 8.0, 8.0, 254.0/255.0, 237.0/255.0, 190.0/255.0, 1.0);
+        // A repaint asked for during this paint (the grid's own chrome
+        // refresh, a status-line change) belongs to the next frame: the
+        // adapter schedules it here, once per frame.
+        #[cfg(target_arch = "wasm32")]
+        rswidgets::backends_wasm_adapter::flush_pending_frame();
     }));
     eprintln!("PHASE: after_set_draw_callback");
     let _ = std::fs::write("/tmp/gui_setup_phase2.txt", "after_set_draw_callback\n");

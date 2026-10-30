@@ -518,6 +518,47 @@ pub fn mnemonic_label(label: &str, shortcut: &str) -> String {
     format!("_{label}")
 }
 
+/// The label a *DOM* menubar shows: the plain text, with the GTK mnemonic
+/// marker removed -- and rendered as an access key, not thrown away.
+///
+/// The shared tree's labels are GTK mnemonics (`_File`, `S_ave as`): the
+/// underscore marks the letter `Alt` activates. A page has no underline, so
+/// the marker has to be *interpreted*, and there are three ways:
+///
+/// * leave it in -- what the wasm menubar did, and why every menu read
+///   `_File`, `S_ave as`: the marker is a control character that leaked into
+///   visible text;
+/// * strip it -- correct-looking, but it throws away which letter is
+///   accelerated, and the adapter needs exactly that (it derives its Alt
+///   mnemonics by matching the *original* label, so a stripped label would
+///   also have to carry the letter separately);
+/// * keep it as markup -- `<u>F</u>ile` -- which is what this returns: the
+///   letter is still the first thing a reader sees, it is visually marked the
+///   way every desktop menubar marks an accelerator, and the label a screen
+///   reader announces is still "File" (the `<u>` is inline text).
+///
+/// The adapter renders this with `innerHTML` rather than `textContent`, and
+/// continues to derive mnemonics from the label it was *given*, so the two do
+/// not have to agree on the markup.
+///
+/// A label with no marker, or with the marker on the last character, is
+/// returned unchanged: there is nothing to underline, and inventing one would
+/// make the rendered label disagree with the key that works.
+pub fn dom_menu_label(label: &str, shortcut: &str) -> String {
+    let marked = mnemonic_label(label, shortcut);
+    match marked.char_indices().find(|(_, c)| *c == '_') {
+        Some((i, _)) => {
+            let (before, rest) = marked.split_at(i);
+            let letter = rest.chars().nth(1);
+            match letter {
+                Some(l) => format!("{before}<u>{l}</u>{}", &rest[l.len_utf8()..]),
+                None => before.to_string(),
+            }
+        }
+        None => marked,
+    }
+}
+
 /// Build a backend-agnostic (`common`) menu tree from a `&[MenuAction]` tree
 /// (the GTK backend's converter for the shared [`menu_bar`] definition).
 /// Labels carry GTK underscore mnemonics derived from each item's shortcut
@@ -528,14 +569,40 @@ pub fn build_common_menu(
     items: &[MenuAction],
     prefix: &str,
 ) -> Result<rswidgets::common::Menu, Box<dyn std::error::Error>> {
+    build_common_menu_with(rxapp, items, prefix, mnemonic_label)
+}
+
+/// [`build_common_menu`], with the label transform supplied by the caller.
+///
+/// The shared tree carries a GTK underscore mnemonic (`_File`, `S_ave as`).
+/// A backend that *renders text* rather than binding an accelerator has to
+/// decide what to do with the underscore, and the two honest answers differ:
+///
+/// * strip it and show the plain label (`File`, `Save as`) -- correct for a
+///   DOM menubar, where the mnemonic is handled by the keyboard map and
+///   showing `_File` to the user is just a stray character;
+/// * or render it as the GTK underline (an accessible `<u>F</u>ile`), which
+///   is the better answer once the menubar exposes Alt mnemonics.
+///
+/// `render` is the caller's choice; GTK itself passes [`mnemonic_label`] so
+/// its tree is unchanged.
+pub fn build_common_menu_with<F>(
+    rxapp: &rswidgets::App,
+    items: &[MenuAction],
+    prefix: &str,
+    render: F,
+) -> Result<rswidgets::common::Menu, Box<dyn std::error::Error>>
+where
+    F: Fn(&str, &str) -> String + Copy,
+{
     let mut menu = rxapp.new_menu()?;
     for item in items {
         if let Some(sub) = item.submenu.as_deref() {
-            let sub_menu = build_common_menu(rxapp, sub, prefix)?;
-            menu.append_submenu(&mnemonic_label(item.label, item.shortcut), &sub_menu);
+            let sub_menu = build_common_menu_with(rxapp, sub, prefix, render)?;
+            menu.append_submenu(&render(item.label, item.shortcut), &sub_menu);
         } else {
             let name = action_kind_to_name(item.action);
-            menu.append(&mnemonic_label(item.label, item.shortcut), &format!("{}.{}", prefix, name));
+            menu.append(&render(item.label, item.shortcut), &format!("{}.{}", prefix, name));
         }
     }
     Ok(menu)

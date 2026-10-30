@@ -21,13 +21,15 @@ name: WASM
 # std, and the check is worthless on a toolchain that cannot build it.
 #
 # What this does NOT cover, stated here so it is not assumed:
-#   * Running the app in a browser. That needs wasm-bindgen-cli, a bundler and
-#     an index.html, none of which exist in the repo yet. The producer side of
-#     the browser test contract does exist (`window.__corro_output`, and
-#     `document.title = "CORRO_QUIT"` in `quit_main_loop`) and has no driver.
+#   * Running the app in a browser. That is possible now --
+#     `scripts/serve-wasm.sh` builds, runs wasm-bindgen and serves `web/`, and
+#     `scripts/wasm-smoke.sh` drives the page headless and asserts ten things
+#     about what it renders -- but neither is run here, deliberately: the smoke
+#     test needs a browser, and a job that downloads one to check DOM behaviour
+#     is a different kind of job from this one. See docs/WASM_MISSING.md §8.
 #   * Anything about DOM behaviour. A compile check cannot tell you that a
-#     click handler fires. The widget layer's correctness is argued in
-#     docs/WASM_MISSING.md and needs a harness, not more CI.
+#     click handler fires. That question now has a harness
+#     (`scripts/wasm_smoke.mjs`); this job does not run it.
 #
 # A green run here means "the target builds", nothing stronger.
 on:

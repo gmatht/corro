@@ -1862,7 +1862,13 @@ mod tests {
     #[test]
     fn explicit_ui_flags_override_argv0() {
         // An explicit flag always beats the program-name default.
-        #[cfg(any(feature = "gui", feature = "gui-core", feature = "ratatui"))]
+        //
+        // Gated on the variant, not on `ratatui`: `--gui` is only parsed into
+        // `UiKind::Gui` when the GUI is compiled in, and `UiKind::Gui` itself
+        // is `cfg(feature = "gui" | "gui-core")`. A gate that also accepted
+        // `ratatui` compiled this assertion in a ratatui-only build, where the
+        // variant does not exist.
+        #[cfg(any(feature = "gui", feature = "gui-core"))]
         assert!(matches!(
             parse_args_from(["pcorro", "--gui"]).ui,
             super::UiKind::Gui

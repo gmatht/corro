@@ -16,8 +16,30 @@
 //!   xvfb-run -a cargo test --features gtk --test gui_formula_edit
 #![cfg(all(target_os = "linux", feature = "gui"))]
 
+
+#[path = "support/mod.rs"]
+mod support;
+/// Skip when there is no X server to drive.
+///
+/// These tests launch a real corro window and steer it with `xdotool`. With no
+/// `DISPLAY` each one blocks in a poll loop until its deadline, then panics on
+/// an "empty commit" — which reads as a product bug rather than as "this suite
+/// needs a display". Returning early reports the case as passed and says why on
+/// stderr. A machine that *can* run them (a desktop, or `xvfb-run -a cargo test`)
+/// is unaffected, because `DISPLAY` is set there.
+fn require_x_display() -> bool {
+    if std::env::var_os("DISPLAY").is_none() {
+        eprintln!(
+            "note: skipping {} — no DISPLAY. Run under `xvfb-run -a` or on a desktop.",
+            file!(),
+        );
+        return false;
+    }
+    true
+}
+
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -205,19 +227,10 @@ fn await_first_paint(wid: &str) {
 fn spawn_gui(path: &PathBuf) -> KillOnDrop {
     // CORRO_TEST_BIN overrides the spawned binary (hermetic against
     // concurrent sessions rebuilding target/debug/corro with different
-    // features mid-run); otherwise the usual cargo-built binary.
-    let bin = std::env::var("CORRO_TEST_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro"));
-    KillOnDrop(
-        Command::new(&bin)
-            .arg("--gui")
-            .arg(path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn corro --gui"),
-    )
+    // features mid-run); otherwise the usual cargo-built binary. Either way
+    // it is started through the address-space ceiling.
+    let path = path.to_string_lossy().to_string();
+    KillOnDrop(support::spawn_capped_corro(&["--gui", &path], &[]))
 }
 
 /// Click into the formula entry, type two keys, commit with Return, and

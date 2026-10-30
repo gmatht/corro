@@ -7,7 +7,7 @@ mod nwg_backend {
     use std::cell::RefCell;
     use std::os::raw::c_void;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     pub struct NwgApp {
         #[allow(dead_code)]
@@ -262,12 +262,77 @@ mod nwg_backend {
         Ok((entry, changed_cb, handler))
     }
 
+    // -- WM_COMMAND notification plumbing --
+    //
+    // NWG 1.0.13 translates `WM_COMMAND` only from its `WM_MENUSELECT` arm
+    // (see `win32/window.rs`: the `match &class_name` dispatch for
+    // "Button"/"Edit"/"ComboBox" is nested inside `WM_MENUSELECT =>`), so the
+    // high-level `nwg::Event::OnComboxBoxSelection` / `OnButtonClick` events
+    // a ComboBox click would otherwise produce are never reached: a combo
+    // click is a plain `WM_COMMAND` to its *parent*, not a `WM_MENUSELECT`.
+    // That is why `create_dropdown`/`create_checkbox`/`create_radiobutton`
+    // used to bind an empty closure and drop the callback on the floor.
+    //
+    // So we decode the notification ourselves, on the parent's HWND, and fire
+    // the stored callback. Two details are load-bearing:
+    //
+    //   * The handler id MUST be > 0xFFFF. NWG reserves the low range and
+    //     `bind_raw_event_handler` panics on it (see `Window::
+    //     start_repeating_timer`, which documents the same constraint).
+    //   * `WM_COMMAND` carries every child's notifications, so the `lParam`
+    //     child HWND must be matched or the callback fires for the wrong
+    //     widget. `lParam` is zero for a menu/accelerator command, which the
+    //     null check below rejects.
+    static NOTIFY_HANDLER_ID: AtomicUsize = AtomicUsize::new(0x9000_0000);
+
+    /// Bind a `WM_COMMAND` handler on `parent` that fires `cb` when `child`
+    /// reports notification code `code` (e.g. `CBN_SELCHANGE`).
+    ///
+    /// Returns the handler so the caller can keep it alive for the control's
+    /// lifetime: dropping an `nwg::RawEventHandler` unbinds the subclass.
+    fn bind_command_notify(
+        parent: *mut c_void,
+        child: *mut c_void,
+        code: u16,
+        cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
+    ) -> Option<nwg::RawEventHandler> {
+        if parent.is_null() || child.is_null() {
+            return None;
+        }
+        let id = NOTIFY_HANDLER_ID.fetch_add(1, Ordering::SeqCst);
+        nwg::bind_raw_event_handler(
+            &nwg::ControlHandle::Hwnd(parent as _),
+            id,
+            move |_h, msg, w, l| {
+                if msg != winapi::um::winuser::WM_COMMAND {
+                    return None;
+                }
+                // HIWORD(w) is the notification code, LOWORD(w) the control id.
+                if (winapi::shared::minwindef::HIWORD(w as u32) as u16) != code {
+                    return None;
+                }
+                // lParam is the child HWND that sent the notification; a
+                // menu/accelerator command carries 0 and must not match.
+                if (l as *mut c_void) != child {
+                    return None;
+                }
+                if let Some(ref mut f) = *cb.borrow_mut() {
+                    f();
+                }
+                // None => DefSubclassProc; a notification must still reach the
+                // control so the selection state is committed.
+                None
+            },
+        )
+        .ok()
+    }
+
     // -- DropDown (ComboBox) --
 
     pub fn create_dropdown(
         parent: *mut c_void,
         items: &[&str],
-    ) -> Result<(nwg::ComboBox<String>, nwg::EventHandler), nwg::NwgError> {
+    ) -> Result<(nwg::ComboBox<String>, Rc<RefCell<Option<Box<dyn FnMut()>>>>, Option<nwg::RawEventHandler>), nwg::NwgError> {
         let mut cb = nwg::ComboBox::<String>::default();
         nwg::ComboBox::builder()
             .flags(nwg::ComboBoxFlags::VISIBLE | nwg::ComboBoxFlags::TAB_STOP)
@@ -276,12 +341,14 @@ mod nwg_backend {
             .parent(&nwg::ControlHandle::Hwnd(parent as _))
             .build(&mut cb)?;
         let hwnd = cb.handle.hwnd().unwrap();
-        let parent_h = nwg::ControlHandle::Hwnd(parent as _);
-        let handler = nwg::bind_event_handler(
-            &nwg::ControlHandle::Hwnd(hwnd), &parent_h,
-            |_evt, _data, _handle| {},
+        let changed_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+        let notify = bind_command_notify(
+            parent,
+            hwnd as *mut c_void,
+            winapi::um::winuser::CBN_SELCHANGE,
+            changed_cb.clone(),
         );
-        Ok((cb, handler))
+        Ok((cb, changed_cb, notify))
     }
 
     // -- CheckBox --
@@ -289,7 +356,7 @@ mod nwg_backend {
     pub fn create_checkbox(
         parent: *mut c_void,
         text: &str,
-    ) -> Result<(nwg::CheckBox, nwg::EventHandler), nwg::NwgError> {
+    ) -> Result<(nwg::CheckBox, Rc<RefCell<Option<Box<dyn FnMut()>>>>, Option<nwg::RawEventHandler>), nwg::NwgError> {
         let mut chk = nwg::CheckBox::default();
         nwg::CheckBox::builder()
             .text(text)
@@ -298,12 +365,14 @@ mod nwg_backend {
             .parent(&nwg::ControlHandle::Hwnd(parent as _))
             .build(&mut chk)?;
         let hwnd = chk.handle.hwnd().unwrap();
-        let parent_h = nwg::ControlHandle::Hwnd(parent as _);
-        let handler = nwg::bind_event_handler(
-            &nwg::ControlHandle::Hwnd(hwnd), &parent_h,
-            |_evt, _data, _handle| {},
+        let toggled_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+        let notify = bind_command_notify(
+            parent,
+            hwnd as *mut c_void,
+            winapi::um::winuser::BN_CLICKED,
+            toggled_cb.clone(),
         );
-        Ok((chk, handler))
+        Ok((chk, toggled_cb, notify))
     }
 
     // -- RadioButton --
@@ -312,7 +381,7 @@ mod nwg_backend {
         parent: *mut c_void,
         text: &str,
         is_group_start: bool,
-    ) -> Result<(nwg::RadioButton, nwg::EventHandler), nwg::NwgError> {
+    ) -> Result<(nwg::RadioButton, Rc<RefCell<Option<Box<dyn FnMut()>>>>, Option<nwg::RawEventHandler>), nwg::NwgError> {
         let mut rb = nwg::RadioButton::default();
         let mut flags = nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::TAB_STOP;
         if is_group_start {
@@ -324,12 +393,14 @@ mod nwg_backend {
             .parent(&nwg::ControlHandle::Hwnd(parent as _))
             .build(&mut rb)?;
         let hwnd = rb.handle.hwnd().unwrap();
-        let parent_h = nwg::ControlHandle::Hwnd(parent as _);
-        let handler = nwg::bind_event_handler(
-            &nwg::ControlHandle::Hwnd(hwnd), &parent_h,
-            |_evt, _data, _handle| {},
+        let toggled_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+        let notify = bind_command_notify(
+            parent,
+            hwnd as *mut c_void,
+            winapi::um::winuser::BN_CLICKED,
+            toggled_cb.clone(),
         );
-        Ok((rb, handler))
+        Ok((rb, toggled_cb, notify))
     }
 
     // -- TextBox (multi-line) --
